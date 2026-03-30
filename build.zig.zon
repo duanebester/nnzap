@@ -1,0 +1,18 @@
+.{
+    .name = .nnzap,
+    .version = "0.0.0",
+    .fingerprint = 0x4e5c785dd35b82bc,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .zig_objc = .{
+            .url = "git+https://github.com/mitchellh/zig-objc.git#27d0e03242e7ee6842bf8a86d2e0bb1f586a9847",
+            .hash = "zig_objc-0.0.0-Ir_Sp7oUAQC3JpeR9EGUFGcHRSx_33IehitnjBCy-CwD",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        
+    },
+}

@@ -1,0 +1,24 @@
+# Build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Engine research snapshots (local experiment state)
+.engine_snapshots/
+
+# Agent history (persistent experiment log across runs)
+.agent_history/
+
+# Benchmark results (regenerated per run)
+benchmarks/
+
+# Backup files from autoresearch
+src/main.zig.bak
+
+# macOS
+.DS_Store
+
+# Editor state
+*.swp
+*.swo
+*~
