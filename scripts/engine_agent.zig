@@ -81,6 +81,12 @@ const ALLOWED_WRITE_FILES = [_][]const u8{
 };
 
 // ============================================================
+// Engineering rules path (loaded at runtime)
+// ============================================================
+
+const CLAUDE_MD_PATH: []const u8 = "CLAUDE.md";
+
+// ============================================================
 // Allowed path prefixes for read_file / list_directory
 // ============================================================
 
@@ -462,9 +468,11 @@ fn mainInner() !void {
     }
 
     const history = loadHistoryContent(arena);
+    const rules = loadEngineeringRules(arena);
     const first_msg = buildInitialMessage(
         arena,
         history,
+        rules,
     );
 
     var messages: [MAX_MESSAGES][]const u8 = undefined;
@@ -684,6 +692,45 @@ fn loadModel() []const u8 {
         return model;
     }
     return DEFAULT_MODEL;
+}
+
+/// Load CLAUDE.md engineering rules from disk.
+/// Returns the file contents or a fallback message.
+fn loadEngineeringRules(arena: Allocator) []const u8 {
+    const file = std.fs.cwd().openFile(
+        CLAUDE_MD_PATH,
+        .{},
+    ) catch |err| {
+        log(
+            "WARNING: cannot open {s}: {s}\n",
+            .{ CLAUDE_MD_PATH, @errorName(err) },
+        );
+        return "(CLAUDE.md not found — " ++
+            "follow standard engineering practices)";
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(
+        arena,
+        MAX_FILE_SIZE,
+    ) catch |err| {
+        log(
+            "WARNING: cannot read {s}: {s}\n",
+            .{ CLAUDE_MD_PATH, @errorName(err) },
+        );
+        return "(CLAUDE.md too large or unreadable)";
+    };
+
+    if (content.len == 0) {
+        log("WARNING: {s} is empty.\n", .{CLAUDE_MD_PATH});
+        return "(CLAUDE.md is empty)";
+    }
+
+    log(
+        "Engineering rules: {d} KB ({s})\n",
+        .{ content.len / 1024, CLAUDE_MD_PATH },
+    );
+    return content;
 }
 
 /// Build the toolbox with `zig build`.
@@ -2036,18 +2083,29 @@ fn unescapeJsonString(
 fn buildInitialMessage(
     arena: Allocator,
     history: []const u8,
+    rules: []const u8,
 ) []const u8 {
+    std.debug.assert(rules.len > 0);
     const has_history = history.len > 0;
 
-    const intro = if (has_history)
-        "Benchmark history from previous runs " ++
-            "(JSONL -- one result per line):\n\n"
+    const rules_section =
+        "## Engineering rules (CLAUDE.md)\n\n" ++
+        "You MUST follow these rules when editing " ++
+        "engine source code. They are non-negotiable " ++
+        "— assertion density, function length limits, " ++
+        "naming, explicit control flow, and all other " ++
+        "rules apply to every line you write.\n\n";
+
+    const history_section = if (has_history)
+        "## Benchmark history\n\n" ++
+            "Previous runs (JSONL — one per line):\n\n"
     else
         "No previous benchmark history. " ++
             "This is the first run.\n\n";
 
     const suffix =
-        "\nBegin optimising engine throughput. " ++
+        "\n\n## Begin\n\n" ++
+        "Optimise engine throughput. " ++
         "Start by calling snapshot to create a " ++
         "restore point, then read the source " ++
         "code to understand the baseline.";
@@ -2055,14 +2113,25 @@ fn buildInitialMessage(
     const text = if (has_history)
         std.fmt.allocPrint(
             arena,
-            "{s}{s}{s}",
-            .{ intro, history, suffix },
+            "{s}{s}\n\n{s}{s}{s}",
+            .{
+                rules_section,
+                rules,
+                history_section,
+                history,
+                suffix,
+            },
         ) catch "Begin optimising."
     else
         std.fmt.allocPrint(
             arena,
-            "{s}{s}",
-            .{ intro, suffix },
+            "{s}{s}\n\n{s}{s}",
+            .{
+                rules_section,
+                rules,
+                history_section,
+                suffix,
+            },
         ) catch "Begin optimising.";
 
     std.debug.assert(text.len > 0);
