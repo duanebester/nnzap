@@ -250,6 +250,12 @@ pub fn main() !void {
     while (epoch < num_epochs) : (epoch += 1) {
         const epoch_start = std.time.nanoTimestamp();
 
+        // Only compute training loss on reporting epochs
+        // (saves 2 GPU dispatches on non-report epochs).
+        const is_val_epoch =
+            ((epoch + 1) % val_interval == 0) or
+            (epoch + 1 == num_epochs);
+
         const train_loss = trainEpoch(
             &device,
             &net,
@@ -257,21 +263,18 @@ pub fn main() !void {
             &bufs,
             train_indices,
             prng.random(),
+            is_val_epoch,
         );
-
-        // Validate every VAL_INTERVAL epochs and on the
-        // last epoch.  Skipping intermediate validations
-        // saves ~45% of per-epoch time (156 command
-        // buffers × 20 epochs → 156 × 4 epochs).
-        const is_val_epoch =
-            ((epoch + 1) % val_interval == 0) or
-            (epoch + 1 == num_epochs);
 
         var val_loss: f32 = 0.0;
         var val_acc: f64 = 0.0;
 
         if (is_val_epoch) {
-            const val = evaluate(
+            // Skip loss computation during validation:
+            // saves 2 GPU dispatches per eval batch
+            // (~314 dispatches total).  Accuracy is the
+            // only metric that gates training decisions.
+            const val = evaluateInner(
                 &device,
                 &net,
                 &bufs,
@@ -279,6 +282,7 @@ pub fn main() !void {
                 mnist.train_labels,
                 mnist.train_labels_raw,
                 val_indices,
+                false,
             );
             val_loss = val.mean_loss;
             val_acc = val.accuracy_pct;
@@ -388,6 +392,11 @@ pub fn main() !void {
 /// Obj-C message send overhead (~15 dispatches per batch,
 /// so grouping 8 batches saves 7 × beginCommandBuffer +
 /// beginCompute + endEncoding + commit round-trips).
+/// Run one training epoch.  When compute_loss is true,
+/// the final batch encodes softmax + CE loss for
+/// monitoring (2 extra dispatches).  When false, skips
+/// loss entirely, saving GPU time on non-reporting
+/// epochs.
 fn trainEpoch(
     device: *const Device,
     net: *const MnistNet,
@@ -395,6 +404,7 @@ fn trainEpoch(
     bufs: *const Buffers,
     indices: []u32,
     random: std.Random,
+    compute_loss: bool,
 ) f32 {
     std.debug.assert(indices.len == train_count);
     std.debug.assert(batches_per_epoch > 0);
@@ -433,6 +443,7 @@ fn trainEpoch(
             bufs,
             batch,
             group_size,
+            compute_loss,
         );
 
         batch += group_size;
@@ -443,8 +454,11 @@ fn trainEpoch(
         pc.msgSend(void, "waitUntilCompleted", .{});
     }
 
-    return sumSlice(bufs.loss.asSlice()) /
-        @as(f32, max_batch);
+    if (compute_loss) {
+        return sumSlice(bufs.loss.asSlice()) /
+            @as(f32, max_batch);
+    }
+    return 0.0;
 }
 
 /// Fill input/target buffer slots for a group of batches.
@@ -482,12 +496,16 @@ fn fillBatchGroup(
 /// Encode a group of training steps (forward + backward +
 /// SGD update) into a single command buffer.  Returns the
 /// command buffer object so the caller can wait on it.
+/// Encode a group of training steps into one command
+/// buffer.  When compute_loss is true, the final batch
+/// also encodes softmax + CE loss for monitoring.
 fn encodeTrainGroup(
     device: *const Device,
     net: *const MnistNet,
     bufs: *const Buffers,
     start_batch: u32,
     group_size: u32,
+    compute_loss: bool,
 ) Object {
     std.debug.assert(group_size > 0);
     std.debug.assert(group_size <= BATCHES_PER_CMD);
@@ -508,7 +526,9 @@ fn encodeTrainGroup(
             max_batch,
         );
 
-        if (is_last) {
+        // Loss computation only on the final batch
+        // of the epoch, and only when requested.
+        if (is_last and compute_loss) {
             encodeLoss(
                 device,
                 net,
@@ -608,6 +628,10 @@ fn encodeLoss(
 /// subset of samples specified by `indices`.  Handles
 /// partial final batches.  Used for both validation and
 /// test evaluation.
+/// Evaluate accuracy and optionally loss over a subset of
+/// samples.  When compute_loss is false, skips softmax +
+/// CE dispatches (saves 2 GPU dispatches per batch, ~40%
+/// of per-batch eval work).
 fn evaluate(
     device: *const Device,
     net: *const MnistNet,
@@ -616,6 +640,33 @@ fn evaluate(
     labels_onehot: []const f32,
     labels_raw: []const u8,
     indices: []const u32,
+) EvalResult {
+    return evaluateInner(
+        device,
+        net,
+        bufs,
+        images,
+        labels_onehot,
+        labels_raw,
+        indices,
+        true,
+    );
+}
+
+/// Core evaluation loop.  When compute_loss is false, only
+/// forward passes are dispatched (no softmax or CE loss),
+/// saving 2 dispatches per batch.  Accuracy uses argmax on
+/// raw logits, which is monotonically equivalent to
+/// softmax argmax.
+fn evaluateInner(
+    device: *const Device,
+    net: *const MnistNet,
+    bufs: *const Buffers,
+    images: []const f32,
+    labels_onehot: []const f32,
+    labels_raw: []const u8,
+    indices: []const u32,
+    compute_loss: bool,
 ) EvalResult {
     const count: u32 = @intCast(indices.len);
     std.debug.assert(count > 0);
@@ -631,39 +682,43 @@ fn evaluate(
         const current: u32 = @min(max_batch, remaining);
         const idx = indices[offset..][0..current];
 
-        // Evaluation uses buffer slot 0 (synchronous, no
-        // need for double-buffering).
         Mnist.fillImageBatch(
             images,
             idx,
             bufs.inputs[0].asSlice(),
         );
-        Mnist.fillLabelBatch(
-            labels_onehot,
-            idx,
-            bufs.targets[0].asSlice(),
-        );
 
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
         net.forward(device, enc, bufs.inputs[0], current);
-        encodeLoss(
-            device,
-            net,
-            bufs,
-            bufs.targets[0],
-            current,
-            enc,
-        );
+
+        if (compute_loss) {
+            Mnist.fillLabelBatch(
+                labels_onehot,
+                idx,
+                bufs.targets[0].asSlice(),
+            );
+            encodeLoss(
+                device,
+                net,
+                bufs,
+                bufs.targets[0],
+                current,
+                enc,
+            );
+        }
+
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndWait(cmd);
 
-        // Accumulate per-sample CE loss.
-        for (bufs.loss.asSlice()[0..current]) |v| {
-            loss_sum += @as(f64, v);
+        if (compute_loss) {
+            for (bufs.loss.asSlice()[0..current]) |v| {
+                loss_sum += @as(f64, v);
+            }
         }
 
-        // CPU argmax over raw logits.
+        // CPU argmax over raw logits (monotonically
+        // equivalent to softmax argmax).
         correct += countCorrect(
             net.getOutput().asSlice(),
             labels_raw,
@@ -676,11 +731,15 @@ fn evaluate(
 
     const n: f64 = @floatFromInt(count);
     const c: f64 = @floatFromInt(correct);
+    const mean_loss: f32 = if (compute_loss)
+        @floatCast(loss_sum / n)
+    else
+        0.0;
 
     return .{
         .correct = correct,
         .total = count,
-        .mean_loss = @floatCast(loss_sum / n),
+        .mean_loss = mean_loss,
         .accuracy_pct = c / n * 100.0,
     };
 }

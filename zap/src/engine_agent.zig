@@ -192,7 +192,8 @@ const SYSTEM_PROMPT =
     \\Engine research (safety + measurement):
     \\  snapshot, snapshot_list, rollback, rollback_latest,
     \\  diff, check, test, bench, bench_compare,
-    \\  history, show, show_function, commit
+    \\  history, show, show_function, commit,
+    \\  add_summary
     \\
     \\File I/O (locked to project directory):
     \\  read_file, write_file, edit_file, list_directory
@@ -231,12 +232,13 @@ const SYSTEM_PROMPT =
     \\6. bench -- full MNIST training benchmark.
     \\7. Evaluate: see decision rules below.
     \\8. Keep (commit with a descriptive message) or
-    \\   rollback_latest.
+    \\   rollback_latest + add_summary describing what
+    \\   was tried and WHY it failed. Then try another
+    \\   approach from step 2.
     \\
-    \\After step 8, STOP. The outer loop will start a
-    \\new conversation for the next experiment. Do NOT
-    \\try to run multiple experiments in one conversation.
-    \\Focus on making ONE change well.
+    \\When you have exhausted ideas or found a KEEP,
+    \\STOP. The outer loop will start a new conversation
+    \\for the next experiment.
     \\
     \\## Decision rules
     \\
@@ -311,10 +313,15 @@ const SYSTEM_PROMPT =
     \\
     \\## Recovery
     \\
-    \\- check fails: fix or rollback_latest.
-    \\- test fails: rollback_latest.
-    \\- bench crashes: rollback_latest.
-    \\- bench regresses: record result, rollback_latest.
+    \\After every rollback, call add_summary with a
+    \\concise description of what was tried, the result,
+    \\and why it failed. This prevents future experiments
+    \\from repeating the same mistake.
+    \\
+    \\- check fails: fix or rollback_latest + add_summary.
+    \\- test fails: rollback_latest + add_summary.
+    \\- bench crashes: rollback_latest + add_summary.
+    \\- bench regresses: rollback_latest + add_summary.
     \\
     \\## FOCUS
     \\
@@ -438,7 +445,13 @@ const TOOL_SCHEMAS =
     \\   "input_schema":{"type":"object",
     \\     "properties":{"message":{"type":"string",
     \\       "description":"Commit message summarizing the optimization"}},
-    \\     "required":["message"]}}
+    \\     "required":["message"]}},
+    \\  {"name":"add_summary",
+    \\   "description":"Record a concise summary of what was tried and why it succeeded or failed. Call after every rollback so future experiments avoid repeating failed approaches. Also call after a KEEP to record what worked. Summaries are injected into every future experiment's initial context.",
+    \\   "input_schema":{"type":"object",
+    \\     "properties":{"summary":{"type":"string",
+    \\       "description":"Concise summary: what was tried, the throughput result, and why it succeeded or failed."}},
+    \\     "required":["summary"]}}
     \\]
 ;
 
@@ -1491,6 +1504,11 @@ fn dispatchTool(
         return executeCommit(arena, call.input_json);
     }
 
+    // Summary recording tool.
+    if (eql(call.name, "add_summary")) {
+        return executeAddSummary(arena, call.input_json);
+    }
+
     return .{
         .stdout = "Error: unknown tool name",
         .success = false,
@@ -2284,6 +2302,89 @@ fn executeCwd(arena: Allocator) ToolOutput {
 
 /// Git commit all current changes with a descriptive
 /// message. Called after a successful KEEP decision.
+/// Record a summary of what was tried and its outcome.
+/// Appends to summaries.jsonl so future experiments
+/// see what approaches succeeded or failed.
+fn executeAddSummary(
+    arena: Allocator,
+    input: []const u8,
+) ToolOutput {
+    std.debug.assert(input.len > 0);
+
+    const raw_summary = extractRequiredField(
+        input,
+        "summary",
+    ) orelse {
+        return .{
+            .stdout = "Error: missing 'summary' field",
+            .success = false,
+        };
+    };
+
+    const summary = unescapeJsonString(
+        arena,
+        raw_summary,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape summary",
+            .success = false,
+        };
+    };
+
+    if (summary.len == 0) {
+        return .{
+            .stdout = "Error: empty summary",
+            .success = false,
+        };
+    }
+
+    // Count existing summaries to assign the next ID.
+    const next_id = countSummaryLines(arena) + 1;
+
+    appendSummary(arena, next_id, summary);
+
+    const msg = std.fmt.allocPrint(
+        arena,
+        "Summary #{d} recorded.",
+        .{next_id},
+    ) catch return .{
+        .stdout = "Summary recorded.",
+        .success = true,
+    };
+
+    return .{ .stdout = msg, .success = true };
+}
+
+/// Count existing lines in the summaries JSONL file.
+fn countSummaryLines(arena: Allocator) u32 {
+    const fs_path = resolveToFs(
+        arena,
+        SUMMARIES_PATH,
+    ) orelse return 0;
+
+    const file = std.fs.cwd().openFile(
+        fs_path,
+        .{},
+    ) catch return 0;
+    defer file.close();
+
+    const content = file.readToEndAlloc(
+        arena,
+        MAX_HISTORY_SIZE,
+    ) catch return 0;
+
+    var count: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        if (line.len >= 2) count += 1;
+    }
+    return count;
+}
+
 fn executeCommit(
     arena: Allocator,
     input: []const u8,
