@@ -2422,9 +2422,10 @@ fn executeCommit(
     // shell quoting issues with newlines and special
     // characters.  Using `git commit -F` reads the
     // message from the file instead of the command line.
+    const raw_path = ".engine_agent_history/_commit_msg.txt";
     const msg_path = resolveToFs(
         arena,
-        ".engine_agent_history/_commit_msg.txt",
+        raw_path,
     ) orelse {
         return .{
             .stdout = "Error: cannot resolve temp path",
@@ -2432,7 +2433,9 @@ fn executeCommit(
         };
     };
 
-    writeFileContent(arena, msg_path, msg) catch {
+    // Pass raw_path (not msg_path) because writeFileContent
+    // calls resolveToFs internally.
+    writeFileContent(arena, raw_path, msg) catch {
         return .{
             .stdout = "Error: failed to write commit msg",
             .success = false,

@@ -57,9 +57,10 @@ const test_count: u32 = 10_000;
 const batches_per_epoch: u32 = train_count / max_batch;
 
 /// Run validation every N epochs to reduce per-epoch
-/// overhead.  Validation is ~45% of epoch time due to
-/// 156 synchronous command buffers.
-const val_interval: u32 = 5;
+/// overhead.  Validation adds ~20ms per invocation;
+/// reducing frequency amortises this across more
+/// training epochs.
+const val_interval: u32 = 10;
 
 // -- Evaluation result --------------------------------
 

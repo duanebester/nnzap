@@ -357,6 +357,10 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "matmul_transB",
         .shader_name = "matmul_transB",
     },
+    .{
+        .field_name = "matmul_transB_relu",
+        .shader_name = "matmul_transB_relu",
+    },
     .{ .field_name = "relu_forward", .shader_name = "relu_forward" },
     .{ .field_name = "tanh_forward", .shader_name = "tanh_forward" },
     .{
