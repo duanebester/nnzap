@@ -2432,7 +2432,7 @@ fn executeCommit(
         };
     };
 
-    writeFileContent(msg_path, msg) catch {
+    writeFileContent(arena, msg_path, msg) catch {
         return .{
             .stdout = "Error: failed to write commit msg",
             .success = false,

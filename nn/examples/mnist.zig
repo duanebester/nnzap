@@ -78,7 +78,11 @@ const EvalResult = struct {
 // because all CPU fills happen before the GPU starts.
 
 const BATCHES_PER_CMD: u32 = 64;
-const BUFFER_COUNT: u32 = BATCHES_PER_CMD;
+/// Double-buffered: two sets of BATCHES_PER_CMD slots so
+/// the CPU can fill set B while the GPU reads set A, and
+/// vice versa. Eliminates the wait between fill and encode.
+const BUFFER_SETS: u32 = 2;
+const BUFFER_COUNT: u32 = BATCHES_PER_CMD * BUFFER_SETS;
 
 /// Number of eval forward passes to batch into one command
 /// buffer.  Reduces per-batch commitAndWait overhead from
@@ -426,47 +430,58 @@ fn trainEpoch(
 
     random.shuffle(u32, indices);
 
-    // Track the previous command buffer for async overlap.
-    var prev_cmd: ?Object = null;
+    // Double-buffered command buffers: track the cmd that
+    // used each buffer set so we wait for the right one
+    // before overwriting its input/target buffers.
+    var set_cmd: [BUFFER_SETS]?Object = .{ null, null };
+    var set_idx: u32 = 0;
 
     var batch: u32 = 0;
     while (batch < batches_per_epoch) {
         const remaining = batches_per_epoch - batch;
         const group_size = @min(BATCHES_PER_CMD, remaining);
+        const buf_base = set_idx * BATCHES_PER_CMD;
 
-        // Phase 1: CPU fills all buffer slots for this
-        // group while the GPU processes the previous group.
+        // Wait for the command buffer that last used this
+        // buffer set (if any) before the CPU overwrites it.
+        if (set_cmd[set_idx]) |pc| {
+            pc.msgSend(void, "waitUntilCompleted", .{});
+        }
+
+        // Phase 1: CPU fills buffer slots for this group.
         fillBatchGroup(
             mnist,
             bufs,
             indices,
             batch,
             group_size,
+            buf_base,
         );
 
-        // Wait for the previous command buffer to finish
-        // before encoding (SGD wrote to params there).
-        if (prev_cmd) |pc| {
-            pc.msgSend(void, "waitUntilCompleted", .{});
-        }
-
-        // Phase 2: encode all batches in a single
-        // command buffer + compute encoder.
-        prev_cmd = encodeTrainGroup(
+        // Phase 2: encode and commit asynchronously.
+        // Metal command queue serialises execution, so
+        // this group runs after the previous one finishes
+        // on the GPU (SGD params update is visible).
+        set_cmd[set_idx] = encodeTrainGroup(
             device,
             net,
             bufs,
             batch,
             group_size,
             compute_loss,
+            buf_base,
         );
 
+        // Alternate buffer sets.
+        set_idx = (set_idx + 1) % BUFFER_SETS;
         batch += group_size;
     }
 
-    // Wait for the final command buffer.
-    if (prev_cmd) |pc| {
-        pc.msgSend(void, "waitUntilCompleted", .{});
+    // Wait for all outstanding command buffers.
+    for (set_cmd) |cmd_opt| {
+        if (cmd_opt) |pc| {
+            pc.msgSend(void, "waitUntilCompleted", .{});
+        }
     }
 
     if (compute_loss) {
@@ -485,25 +500,28 @@ fn fillBatchGroup(
     indices: []u32,
     start_batch: u32,
     group_size: u32,
+    buf_base: u32,
 ) void {
     std.debug.assert(group_size > 0);
     std.debug.assert(group_size <= BATCHES_PER_CMD);
+    std.debug.assert(buf_base + group_size <= BUFFER_COUNT);
 
     var g: u32 = 0;
     while (g < group_size) : (g += 1) {
         const batch = start_batch + g;
         const off: usize = @as(usize, batch) * max_batch;
         const idx = indices[off..][0..max_batch];
+        const slot = buf_base + g;
 
         Mnist.fillImageBatch(
             mnist.train_images,
             idx,
-            bufs.inputs[g].asSlice(),
+            bufs.inputs[slot].asSlice(),
         );
         Mnist.fillLabelBatch(
             mnist.train_labels,
             idx,
-            bufs.targets[g].asSlice(),
+            bufs.targets[slot].asSlice(),
         );
     }
 }
@@ -521,9 +539,11 @@ fn encodeTrainGroup(
     start_batch: u32,
     group_size: u32,
     compute_loss: bool,
+    buf_base: u32,
 ) Object {
     std.debug.assert(group_size > 0);
     std.debug.assert(group_size <= BATCHES_PER_CMD);
+    std.debug.assert(buf_base + group_size <= BUFFER_COUNT);
 
     const cmd = device.beginCommandBuffer();
     const enc = device.beginCompute(cmd);
@@ -533,11 +553,12 @@ fn encodeTrainGroup(
         const batch = start_batch + g;
         const is_last =
             (batch == batches_per_epoch - 1);
+        const slot = buf_base + g;
 
         net.forward(
             device,
             enc,
-            bufs.inputs[g],
+            bufs.inputs[slot],
             max_batch,
         );
 
@@ -548,7 +569,7 @@ fn encodeTrainGroup(
                 device,
                 net,
                 bufs,
-                bufs.targets[g],
+                bufs.targets[slot],
                 max_batch,
                 enc,
             );
@@ -559,7 +580,7 @@ fn encodeTrainGroup(
             net,
             enc,
             bufs,
-            g,
+            slot,
         );
 
         net.update(device, enc, learning_rate);
