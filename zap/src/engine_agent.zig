@@ -2418,36 +2418,32 @@ fn executeCommit(
         };
     }
 
-    // Sanitise the message for shell safety: replace
-    // single quotes with escaped equivalents.
-    var safe_msg: std.ArrayList(u8) = .empty;
-    for (msg) |c| {
-        if (c == '\'') {
-            safe_msg.appendSlice(
-                arena,
-                "'\\''",
-            ) catch {
-                return .{
-                    .stdout = "Error: allocation failure",
-                    .success = false,
-                };
-            };
-        } else {
-            safe_msg.append(arena, c) catch {
-                return .{
-                    .stdout = "Error: allocation failure",
-                    .success = false,
-                };
-            };
-        }
-    }
+    // Write the commit message to a temp file to avoid
+    // shell quoting issues with newlines and special
+    // characters.  Using `git commit -F` reads the
+    // message from the file instead of the command line.
+    const msg_path = resolveToFs(
+        arena,
+        ".engine_agent_history/_commit_msg.txt",
+    ) orelse {
+        return .{
+            .stdout = "Error: cannot resolve temp path",
+            .success = false,
+        };
+    };
 
-    std.debug.assert(safe_msg.items.len >= msg.len);
+    writeFileContent(msg_path, msg) catch {
+        return .{
+            .stdout = "Error: failed to write commit msg",
+            .success = false,
+        };
+    };
 
     const cmd = std.fmt.allocPrint(
         arena,
-        "git add -A && git commit -m '{s}'",
-        .{safe_msg.items},
+        "git add -A && git commit -F '{s}' " ++
+            "&& rm -f '{s}'",
+        .{ msg_path, msg_path },
     ) catch {
         return .{
             .stdout = "Error: allocation failure",
