@@ -525,6 +525,188 @@ pub fn Network(
             // chained layer dispatches that share buffers).
         }
 
+        /// Encode backward pass with fused SGD updates.
+        /// Each layer's bias and weight gradients are
+        /// applied directly to params (params -= lr*grad),
+        /// eliminating the separate SGD dispatch and the
+        /// gradient buffer round-trip.
+        ///
+        /// Dispatch order per layer: activation backward →
+        /// input_grad (reads params BEFORE update) →
+        /// fused bias_grad+SGD → fused weight_grad+SGD.
+        /// Metal serialises within an encoder, so the
+        /// input_grad sees un-modified weights.
+        pub fn backwardSGD(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+            loss_grad: Buffer,
+            batch_size: u32,
+            learning_rate: f32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(batch_size <= max_batch_size);
+            std.debug.assert(learning_rate > 0.0);
+            std.debug.assert(
+                loss_grad.len >=
+                    batch_size * Layout.output_size,
+            );
+            std.debug.assert(
+                input.len >=
+                    batch_size * Layout.input_size,
+            );
+
+            comptime var active: u1 = 0;
+
+            inline for (0..Layout.num_layers) |fwd_i| {
+                const i = Layout.num_layers - 1 - fwd_i;
+                const is_last =
+                    (i == Layout.num_layers - 1);
+
+                const layer_input: Buffer =
+                    if (i == 0)
+                        input
+                    else
+                        self.post_activations[i - 1];
+
+                if (Layout.layers[i].act != .none) {
+                    const target: u1 =
+                        comptime if (is_last)
+                            0
+                        else
+                            1 - active;
+
+                    const grad_output: Buffer =
+                        if (is_last)
+                            loss_grad
+                        else
+                            self.backward_scratch[active];
+
+                    // 1. Activation backward.
+                    encodeActivationBackward(
+                        Layout.layers[i].act,
+                        Layout.layers[i].out,
+                        device,
+                        encoder,
+                        self.pre_activations[i],
+                        self.post_activations[i],
+                        grad_output,
+                        self.backward_scratch[target],
+                        batch_size,
+                    );
+
+                    // 2. Input grad BEFORE param update.
+                    if (i > 0) {
+                        const ig_target: u1 =
+                            comptime if (is_last)
+                                1
+                            else
+                                active;
+
+                        encodeInputGrad(
+                            Layout.layers[i].in,
+                            Layout.layers[i].out,
+                            Layout.weight_offsets[i],
+                            device,
+                            encoder,
+                            self.backward_scratch[target],
+                            self.params,
+                            self.backward_scratch[
+                                ig_target
+                            ],
+                            batch_size,
+                        );
+
+                        active = ig_target;
+                    }
+
+                    // 3. Fused bias grad + SGD.
+                    encodeBiasGradSGD(
+                        Layout.layers[i].out,
+                        Layout.bias_offsets[i],
+                        device,
+                        encoder,
+                        self.backward_scratch[target],
+                        self.params,
+                        batch_size,
+                        learning_rate,
+                    );
+
+                    // 4. Fused weight grad + SGD.
+                    encodeWeightGradSGD(
+                        Layout.layers[i].in,
+                        Layout.layers[i].out,
+                        Layout.weight_offsets[i],
+                        device,
+                        encoder,
+                        layer_input,
+                        self.backward_scratch[target],
+                        self.params,
+                        batch_size,
+                        learning_rate,
+                    );
+                } else {
+                    const grad_pre_act: Buffer =
+                        if (is_last)
+                            loss_grad
+                        else
+                            self.backward_scratch[active];
+
+                    // 1. Input grad BEFORE param update.
+                    if (i > 0) {
+                        const ig_target: u1 =
+                            comptime if (is_last)
+                                0
+                            else
+                                1 - active;
+
+                        encodeInputGrad(
+                            Layout.layers[i].in,
+                            Layout.layers[i].out,
+                            Layout.weight_offsets[i],
+                            device,
+                            encoder,
+                            grad_pre_act,
+                            self.params,
+                            self.backward_scratch[
+                                ig_target
+                            ],
+                            batch_size,
+                        );
+
+                        active = ig_target;
+                    }
+
+                    // 2. Fused bias grad + SGD.
+                    encodeBiasGradSGD(
+                        Layout.layers[i].out,
+                        Layout.bias_offsets[i],
+                        device,
+                        encoder,
+                        grad_pre_act,
+                        self.params,
+                        batch_size,
+                        learning_rate,
+                    );
+
+                    // 3. Fused weight grad + SGD.
+                    encodeWeightGradSGD(
+                        Layout.layers[i].in,
+                        Layout.layers[i].out,
+                        Layout.weight_offsets[i],
+                        device,
+                        encoder,
+                        layer_input,
+                        grad_pre_act,
+                        self.params,
+                        batch_size,
+                        learning_rate,
+                    );
+                }
+            }
+        }
+
         // ====================================================
         // SGD parameter update
         // ====================================================
@@ -1308,6 +1490,103 @@ pub fn Network(
             // within a single compute encoder on Apple Silicon.
             // The forward pass relies on this same guarantee
             // (no barriers between chained layer dispatches).
+        }
+
+        /// Encode fused bias gradient + SGD update:
+        ///   bias[n] -= lr * sum_m(grad[m*N + n])
+        /// Reads grad_pre_act, directly updates params
+        /// at bias_offset.  Eliminates the separate write
+        /// to a gradient buffer and the SGD read of it.
+        fn encodeBiasGradSGD(
+            comptime out_size: u32,
+            comptime bias_offset: u32,
+            device: *const Device,
+            encoder: objc.Object,
+            grad_pre_act: Buffer,
+            params: Buffer,
+            batch_size: u32,
+            learning_rate: f32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(params.len > bias_offset);
+            std.debug.assert(learning_rate > 0.0);
+
+            metal.setBuffer(encoder, grad_pre_act, 0);
+            metal.setBufferWithOffset(
+                encoder,
+                params,
+                bias_offset,
+                1,
+            );
+
+            const m_val: u32 = batch_size;
+            const n_val: u32 = out_size;
+            metal.setBytes(encoder, u32, &m_val, 2);
+            metal.setBytes(encoder, u32, &n_val, 3);
+            metal.setBytes(
+                encoder,
+                f32,
+                &learning_rate,
+                4,
+            );
+
+            device.dispatch1D(
+                encoder,
+                device.bias_grad_sgd,
+                out_size,
+            );
+        }
+
+        /// Encode fused weight gradient + SGD update
+        /// (tiled Aᵀ·B with in-place param update):
+        ///   W[k,n] -= lr * sum_m(A[m*K+k] * B[m*N+n])
+        /// Reads layer_input and grad_pre_act, directly
+        /// updates params at weight_offset.
+        fn encodeWeightGradSGD(
+            comptime in_size: u32,
+            comptime out_size: u32,
+            comptime weight_offset: u32,
+            device: *const Device,
+            encoder: objc.Object,
+            layer_input: Buffer,
+            grad_pre_act: Buffer,
+            params: Buffer,
+            batch_size: u32,
+            learning_rate: f32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(params.len > weight_offset);
+            std.debug.assert(learning_rate > 0.0);
+
+            metal.setBuffer(encoder, layer_input, 0);
+            metal.setBuffer(encoder, grad_pre_act, 1);
+            metal.setBufferWithOffset(
+                encoder,
+                params,
+                weight_offset,
+                2,
+            );
+
+            const m_val: u32 = batch_size;
+            const k_val: u32 = in_size;
+            const n_val: u32 = out_size;
+            metal.setBytes(encoder, u32, &m_val, 3);
+            metal.setBytes(encoder, u32, &k_val, 4);
+            metal.setBytes(encoder, u32, &n_val, 5);
+            metal.setBytes(
+                encoder,
+                f32,
+                &learning_rate,
+                6,
+            );
+
+            // Output is [in × out].
+            device.dispatch2D(
+                encoder,
+                device.weight_grad_sgd,
+                out_size,
+                in_size,
+            );
         }
     };
 }

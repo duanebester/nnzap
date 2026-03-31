@@ -582,8 +582,9 @@ fn encodeTrainGroup(
             bufs,
             slot,
         );
-
-        net.update(device, enc, learning_rate);
+        // No separate SGD update needed: backwardSGD
+        // applies gradient updates in-place during the
+        // backward pass, saving 1 dispatch per batch.
     }
 
     enc.msgSend(void, "endEncoding", .{});
@@ -593,6 +594,11 @@ fn encodeTrainGroup(
 
 /// Encode softmax-CE gradient, backward pass, using the
 /// specified buffer slot for input/target data.
+/// Encode softmax-CE gradient and fused backward+SGD,
+/// using the specified buffer slot for input/target data.
+/// The backwardSGD method computes gradients and applies
+/// the SGD update in-place, eliminating the separate
+/// update dispatch.
 fn encodeSoftmaxCEGradAndBackward(
     device: *const Device,
     net: *const MnistNet,
@@ -614,12 +620,13 @@ fn encodeSoftmaxCEGradAndBackward(
         max_batch,
     );
 
-    net.backward(
+    net.backwardSGD(
         device,
         enc,
         bufs.inputs[buf_idx],
         bufs.loss_grad,
         max_batch,
+        learning_rate,
     );
 }
 

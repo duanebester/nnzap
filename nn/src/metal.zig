@@ -114,6 +114,48 @@ pub const Buffer = struct {
         return result;
     }
 
+    /// Allocate a new Metal buffer with shared storage and
+    /// write-combined CPU cache mode.  Write-combined mode
+    /// bypasses the CPU cache on writes, avoiding cache
+    /// pollution for buffers the CPU fills but never reads.
+    /// Ideal for input buffers written by CPU (fillImageBatch)
+    /// and read only by the GPU (forward pass).
+    pub fn initWriteCombined(
+        device: objc.Object,
+        num_elements: u32,
+    ) !Buffer {
+        std.debug.assert(num_elements > 0);
+
+        const byte_len: usize =
+            @as(usize, num_elements) * @sizeOf(f32);
+        std.debug.assert(byte_len > 0);
+
+        const opts = MTLResourceOptions{
+            .cpu_cache_mode = .write_combined,
+            .storage_mode = .shared,
+        };
+
+        const raw = device.msgSend(
+            ?*anyopaque,
+            "newBufferWithLength:options:",
+            .{
+                @as(c_ulong, @intCast(byte_len)),
+                opts,
+            },
+        ) orelse return error.MetalBufferAllocFailed;
+
+        const result = Buffer{
+            .obj = objc.Object.fromId(raw),
+            .len = num_elements,
+        };
+
+        // Zero-fill to prevent stale data leaks.
+        const slice = result.asSlice();
+        @memset(slice, 0.0);
+
+        return result;
+    }
+
     /// Get a Zig []f32 slice that points directly into the Metal
     /// shared buffer. On Apple Silicon this IS the GPU memory —
     /// zero copy.
@@ -358,6 +400,14 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "argmax_predictions",
         .shader_name = "argmax_predictions",
     },
+    .{
+        .field_name = "bias_grad_sgd",
+        .shader_name = "bias_grad_sgd",
+    },
+    .{
+        .field_name = "weight_grad_sgd",
+        .shader_name = "weight_grad_sgd",
+    },
 };
 
 // ============================================================================
@@ -397,6 +447,8 @@ pub const Device = struct {
     ce_forward: ComputePipeline,
     softmax_ce_backward: ComputePipeline,
     argmax_predictions: ComputePipeline,
+    bias_grad_sgd: ComputePipeline,
+    weight_grad_sgd: ComputePipeline,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(

@@ -623,6 +623,95 @@ kernel void sgd_update(
 }
 
 // ============================================================================
+// Fused gradient + SGD update kernels
+// ============================================================================
+
+/// Fused bias gradient + SGD update:
+///   bias[n] -= lr * sum_m( grad_pre_act[m * N + n] )
+/// Eliminates the separate bias_grad write to a gradient
+/// buffer and the SGD read of that buffer.  One thread per
+/// output column sums the batch dimension and directly
+/// updates the bias parameter.
+kernel void bias_grad_sgd(
+    device const float* input    [[buffer(0)]],  // [M x N]
+    device float*       params   [[buffer(1)]],  // bias [N]
+    constant uint& M             [[buffer(2)]],
+    constant uint& N             [[buffer(3)]],
+    constant float& lr           [[buffer(4)]],
+    uint                gid      [[thread_position_in_grid]])
+{
+    if (gid >= N) return;
+
+    float sum = 0.0f;
+    for (uint m = 0; m < M; m++) {
+        sum += input[m * N + gid];
+    }
+    // Fused SGD: apply learning rate and update in-place.
+    params[gid] -= lr * sum;
+}
+
+/// Fused weight gradient + SGD update (tiled A^T * B):
+///   W[k, n] -= lr * sum_m( A[m*K+k] * B[m*N+n] )
+/// Same tiled matmul_transA logic but writes the SGD update
+/// directly to the param buffer instead of a gradient buffer.
+/// Eliminates the weight_grad write + SGD read round-trip.
+kernel void weight_grad_sgd(
+    device const float* A    [[buffer(0)]],  // [M x K]
+    device const float* B    [[buffer(1)]],  // [M x N]
+    device float*       W    [[buffer(2)]],  // [K x N] params
+    constant uint& M         [[buffer(3)]],
+    constant uint& K         [[buffer(4)]],
+    constant uint& N         [[buffer(5)]],
+    constant float& lr       [[buffer(6)]],
+    uint2 gid                [[thread_position_in_grid]],
+    uint2 lid                [[thread_position_in_threadgroup]])
+{
+    threadgroup float tileA[TS * TS];
+    threadgroup float tileB[TS * TS];
+
+    const uint out_row = gid.y;  // k
+    const uint out_col = gid.x;  // n
+
+    float sum = 0.0f;
+
+    // Tile over M (summation/contraction dimension).
+    const uint num_tiles = (M + TS - 1) / TS;
+    for (uint t = 0; t < num_tiles; t++) {
+        // Load A^T tile: A[t*TS+lid.x, out_row].
+        const uint m_idx = t * TS + lid.x;
+        if (out_row < K && m_idx < M) {
+            tileA[lid.y * TS + lid.x] =
+                A[m_idx * K + out_row];
+        } else {
+            tileA[lid.y * TS + lid.x] = 0.0f;
+        }
+
+        // Load B tile: B[t*TS+lid.y, out_col].
+        const uint m_idy = t * TS + lid.y;
+        if (m_idy < M && out_col < N) {
+            tileB[lid.y * TS + lid.x] =
+                B[m_idy * N + out_col];
+        } else {
+            tileB[lid.y * TS + lid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < TS; i++) {
+            sum += tileA[lid.y * TS + i]
+                 * tileB[i * TS + lid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Fused SGD: apply gradient directly to weights.
+    if (out_row < K && out_col < N) {
+        W[out_row * N + out_col] -= lr * sum;
+    }
+}
+
+// ============================================================================
 // Loss functions
 // ============================================================================
 
