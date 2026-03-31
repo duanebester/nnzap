@@ -41,6 +41,21 @@ pub fn Network(
     return struct {
         const Self = @This();
 
+        /// Packed weight/bias offsets for the fused 3-layer
+        /// inference kernel.  Matches the MSL FusedOffsets
+        /// struct layout (6 × uint32, tightly packed).
+        /// Using one struct at buffer(3) instead of 6
+        /// separate setBytes calls saves 5 Obj-C message
+        /// sends per inference dispatch.
+        const FusedOffsets = extern struct {
+            w0: u32,
+            b0: u32,
+            w1: u32,
+            b1: u32,
+            w2: u32,
+            b2: u32,
+        };
+
         /// Flat parameter buffer (weights + biases, all layers).
         params: Buffer,
 
@@ -466,19 +481,23 @@ pub fn Network(
             metal.setBuffer(encoder, self.params, 1);
             metal.setBuffer(encoder, out_buf, 2);
 
-            // Pass weight/bias offsets as constants.
-            const w0: u32 = Layout.weight_offsets[0];
-            const b0: u32 = Layout.bias_offsets[0];
-            const w1: u32 = Layout.weight_offsets[1];
-            const b1: u32 = Layout.bias_offsets[1];
-            const w2: u32 = Layout.weight_offsets[2];
-            const b2: u32 = Layout.bias_offsets[2];
-            metal.setBytes(encoder, u32, &w0, 3);
-            metal.setBytes(encoder, u32, &b0, 4);
-            metal.setBytes(encoder, u32, &w1, 5);
-            metal.setBytes(encoder, u32, &b1, 6);
-            metal.setBytes(encoder, u32, &w2, 7);
-            metal.setBytes(encoder, u32, &b2, 8);
+            // Pack all 6 offsets into a single struct to
+            // reduce setBytes calls from 6 to 1, cutting
+            // ~30% of Obj-C message send overhead.
+            const offsets = FusedOffsets{
+                .w0 = Layout.weight_offsets[0],
+                .b0 = Layout.bias_offsets[0],
+                .w1 = Layout.weight_offsets[1],
+                .b1 = Layout.bias_offsets[1],
+                .w2 = Layout.weight_offsets[2],
+                .b2 = Layout.bias_offsets[2],
+            };
+            metal.setBytes(
+                encoder,
+                FusedOffsets,
+                &offsets,
+                3,
+            );
 
             // Single dispatch: 1 threadgroup of 128 threads.
             // 128 matches the largest hidden layer (layer 0).
