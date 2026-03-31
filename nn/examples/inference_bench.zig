@@ -43,6 +43,11 @@ const CPU_LATENCY_ITERS: u32 = 1_000;
 const BATCHES_PER_CMD: u32 = 64;
 const MAX_LATENCY_SAMPLES: u32 = 10_000;
 
+/// Samples per mega-dispatch: one dispatch covers
+/// BATCHES_PER_CMD × BATCH_SIZE samples, eliminating
+/// all inter-dispatch Metal barriers within a cmd buf.
+const MEGA_SAMPLES: u32 = BATCHES_PER_CMD * BATCH_SIZE;
+
 const seed: u64 = 42;
 
 comptime {
@@ -130,16 +135,29 @@ pub fn main() !void {
         prng.random(),
     );
 
-    // Single input buffer, reused for all phases.
-    // Sized for the largest batch (BATCH_SIZE); single-
-    // sample phases just read the first input_size floats.
-
+    // Small input buffer for single-sample phases.
     var input_buf = try device.createBuffer(
         BATCH_SIZE * Layout.input_size,
     );
     defer input_buf.deinit();
 
     fillRandom(input_buf.asSlice(), prng.random());
+
+    // Mega input/output buffers for batched phase.
+    // Dispatch MEGA_SAMPLES per dispatch call,
+    // eliminating inter-dispatch Metal barriers.
+
+    var mega_in = try device.createBuffer(
+        MEGA_SAMPLES * Layout.input_size,
+    );
+    defer mega_in.deinit();
+
+    fillRandom(mega_in.asSlice(), prng.random());
+
+    var mega_out = try device.createBuffer(
+        MEGA_SAMPLES * Layout.output_size,
+    );
+    defer mega_out.deinit();
 
     // Warm the GPU pipeline before measuring.
     std.debug.print(
@@ -152,7 +170,8 @@ pub fn main() !void {
     const gpu_batched = benchGpuBatched(
         &device,
         &net,
-        input_buf,
+        mega_in,
+        mega_out,
     );
     printGpuBatched(gpu_batched);
 
@@ -199,8 +218,8 @@ fn warmup(
     std.debug.assert(input.len >= Layout.input_size);
     std.debug.assert(WARMUP_ITERS > 0);
 
-    // Warm fused single-sample path (unretained to match
-    // the measurement path).
+    // Warm fused single-sample path (unretained + spin
+    // wait to match the measurement path).
     var i: u32 = 0;
     while (i < WARMUP_ITERS) : (i += 1) {
         const cmd = device.beginCommandBufferUnretained();
@@ -227,44 +246,51 @@ fn warmup(
 // Phase 1 — GPU batched throughput
 // ====================================================
 
-/// Forward-pass many samples in batches, packed into
-/// multi-batch command buffers.  Measures peak throughput
-/// with amortised Metal dispatch overhead.
+/// Forward-pass many samples via mega-dispatch.  Each
+/// command buffer dispatches BATCHES_PER_CMD × BATCH_SIZE
+/// samples in ONE dispatch call — eliminating implicit
+/// Metal barriers between per-batch dispatches and
+/// reducing Obj-C message overhead from ~192 to ~6 per
+/// command buffer.
 fn benchGpuBatched(
     device: *const Device,
     net: *const Net,
     input: Buffer,
+    mega_out: Buffer,
 ) GpuBatchedResult {
-    const min_len = BATCH_SIZE * Layout.input_size;
-    std.debug.assert(input.len >= min_len);
+    std.debug.assert(
+        input.len >= MEGA_SAMPLES * Layout.input_size,
+    );
+    std.debug.assert(
+        mega_out.len >=
+            MEGA_SAMPLES * Layout.output_size,
+    );
     std.debug.assert(GPU_THROUGHPUT_BATCHES > 0);
 
     const total_samples: u32 =
         GPU_THROUGHPUT_BATCHES * BATCH_SIZE;
     const start = std.time.nanoTimestamp();
 
-    var batch: u32 = 0;
-    while (batch < GPU_THROUGHPUT_BATCHES) {
-        const remaining =
-            GPU_THROUGHPUT_BATCHES - batch;
-        const group = @min(BATCHES_PER_CMD, remaining);
+    // Process samples in mega-batches: one dispatch
+    // per MEGA_SAMPLES, packed into command buffers.
+    // This eliminates implicit Metal barriers between
+    // the original per-batch dispatches.
+    var done: u32 = 0;
+    while (done < total_samples) {
+        const remaining = total_samples - done;
+        const this_batch = @min(
+            MEGA_SAMPLES,
+            remaining,
+        );
 
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
-
-        var g: u32 = 0;
-        while (g < group) : (g += 1) {
-            net.forwardInferFusedBatched(
-                device,
-                enc,
-                input,
-                BATCH_SIZE,
-            );
-        }
-
+        net.forwardInferFusedBatchedExt(
+            device, enc, input, mega_out, this_batch,
+        );
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndWait(cmd);
-        batch += group;
+        done += this_batch;
     }
 
     const elapsed_ms = nanosToMs(
@@ -287,10 +313,15 @@ fn benchGpuBatched(
 // Phase 2 — GPU single-sample latency
 // ====================================================
 
-/// One forward pass per command buffer, commitAndWait
-/// each time.  Measures full Metal round-trip for
+/// One forward pass per command buffer, spin-polling
+/// for completion.  Measures full Metal round-trip for
 /// batch=1 — includes command buffer creation, encoder
 /// setup, dispatch, and GPU-to-CPU synchronisation.
+///
+/// Uses commitAndSpinWait to avoid the Mach kernel
+/// trap in waitUntilCompleted (~50-100 us overhead).
+/// The CPU busy-polls command buffer status, which is
+/// faster for very short GPU work (< 50 us compute).
 ///
 /// Uses the fused 3-layer kernel to minimise dispatch
 /// overhead: 1 dispatch instead of 3 per forward pass.

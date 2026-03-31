@@ -179,6 +179,47 @@ pub const Buffer = struct {
     }
 };
 
+/// Half-precision buffer for inference weight storage.
+/// Stores float16 values — half the memory bandwidth of
+/// float32 buffers.  Created via GPU conversion kernel
+/// from an existing float32 buffer.
+pub const HalfBuffer = struct {
+    obj: objc.Object,
+    len: u32, // number of f16 elements
+
+    /// Allocate a half-precision Metal buffer.
+    pub fn init(
+        device: objc.Object,
+        num_elements: u32,
+    ) !HalfBuffer {
+        std.debug.assert(num_elements > 0);
+
+        // f16 is 2 bytes per element.
+        const byte_len: usize =
+            @as(usize, num_elements) * 2;
+        std.debug.assert(byte_len > 0);
+
+        const raw = device.msgSend(
+            ?*anyopaque,
+            "newBufferWithLength:options:",
+            .{
+                @as(c_ulong, @intCast(byte_len)),
+                MTLResourceOptions.storage_shared,
+            },
+        ) orelse return error.MetalBufferAllocFailed;
+
+        return .{
+            .obj = objc.Object.fromId(raw),
+            .len = num_elements,
+        };
+    }
+
+    pub fn deinit(self: *HalfBuffer) void {
+        self.obj.msgSend(void, "release", .{});
+        self.* = undefined;
+    }
+};
+
 // ============================================================================
 // MultiBuffered — generic N-buffered resource for overlapping CPU/GPU work
 // ============================================================================
@@ -433,6 +474,18 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "matmul_bias_relu_infer_packed",
         .shader_name = "matmul_bias_relu_infer_packed",
     },
+    .{
+        .field_name = "f32_to_f16",
+        .shader_name = "f32_to_f16",
+    },
+    .{
+        .field_name = "forward_fused_infer_batched_f16",
+        .shader_name = "forward_fused_infer_batched_f16",
+    },
+    .{
+        .field_name = "forward_fused_infer_single_f16",
+        .shader_name = "forward_fused_infer_single_f16",
+    },
 };
 
 // ============================================================================
@@ -480,6 +533,9 @@ pub const Device = struct {
     forward_fused_infer_batched: ComputePipeline,
     matmul_bias_packed: ComputePipeline,
     matmul_bias_relu_infer_packed: ComputePipeline,
+    f32_to_f16: ComputePipeline,
+    forward_fused_infer_batched_f16: ComputePipeline,
+    forward_fused_infer_single_f16: ComputePipeline,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(

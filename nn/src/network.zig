@@ -601,6 +601,272 @@ pub fn Network(
             );
         }
 
+        /// Fused batched inference with an external output
+        /// buffer.  Allows batch sizes larger than
+        /// max_batch_size because the fused kernel uses
+        /// threadgroup memory for intermediates — only
+        /// the output buffer needs to be large enough.
+        /// This enables mega-dispatches that eliminate
+        /// per-dispatch Metal barriers.
+        pub fn forwardInferFusedBatchedExt(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+            output: Buffer,
+            batch_size: u32,
+        ) void {
+            assertFusedV2Offsets();
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(
+                input.len >=
+                    @as(usize, batch_size) *
+                        Layout.input_size,
+            );
+            std.debug.assert(
+                output.len >=
+                    @as(usize, batch_size) *
+                        Layout.output_size,
+            );
+
+            // 3 buffers: input, params, output.
+            const bufs = [_]Buffer{
+                input, self.params, output,
+            };
+            metal.setBuffersBatch(encoder, &bufs, 0);
+
+            const pipeline =
+                device.forward_fused_infer_batched;
+            encoder.msgSend(
+                void,
+                "setComputePipelineState:",
+                .{pipeline.state.value},
+            );
+
+            // 1 threadgroup per sample, 128 threads.
+            encoder.msgSend(
+                void,
+                "dispatchThreadgroups:" ++
+                    "threadsPerThreadgroup:",
+                .{
+                    metal.MTLSize{
+                        .width = batch_size,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                    metal.MTLSize{
+                        .width = 128,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                },
+            );
+        }
+
+        // ====================================================
+        // Half-precision inference constants
+        // ====================================================
+
+        /// Total weight-only element count (no biases).
+        pub const f16_weight_count: u32 = blk: {
+            var total: u32 = 0;
+            for (0..Layout.num_layers) |i| {
+                total +=
+                    Layout.layers[i].in *
+                    Layout.layers[i].out;
+            }
+            break :blk total;
+        };
+
+        /// Total bias element count across all layers.
+        pub const f16_bias_count: u32 = blk: {
+            var total: u32 = 0;
+            for (0..Layout.num_layers) |i| {
+                total += Layout.layers[i].out;
+            }
+            break :blk total;
+        };
+
+        // ====================================================
+        // Half-precision GPU inference
+        // ====================================================
+
+        /// Batched f16-weight inference: one dispatch
+        /// processes all samples.  The f16 weight buffer
+        /// and f32 bias buffer are pre-populated by the
+        /// caller via convertParamsToF16.
+        pub fn forwardInferBatchedF16(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+            params_h: metal.HalfBuffer,
+            bias_f32: Buffer,
+            batch_size: u32,
+        ) void {
+            assertFusedV2Offsets();
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(batch_size <= max_batch_size);
+            std.debug.assert(
+                params_h.len >= f16_weight_count,
+            );
+            std.debug.assert(
+                bias_f32.len >= f16_bias_count,
+            );
+
+            const last = Layout.num_layers - 1;
+            const out_buf = self.post_activations[last];
+
+            // 4 buffers: input, params_h, output, bias.
+            encoder.msgSend(
+                void,
+                "setBuffer:offset:atIndex:",
+                .{
+                    input.obj.value,
+                    @as(c_ulong, 0),
+                    @as(c_ulong, 0),
+                },
+            );
+            encoder.msgSend(
+                void,
+                "setBuffer:offset:atIndex:",
+                .{
+                    params_h.obj.value,
+                    @as(c_ulong, 0),
+                    @as(c_ulong, 1),
+                },
+            );
+            encoder.msgSend(
+                void,
+                "setBuffer:offset:atIndex:",
+                .{
+                    out_buf.obj.value,
+                    @as(c_ulong, 0),
+                    @as(c_ulong, 2),
+                },
+            );
+            encoder.msgSend(
+                void,
+                "setBuffer:offset:atIndex:",
+                .{
+                    bias_f32.obj.value,
+                    @as(c_ulong, 0),
+                    @as(c_ulong, 3),
+                },
+            );
+
+            const pipeline =
+                device.forward_fused_infer_batched_f16;
+            encoder.msgSend(
+                void,
+                "setComputePipelineState:",
+                .{pipeline.state.value},
+            );
+
+            encoder.msgSend(
+                void,
+                "dispatchThreadgroups:" ++
+                    "threadsPerThreadgroup:",
+                .{
+                    metal.MTLSize{
+                        .width = batch_size,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                    metal.MTLSize{
+                        .width = 128,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                },
+            );
+        }
+
+        /// Single-sample f16-weight inference.
+        pub fn forwardInferSingleF16(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+            params_h: metal.HalfBuffer,
+            bias_f32: Buffer,
+        ) void {
+            assertFusedV2Offsets();
+            std.debug.assert(
+                params_h.len >= f16_weight_count,
+            );
+            std.debug.assert(
+                bias_f32.len >= f16_bias_count,
+            );
+
+            const last = Layout.num_layers - 1;
+            const out_buf = self.post_activations[last];
+
+            // 4 buffers: input, params_h, output, bias.
+            encoder.msgSend(
+                void,
+                "setBuffer:offset:atIndex:",
+                .{
+                    input.obj.value,
+                    @as(c_ulong, 0),
+                    @as(c_ulong, 0),
+                },
+            );
+            encoder.msgSend(
+                void,
+                "setBuffer:offset:atIndex:",
+                .{
+                    params_h.obj.value,
+                    @as(c_ulong, 0),
+                    @as(c_ulong, 1),
+                },
+            );
+            encoder.msgSend(
+                void,
+                "setBuffer:offset:atIndex:",
+                .{
+                    out_buf.obj.value,
+                    @as(c_ulong, 0),
+                    @as(c_ulong, 2),
+                },
+            );
+            encoder.msgSend(
+                void,
+                "setBuffer:offset:atIndex:",
+                .{
+                    bias_f32.obj.value,
+                    @as(c_ulong, 0),
+                    @as(c_ulong, 3),
+                },
+            );
+
+            const pipeline =
+                device.forward_fused_infer_single_f16;
+            encoder.msgSend(
+                void,
+                "setComputePipelineState:",
+                .{pipeline.state.value},
+            );
+
+            encoder.msgSend(
+                void,
+                "dispatchThreadgroups:" ++
+                    "threadsPerThreadgroup:",
+                .{
+                    metal.MTLSize{
+                        .width = 1,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                    metal.MTLSize{
+                        .width = 128,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                },
+            );
+        }
+
         // ====================================================
         // CPU forward pass (pure Zig, no Metal)
         // ====================================================
@@ -2209,15 +2475,19 @@ pub fn Network(
                 }
             }
 
-            // Core mkn loop with k unrolled by 4.
+            // Pass raw pointers to inner loop to skip
+            // per-element bounds checks in Debug mode.
+            // Safety: weights.len >= in_size * out_size
+            // (asserted above); in_row is [in_size] (by
+            // type); k < in_size enforced by loop bound.
             cpuMknLoop(
                 VEC_LEN,
                 in_size,
                 out_size,
                 vec_count,
                 vec_tail,
-                in_row,
-                weights,
+                @as([*]const f32, in_row),
+                weights.ptr,
                 &accum,
                 &tail_accum,
             );
@@ -2244,8 +2514,8 @@ pub fn Network(
             comptime out_size: u32,
             comptime vc: u32,
             comptime vt: u32,
-            in_row: *const [in_size]f32,
-            weights: []const f32,
+            in_ptr: [*]const f32,
+            w_ptr: [*]const f32,
             accum: *[vc]@Vector(VEC, f32),
             tail_accum: *[vt]f32,
         ) void {
@@ -2254,11 +2524,14 @@ pub fn Network(
                 std.debug.assert(out_size > 0);
             }
 
-            // Unroll by 8: halves k-loop iterations vs
-            // unroll-by-4, amortising v-loop overhead.
-            // All MNIST layers divide by 8: 784/8=98,
-            // 128/8=16, 64/8=8.
+            // Pointer-advancing loop: avoids integer
+            // multiply (k*out_size) and addition (k+i)
+            // overflow checks in Debug mode.  Instead,
+            // advance input/weight pointers each step.
             const k_main8 = (in_size / 8) * 8;
+            const stride8 = @as(usize, out_size) * 8;
+            var in_p = in_ptr;
+            var w_p = w_ptr;
             var k: u32 = 0;
 
             while (k < k_main8) : (k += 8) {
@@ -2267,36 +2540,35 @@ pub fn Network(
                     out_size,
                     vc,
                     vt,
-                    in_row,
-                    weights,
+                    in_p,
+                    w_p,
                     accum,
                     tail_accum,
-                    k,
                 );
+                in_p += 8;
+                w_p += stride8;
             }
 
             // Remainder (0-7 elements, one at a time).
             while (k < in_size) : (k += 1) {
                 const x_k: @Vector(VEC, f32) =
-                    @splat(in_row[k]);
-                const w_row =
-                    weights[k * out_size ..];
+                    @splat(in_p[0]);
 
                 inline for (0..vc) |v| {
-                    const o = v * VEC;
                     const wv: @Vector(VEC, f32) =
-                        w_row[o..][0..VEC].*;
+                        w_p[v * VEC ..][0..VEC].*;
                     accum[v] += x_k * wv;
                 }
 
                 if (vt > 0) {
-                    const o = vc * VEC;
                     inline for (0..vt) |t| {
                         tail_accum[t] +=
-                            in_row[k] *
-                            w_row[o + t];
+                            in_p[0] *
+                            w_p[vc * VEC + t];
                     }
                 }
+                in_p += 1;
+                w_p += out_size;
             }
         }
 
@@ -2308,11 +2580,10 @@ pub fn Network(
             comptime out_size: u32,
             comptime vc: u32,
             comptime vt: u32,
-            in_row: anytype,
-            weights: []const f32,
+            in_p: [*]const f32,
+            w_p: [*]const f32,
             accum: *[vc]@Vector(VEC, f32),
             tail_accum: *[vt]f32,
-            k: u32,
         ) void {
             comptime {
                 std.debug.assert(VEC > 0);
@@ -2320,37 +2591,36 @@ pub fn Network(
             }
 
             const V = @Vector(VEC, f32);
-            // Broadcast 8 input scalars.
-            const x0: V = @splat(in_row[k]);
-            const x1: V = @splat(in_row[k + 1]);
-            const x2: V = @splat(in_row[k + 2]);
-            const x3: V = @splat(in_row[k + 3]);
-            const x4: V = @splat(in_row[k + 4]);
-            const x5: V = @splat(in_row[k + 5]);
-            const x6: V = @splat(in_row[k + 6]);
-            const x7: V = @splat(in_row[k + 7]);
+            // Pre-offset pointers from caller — no
+            // integer arithmetic for k+i or k*out_size.
+            // Eliminates overflow checks in Debug mode.
+            const x0: V = @splat(in_p[0]);
+            const x1: V = @splat(in_p[1]);
+            const x2: V = @splat(in_p[2]);
+            const x3: V = @splat(in_p[3]);
+            const x4: V = @splat(in_p[4]);
+            const x5: V = @splat(in_p[5]);
+            const x6: V = @splat(in_p[6]);
+            const x7: V = @splat(in_p[7]);
 
-            // Comptime-unrolled v-loop: each iteration
-            // uses a comptime index for zero loop overhead.
-            // Chained @mulAdd emits FMLA on Apple Silicon.
-            const b0 = @as(usize, k) * out_size;
+            // Weight rows at stride out_size.
             const s = out_size;
             inline for (0..vc) |v| {
-                const b = b0 + v * VEC;
-                var a = @mulAdd(V, x0, weights[b ..][0..VEC].*, accum[v]);
-                a = @mulAdd(V, x1, weights[b + s ..][0..VEC].*, a);
-                a = @mulAdd(V, x2, weights[b + 2 * s ..][0..VEC].*, a);
-                a = @mulAdd(V, x3, weights[b + 3 * s ..][0..VEC].*, a);
-                a = @mulAdd(V, x4, weights[b + 4 * s ..][0..VEC].*, a);
-                a = @mulAdd(V, x5, weights[b + 5 * s ..][0..VEC].*, a);
-                a = @mulAdd(V, x6, weights[b + 6 * s ..][0..VEC].*, a);
-                accum[v] = @mulAdd(V, x7, weights[b + 7 * s ..][0..VEC].*, a);
+                const w_v = w_p + v * VEC;
+                var a = @mulAdd(V, x0, w_v[0..VEC].*, accum[v]);
+                a = @mulAdd(V, x1, w_v[s..][0..VEC].*, a);
+                a = @mulAdd(V, x2, w_v[2 * s ..][0..VEC].*, a);
+                a = @mulAdd(V, x3, w_v[3 * s ..][0..VEC].*, a);
+                a = @mulAdd(V, x4, w_v[4 * s ..][0..VEC].*, a);
+                a = @mulAdd(V, x5, w_v[5 * s ..][0..VEC].*, a);
+                a = @mulAdd(V, x6, w_v[6 * s ..][0..VEC].*, a);
+                accum[v] = @mulAdd(V, x7, w_v[7 * s ..][0..VEC].*, a);
             }
 
             if (vt > 0) {
                 cpuMknTail8(
                     out_size, vc, VEC, vt,
-                    in_row, weights, tail_accum, k,
+                    in_p, w_p, tail_accum,
                 );
             }
         }
@@ -2362,36 +2632,29 @@ pub fn Network(
             comptime vc: u32,
             comptime VEC: u32,
             comptime vt: u32,
-            in_row: anytype,
-            weights: []const f32,
+            in_p: [*]const f32,
+            w_p: [*]const f32,
             tail_accum: *[vt]f32,
-            k: u32,
         ) void {
             comptime {
                 std.debug.assert(vt > 0);
                 std.debug.assert(out_size > 0);
             }
 
-            const o = vc * VEC;
+            // Pre-offset pointers — no k arithmetic.
+            const w_t = w_p + vc * VEC;
+            const s = out_size;
             inline for (0..vt) |t| {
-                const b = @as(usize, k) *
-                    out_size + o + t;
-                const s = out_size;
+                const w_e = w_t + t;
                 tail_accum[t] +=
-                    in_row[k] * weights[b] +
-                    in_row[k + 1] * weights[b + s] +
-                    in_row[k + 2] *
-                    weights[b + 2 * s] +
-                    in_row[k + 3] *
-                    weights[b + 3 * s] +
-                    in_row[k + 4] *
-                    weights[b + 4 * s] +
-                    in_row[k + 5] *
-                    weights[b + 5 * s] +
-                    in_row[k + 6] *
-                    weights[b + 6 * s] +
-                    in_row[k + 7] *
-                    weights[b + 7 * s];
+                    in_p[0] * w_e[0] +
+                    in_p[1] * w_e[s] +
+                    in_p[2] * w_e[2 * s] +
+                    in_p[3] * w_e[3 * s] +
+                    in_p[4] * w_e[4 * s] +
+                    in_p[5] * w_e[5 * s] +
+                    in_p[6] * w_e[6 * s] +
+                    in_p[7] * w_e[7 * s];
             }
         }
 

@@ -1313,6 +1313,168 @@ kernel void forward_fused_infer_batched(
 }
 
 // ============================================================================
+// Float32 to Float16 parameter conversion
+// ============================================================================
+
+/// Convert float32 parameters to float16 for inference.
+/// Halves memory bandwidth for weight reads. Accuracy loss
+/// is negligible for inference (no gradient accumulation).
+/// One thread per parameter element.
+kernel void f32_to_f16(
+    device const float* src  [[buffer(0)]],
+    device half*        dst  [[buffer(1)]],
+    uint                gid  [[thread_position_in_grid]])
+{
+    dst[gid] = half(src[gid]);
+}
+
+// ============================================================================
+// Fused batched inference with half-precision weights
+// ============================================================================
+
+/// Half-precision weight variant of the fused batched kernel.
+/// Reads weights as float16 (halving memory bandwidth) and
+/// accumulates in float32 for numerical stability. Biases
+/// remain float32 (tiny — 202 elements total).
+///
+/// Weight reads dominate bandwidth: layer 0 alone is 100K
+/// weights. In float16, that's 200KB vs 400KB in float32,
+/// halving L2 cache pressure for batched inference.
+kernel void forward_fused_infer_batched_f16(
+    device const float* input     [[buffer(0)]],
+    device const half*  params_h  [[buffer(1)]],
+    device float*       output    [[buffer(2)]],
+    device const float* bias_f32  [[buffer(3)]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint tgid   [[threadgroup_position_in_grid]])
+{
+    // Layer dimensions (comptime-known architecture).
+    constexpr uint IN0  = 784;
+    constexpr uint OUT0 = 128;
+    constexpr uint OUT1 = 64;
+    constexpr uint OUT2 = 10;
+
+    // Weight offsets in the half-precision param buffer.
+    // Only weights are stored as half; biases from bias_f32.
+    constexpr uint W0_OFF = 0;
+    constexpr uint W1_OFF = 100352;   // 784 * 128
+    constexpr uint W2_OFF = 108544;   // W1_OFF + 128*64
+
+    // Bias offsets in the float32 bias buffer.
+    // bias_f32 layout: [B0(128), B1(64), B2(10)] = 202 floats.
+    constexpr uint B0_OFF = 0;
+    constexpr uint B1_OFF = 128;
+    constexpr uint B2_OFF = 192;
+
+    // Per-threadgroup intermediates.
+    threadgroup float act0[OUT0];
+    threadgroup float act1[OUT1];
+
+    // Offset input/output by sample index.
+    device const float* sample_in = input + tgid * IN0;
+    device float* sample_out = output + tgid * OUT2;
+
+    // ---- Layer 0: 784 → 128, ReLU ----
+    {
+        device const half* W0 = params_h + W0_OFF;
+        float sum = bias_f32[B0_OFF + tid];
+        for (uint k = 0; k < IN0; k++) {
+            sum += sample_in[k] * float(W0[k * OUT0 + tid]);
+        }
+        act0[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 1: 128 → 64, ReLU ----
+    if (tid < OUT1) {
+        device const half* W1 = params_h + W1_OFF;
+        float sum = bias_f32[B1_OFF + tid];
+        for (uint k = 0; k < OUT0; k++) {
+            sum += act0[k] * float(W1[k * OUT1 + tid]);
+        }
+        act1[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 2: 64 → 10, none ----
+    if (tid < OUT2) {
+        device const half* W2 = params_h + W2_OFF;
+        float sum = bias_f32[B2_OFF + tid];
+        for (uint k = 0; k < OUT1; k++) {
+            sum += act1[k] * float(W2[k * OUT2 + tid]);
+        }
+        sample_out[tid] = sum;
+    }
+}
+
+// ============================================================================
+// Fused single-sample inference with half-precision weights
+// ============================================================================
+
+/// Half-precision weight variant for single-sample inference.
+/// Same structure as forward_fused_infer_3layer_v2 but reads
+/// weights as float16. Reduces memory bandwidth by 2x.
+kernel void forward_fused_infer_single_f16(
+    device const float* input     [[buffer(0)]],
+    device const half*  params_h  [[buffer(1)]],
+    device float*       output    [[buffer(2)]],
+    device const float* bias_f32  [[buffer(3)]],
+    uint tid                      [[thread_index_in_threadgroup]])
+{
+    constexpr uint IN0  = 784;
+    constexpr uint OUT0 = 128;
+    constexpr uint OUT1 = 64;
+    constexpr uint OUT2 = 10;
+
+    constexpr uint W0_OFF = 0;
+    constexpr uint W1_OFF = 100352;
+    constexpr uint W2_OFF = 108544;
+
+    constexpr uint B0_OFF = 0;
+    constexpr uint B1_OFF = 128;
+    constexpr uint B2_OFF = 192;
+
+    threadgroup float act0[OUT0];
+    threadgroup float act1[OUT1];
+
+    // ---- Layer 0: 784 → 128, ReLU ----
+    {
+        device const half* W0 = params_h + W0_OFF;
+        float sum = bias_f32[B0_OFF + tid];
+        for (uint k = 0; k < IN0; k++) {
+            sum += input[k] * float(W0[k * OUT0 + tid]);
+        }
+        act0[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 1: 128 → 64, ReLU ----
+    if (tid < OUT1) {
+        device const half* W1 = params_h + W1_OFF;
+        float sum = bias_f32[B1_OFF + tid];
+        for (uint k = 0; k < OUT0; k++) {
+            sum += act0[k] * float(W1[k * OUT1 + tid]);
+        }
+        act1[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 2: 64 → 10, none ----
+    if (tid < OUT2) {
+        device const half* W2 = params_h + W2_OFF;
+        float sum = bias_f32[B2_OFF + tid];
+        for (uint k = 0; k < OUT1; k++) {
+            sum += act1[k] * float(W2[k * OUT2 + tid]);
+        }
+        output[tid] = sum;
+    }
+}
+
+// ============================================================================
 // Adam parameter update
 // ============================================================================
 
