@@ -189,6 +189,8 @@ pub fn main() !void {
 /// Run warmup forward passes to prime the GPU pipeline.
 /// Metal JITs shader compilation on first dispatch, so
 /// cold starts would skew latency measurements.
+/// Warms both the batched path (forwardInfer) and the
+/// single-sample fused path (forwardInferFused).
 fn warmup(
     device: *const Device,
     net: *const Net,
@@ -197,8 +199,19 @@ fn warmup(
     std.debug.assert(input.len >= Layout.input_size);
     std.debug.assert(WARMUP_ITERS > 0);
 
+    // Warm fused single-sample path.
     var i: u32 = 0;
     while (i < WARMUP_ITERS) : (i += 1) {
+        const cmd = device.beginCommandBuffer();
+        const enc = device.beginCompute(cmd);
+        net.forwardInferFused(device, enc, input);
+        enc.msgSend(void, "endEncoding", .{});
+        device.commitAndWait(cmd);
+    }
+
+    // Warm batched path (separate dispatches).
+    i = 0;
+    while (i < WARMUP_ITERS / 10) : (i += 1) {
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
         net.forwardInfer(device, enc, input, 1);
@@ -275,6 +288,9 @@ fn benchGpuBatched(
 /// each time.  Measures full Metal round-trip for
 /// batch=1 — includes command buffer creation, encoder
 /// setup, dispatch, and GPU-to-CPU synchronisation.
+///
+/// Uses the fused 3-layer kernel to minimise dispatch
+/// overhead: 1 dispatch instead of 3 per forward pass.
 fn benchGpuSingle(
     device: *const Device,
     net: *const Net,
@@ -291,7 +307,7 @@ fn benchGpuSingle(
 
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
-        net.forwardInfer(device, enc, input, 1);
+        net.forwardInferFused(device, enc, input);
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndWait(cmd);
 

@@ -928,6 +928,98 @@ kernel void argmax_predictions(
 }
 
 // ============================================================================
+// Fused 3-layer inference for batch=1 (784→128→64→10)
+// ============================================================================
+
+/// Single-dispatch inference for the MNIST architecture.
+/// Computes all three layers (784→128 relu, 128→64 relu,
+/// 64→10 none) in one kernel dispatch, eliminating two
+/// setPipelineState + dispatchThreadgroups round-trips.
+///
+/// Uses threadgroup memory for inter-layer activations so
+/// intermediate results stay on-chip.  128 threads per
+/// threadgroup (matching the largest hidden layer).
+///
+/// Buffer layout:
+///   buffer(0): input [784]
+///   buffer(1): params [109386] — full param buffer
+///   buffer(2): output [10] — final logits
+///   buffer(3..8): weight/bias offsets (6 uint constants)
+///
+/// Thread model: 1 threadgroup of 128 threads.  Each thread
+/// computes one output element per layer (threads >= layer
+/// output size are idle for that layer).
+kernel void forward_fused_infer_3layer(
+    device const float* input    [[buffer(0)]],
+    device const float* params   [[buffer(1)]],
+    device float*       output   [[buffer(2)]],
+    constant uint& w0_off        [[buffer(3)]],
+    constant uint& b0_off        [[buffer(4)]],
+    constant uint& w1_off        [[buffer(5)]],
+    constant uint& b1_off        [[buffer(6)]],
+    constant uint& w2_off        [[buffer(7)]],
+    constant uint& b2_off        [[buffer(8)]],
+    uint tid                     [[thread_index_in_threadgroup]])
+{
+    // Layer dimensions (comptime-known architecture).
+    constexpr uint IN0  = 784;
+    constexpr uint OUT0 = 128;
+    constexpr uint OUT1 = 64;
+    constexpr uint OUT2 = 10;
+
+    // Threadgroup memory for intermediate activations.
+    // Only OUT0 (128) floats needed — reused between layers.
+    threadgroup float act0[OUT0];  // layer 0 output
+    threadgroup float act1[OUT1];  // layer 1 output
+
+    // ---- Layer 0: 784 → 128, ReLU ----
+    // Each of 128 threads computes one output element.
+    {
+        device const float* W0 = params + w0_off;
+        device const float* B0 = params + b0_off;
+
+        float sum = B0[tid];
+        // W0 is [IN0 x OUT0] row-major: W0[k * OUT0 + tid]
+        // gives coalesced reads across threads in a SIMD group.
+        for (uint k = 0; k < IN0; k++) {
+            sum += input[k] * W0[k * OUT0 + tid];
+        }
+        act0[tid] = max(0.0f, sum);  // ReLU
+    }
+
+    // Sync so all 128 outputs are visible.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 1: 128 → 64, ReLU ----
+    // Only first 64 threads are active.
+    if (tid < OUT1) {
+        device const float* W1 = params + w1_off;
+        device const float* B1 = params + b1_off;
+
+        float sum = B1[tid];
+        for (uint k = 0; k < OUT0; k++) {
+            sum += act0[k] * W1[k * OUT1 + tid];
+        }
+        act1[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 2: 64 → 10, none ----
+    // Only first 10 threads are active.
+    if (tid < OUT2) {
+        device const float* W2 = params + w2_off;
+        device const float* B2 = params + b2_off;
+
+        float sum = B2[tid];
+        for (uint k = 0; k < OUT1; k++) {
+            sum += act1[k] * W2[k * OUT2 + tid];
+        }
+        output[tid] = sum;  // No activation.
+    }
+}
+
+// ============================================================================
 // Adam parameter update
 // ============================================================================
 

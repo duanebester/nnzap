@@ -424,6 +424,91 @@ pub fn Network(
         }
 
         // ====================================================
+        // Fused 3-layer inference (single dispatch)
+        // ====================================================
+
+        /// Encode all 3 layers in a single GPU dispatch
+        /// using the forward_fused_infer_3layer kernel.
+        /// Only valid for batch_size=1 and 3-layer networks.
+        /// Eliminates 2 setPipelineState + 2 dispatch calls
+        /// worth of Metal API overhead (~100 us savings).
+        ///
+        /// Writes final output to post_activations[last],
+        /// readable via getOutput().asSlice().
+        pub fn forwardInferFused(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+        ) void {
+            comptime {
+                // This kernel is architecture-specific:
+                // exactly 3 layers, ReLU/ReLU/none.
+                std.debug.assert(Layout.num_layers == 3);
+                std.debug.assert(
+                    Layout.layers[0].act == .relu,
+                );
+                std.debug.assert(
+                    Layout.layers[1].act == .relu,
+                );
+                std.debug.assert(
+                    Layout.layers[2].act == .none,
+                );
+            }
+            std.debug.assert(
+                input.len >= Layout.input_size,
+            );
+
+            const last = Layout.num_layers - 1;
+            const out_buf = self.post_activations[last];
+
+            metal.setBuffer(encoder, input, 0);
+            metal.setBuffer(encoder, self.params, 1);
+            metal.setBuffer(encoder, out_buf, 2);
+
+            // Pass weight/bias offsets as constants.
+            const w0: u32 = Layout.weight_offsets[0];
+            const b0: u32 = Layout.bias_offsets[0];
+            const w1: u32 = Layout.weight_offsets[1];
+            const b1: u32 = Layout.bias_offsets[1];
+            const w2: u32 = Layout.weight_offsets[2];
+            const b2: u32 = Layout.bias_offsets[2];
+            metal.setBytes(encoder, u32, &w0, 3);
+            metal.setBytes(encoder, u32, &b0, 4);
+            metal.setBytes(encoder, u32, &w1, 5);
+            metal.setBytes(encoder, u32, &b1, 6);
+            metal.setBytes(encoder, u32, &w2, 7);
+            metal.setBytes(encoder, u32, &b2, 8);
+
+            // Single dispatch: 1 threadgroup of 128 threads.
+            // 128 matches the largest hidden layer (layer 0).
+            const pipeline =
+                device.forward_fused_infer_3layer;
+            encoder.msgSend(
+                void,
+                "setComputePipelineState:",
+                .{pipeline.state.value},
+            );
+
+            const grid = metal.MTLSize{
+                .width = 1,
+                .height = 1,
+                .depth = 1,
+            };
+            const group = metal.MTLSize{
+                .width = 128,
+                .height = 1,
+                .depth = 1,
+            };
+            encoder.msgSend(
+                void,
+                "dispatchThreadgroups:" ++
+                    "threadsPerThreadgroup:",
+                .{ grid, group },
+            );
+        }
+
+        // ====================================================
         // CPU forward pass (pure Zig, no Metal)
         // ====================================================
 
@@ -1859,6 +1944,11 @@ pub fn Network(
         /// Accumulates output = bias + sum_k(input[k] *
         /// W[k*N..][0..N]) using @Vector, then applies
         /// the activation function.
+        /// SIMD-vectorised single-row matmul with k-loop
+        /// unrolled by 4 for better ILP.  Accumulates bias
+        /// + W*x using @Vector(VEC, f32) chunks, then
+        /// applies activation on write.  Extracted as a
+        /// standalone hot-loop function (Rule 20).
         fn cpuMatmulRow(
             comptime in_size: u32,
             comptime out_size: u32,
@@ -1868,9 +1958,6 @@ pub fn Network(
             biases: *const [out_size]f32,
             out_row: *[out_size]f32,
         ) void {
-            // SIMD vector width.  Apple Silicon NEON has
-            // 128-bit registers = 4 floats.  We process
-            // out_size in chunks of VEC_LEN.
             const VEC_LEN = 8;
             const vec_count = out_size / VEC_LEN;
             const vec_tail = out_size % VEC_LEN;
@@ -1883,8 +1970,7 @@ pub fn Network(
                 weights.len >= in_size * out_size,
             );
 
-            // Accumulators: one SIMD vector per chunk,
-            // initialised from biases.
+            // Initialise SIMD accumulators from biases.
             var accum: [vec_count]@Vector(
                 VEC_LEN,
                 f32,
@@ -1894,58 +1980,160 @@ pub fn Network(
                 accum[v] = biases[off..][0..VEC_LEN].*;
             }
 
-            // Scalar tail accumulator.
             var tail_accum: [vec_tail]f32 = undefined;
             if (vec_tail > 0) {
-                const tail_off = vec_count * VEC_LEN;
                 inline for (0..vec_tail) |t| {
-                    tail_accum[t] = biases[tail_off + t];
+                    const off = vec_count * VEC_LEN;
+                    tail_accum[t] = biases[off + t];
                 }
             }
 
-            // mkn: for each input element, broadcast and
-            // multiply with the contiguous weight row.
-            for (0..in_size) |k| {
-                const x_k: @Vector(VEC_LEN, f32) =
-                    @splat(in_row[k]);
-                const w_row = weights[k * out_size ..];
+            // Core mkn loop with k unrolled by 4.
+            cpuMknLoop(
+                VEC_LEN,
+                in_size,
+                out_size,
+                vec_count,
+                vec_tail,
+                in_row,
+                weights,
+                &accum,
+                &tail_accum,
+            );
 
-                inline for (0..vec_count) |v| {
-                    const off = v * VEC_LEN;
-                    const w_vec: @Vector(
-                        VEC_LEN,
-                        f32,
-                    ) = w_row[off..][0..VEC_LEN].*;
-                    accum[v] += x_k * w_vec;
+            // Write with activation.
+            cpuWriteActVec(
+                VEC_LEN,
+                out_size,
+                vec_count,
+                vec_tail,
+                act,
+                &accum,
+                &tail_accum,
+                out_row,
+            );
+        }
+
+        /// Core mkn accumulation loop, unrolled by 4 on k.
+        /// Four independent multiply-adds per iteration let
+        /// the OOO engine overlap NEON FMA latencies.
+        fn cpuMknLoop(
+            comptime VEC: u32,
+            comptime in_size: u32,
+            comptime out_size: u32,
+            comptime vc: u32,
+            comptime vt: u32,
+            in_row: *const [in_size]f32,
+            weights: []const f32,
+            accum: *[vc]@Vector(VEC, f32),
+            tail_accum: *[vt]f32,
+        ) void {
+            comptime {
+                std.debug.assert(VEC > 0);
+                std.debug.assert(out_size > 0);
+            }
+
+            const k_main = (in_size / 4) * 4;
+            var k: u32 = 0;
+
+            // Unrolled-by-4 main loop.
+            while (k < k_main) : (k += 4) {
+                const x0: @Vector(VEC, f32) =
+                    @splat(in_row[k]);
+                const x1: @Vector(VEC, f32) =
+                    @splat(in_row[k + 1]);
+                const x2: @Vector(VEC, f32) =
+                    @splat(in_row[k + 2]);
+                const x3: @Vector(VEC, f32) =
+                    @splat(in_row[k + 3]);
+
+                inline for (0..vc) |v| {
+                    const o = v * VEC;
+                    const w0: @Vector(VEC, f32) =
+                        weights[(k) * out_size + o ..]
+                            [0..VEC].*;
+                    const w1: @Vector(VEC, f32) =
+                        weights[(k + 1) * out_size + o ..]
+                            [0..VEC].*;
+                    const w2: @Vector(VEC, f32) =
+                        weights[(k + 2) * out_size + o ..]
+                            [0..VEC].*;
+                    const w3: @Vector(VEC, f32) =
+                        weights[(k + 3) * out_size + o ..]
+                            [0..VEC].*;
+                    accum[v] += x0 * w0 + x1 * w1 +
+                        x2 * w2 + x3 * w3;
                 }
 
-                // Scalar tail.
-                if (vec_tail > 0) {
-                    const tail_off =
-                        vec_count * VEC_LEN;
-                    inline for (0..vec_tail) |t| {
+                if (vt > 0) {
+                    const o = vc * VEC;
+                    inline for (0..vt) |t| {
                         tail_accum[t] +=
                             in_row[k] *
-                            w_row[tail_off + t];
+                            weights[k * out_size + o + t] +
+                            in_row[k + 1] *
+                            weights[(k + 1) * out_size +
+                                o + t] +
+                            in_row[k + 2] *
+                            weights[(k + 2) * out_size +
+                                o + t] +
+                            in_row[k + 3] *
+                            weights[(k + 3) * out_size +
+                                o + t];
                     }
                 }
             }
 
-            // Write results with activation.
-            inline for (0..vec_count) |v| {
-                const off = v * VEC_LEN;
-                const result = applyActVec(
-                    VEC_LEN,
-                    act,
-                    accum[v],
-                );
-                out_row[off..][0..VEC_LEN].* = result;
+            // Remainder (0-3 elements).
+            while (k < in_size) : (k += 1) {
+                const x_k: @Vector(VEC, f32) =
+                    @splat(in_row[k]);
+                const w_row =
+                    weights[k * out_size ..];
+
+                inline for (0..vc) |v| {
+                    const o = v * VEC;
+                    const wv: @Vector(VEC, f32) =
+                        w_row[o..][0..VEC].*;
+                    accum[v] += x_k * wv;
+                }
+
+                if (vt > 0) {
+                    const o = vc * VEC;
+                    inline for (0..vt) |t| {
+                        tail_accum[t] +=
+                            in_row[k] *
+                            w_row[o + t];
+                    }
+                }
+            }
+        }
+
+        /// Write accumulated results with activation.
+        fn cpuWriteActVec(
+            comptime VEC: u32,
+            comptime out_size: u32,
+            comptime vc: u32,
+            comptime vt: u32,
+            comptime act: layout.Activation,
+            accum: *const [vc]@Vector(VEC, f32),
+            tail_accum: *const [vt]f32,
+            out_row: *[out_size]f32,
+        ) void {
+            comptime {
+                std.debug.assert(VEC > 0);
+                std.debug.assert(vc * VEC + vt == out_size);
             }
 
-            // Scalar tail activation + write.
-            if (vec_tail > 0) {
-                const tail_off = vec_count * VEC_LEN;
-                inline for (0..vec_tail) |t| {
+            inline for (0..vc) |v| {
+                const off = v * VEC;
+                out_row[off..][0..VEC].* =
+                    applyActVec(VEC, act, accum[v]);
+            }
+
+            if (vt > 0) {
+                const tail_off = vc * VEC;
+                inline for (0..vt) |t| {
                     out_row[tail_off + t] =
                         applyActScalar(
                         act,

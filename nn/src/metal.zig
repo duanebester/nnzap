@@ -413,6 +413,10 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "weight_grad_sgd",
         .shader_name = "weight_grad_sgd",
     },
+    .{
+        .field_name = "forward_fused_infer_3layer",
+        .shader_name = "forward_fused_infer_3layer",
+    },
 };
 
 // ============================================================================
@@ -455,6 +459,7 @@ pub const Device = struct {
     argmax_predictions: ComputePipeline,
     bias_grad_sgd: ComputePipeline,
     weight_grad_sgd: ComputePipeline,
+    forward_fused_infer_3layer: ComputePipeline,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(
