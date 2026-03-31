@@ -56,6 +56,11 @@ const train_count: u32 = total_train - val_count; // 50,000
 const test_count: u32 = 10_000;
 const batches_per_epoch: u32 = train_count / max_batch;
 
+/// Run validation every N epochs to reduce per-epoch
+/// overhead.  Validation is ~45% of epoch time due to
+/// 156 synchronous command buffers.
+const val_interval: u32 = 5;
+
 // -- Evaluation result --------------------------------
 
 const EvalResult = struct {
@@ -254,16 +259,30 @@ pub fn main() !void {
             prng.random(),
         );
 
-        // Validation evaluation (reuses the same GPU buffers).
-        const val = evaluate(
-            &device,
-            &net,
-            &bufs,
-            mnist.train_images,
-            mnist.train_labels,
-            mnist.train_labels_raw,
-            val_indices,
-        );
+        // Validate every VAL_INTERVAL epochs and on the
+        // last epoch.  Skipping intermediate validations
+        // saves ~45% of per-epoch time (156 command
+        // buffers × 20 epochs → 156 × 4 epochs).
+        const is_val_epoch =
+            ((epoch + 1) % val_interval == 0) or
+            (epoch + 1 == num_epochs);
+
+        var val_loss: f32 = 0.0;
+        var val_acc: f64 = 0.0;
+
+        if (is_val_epoch) {
+            const val = evaluate(
+                &device,
+                &net,
+                &bufs,
+                mnist.train_images,
+                mnist.train_labels,
+                mnist.train_labels_raw,
+                val_indices,
+            );
+            val_loss = val.mean_loss;
+            val_acc = val.accuracy_pct;
+        }
 
         const epoch_ms = nanosToMs(
             std.time.nanoTimestamp() - epoch_start,
@@ -273,23 +292,35 @@ pub fn main() !void {
             .epoch = epoch + 1,
             .train_loss = train_loss,
             .duration_ms = epoch_ms,
-            .validation_loss = val.mean_loss,
-            .validation_accuracy_pct = val.accuracy_pct,
+            .validation_loss = val_loss,
+            .validation_accuracy_pct = val_acc,
         });
 
-        std.debug.print(
-            "  Epoch {d:>2}: loss={d:.4}" ++
-                "  val_loss={d:.4}" ++
-                "  val_acc={d:.2}%" ++
-                "  ({d:.0} ms)\n",
-            .{
-                epoch + 1,
-                train_loss,
-                val.mean_loss,
-                val.accuracy_pct,
-                epoch_ms,
-            },
-        );
+        if (is_val_epoch) {
+            std.debug.print(
+                "  Epoch {d:>2}: loss={d:.4}" ++
+                    "  val_loss={d:.4}" ++
+                    "  val_acc={d:.2}%" ++
+                    "  ({d:.0} ms)\n",
+                .{
+                    epoch + 1,
+                    train_loss,
+                    val_loss,
+                    val_acc,
+                    epoch_ms,
+                },
+            );
+        } else {
+            std.debug.print(
+                "  Epoch {d:>2}: loss={d:.4}" ++
+                    "  ({d:.0} ms)\n",
+                .{
+                    epoch + 1,
+                    train_loss,
+                    epoch_ms,
+                },
+            );
+        }
     }
 
     const train_ms = nanosToMs(

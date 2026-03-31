@@ -69,6 +69,8 @@ const HISTORY_DIR: []const u8 =
     ".engine_agent_history";
 const HISTORY_PATH: []const u8 =
     ".engine_agent_history/experiments.jsonl";
+const SUMMARIES_PATH: []const u8 =
+    ".engine_agent_history/summaries.jsonl";
 
 // ============================================================
 // Allowed paths for write_file / edit_file (safety guard)
@@ -519,10 +521,12 @@ fn mainInner() !void {
 
         // Fresh history and context for each experiment.
         const history = buildHistorySummary(arena);
+        const summaries = buildSummariesSection(arena);
         const orientation = buildOrientation(arena);
         const first_msg = buildInitialMessage(
             arena,
             history,
+            summaries,
             rules,
             orientation,
         );
@@ -535,6 +539,7 @@ fn mainInner() !void {
         var bench_ran = false;
         var experiment_complete = false;
         var api_failed = false;
+        var last_claude_text: []const u8 = "";
 
         // ── Inner loop: turns within one experiment ──
         var turn: u32 = 0;
@@ -595,6 +600,7 @@ fn mainInner() !void {
 
             if (resp.text.len > 0) {
                 logClaudeText(resp.text);
+                last_claude_text = resp.text;
             }
 
             messages[count] = buildAssistantMsg(
@@ -679,6 +685,17 @@ fn mainInner() !void {
 
         // Save this experiment's conversation log.
         saveRunLog(arena, messages[0..count]);
+
+        // Persist a one-line summary so future
+        // experiments know what was tried and why
+        // it succeeded or failed.
+        if (last_claude_text.len > 0) {
+            appendSummary(
+                arena,
+                experiment + 1,
+                last_claude_text,
+            );
+        }
 
         if (experiment_complete or bench_ran) {
             total_experiments += 1;
@@ -2673,6 +2690,7 @@ fn runQuietLs(
 fn buildInitialMessage(
     arena: Allocator,
     history: []const u8,
+    summaries: []const u8,
     rules: []const u8,
     orientation: []const u8,
 ) []const u8 {
@@ -2705,25 +2723,27 @@ fn buildInitialMessage(
     const text = if (has_history)
         std.fmt.allocPrint(
             arena,
-            "{s}\n{s}{s}\n\n{s}{s}{s}",
+            "{s}\n{s}{s}\n\n{s}{s}{s}{s}",
             .{
                 orientation,
                 rules_section,
                 rules,
                 history_section,
                 history,
+                summaries,
                 suffix,
             },
         ) catch "Begin optimising."
     else
         std.fmt.allocPrint(
             arena,
-            "{s}\n{s}{s}\n\n{s}{s}",
+            "{s}\n{s}{s}\n\n{s}{s}{s}",
             .{
                 orientation,
                 rules_section,
                 rules,
                 history_section,
+                summaries,
                 suffix,
             },
         ) catch "Begin optimising.";
@@ -2976,6 +2996,73 @@ fn buildHistorySummary(arena: Allocator) []const u8 {
     return buf.items;
 }
 
+/// Load experiment summaries from the summaries JSONL
+/// file. Returns a human-readable block describing
+/// what previous experiments tried and their outcomes,
+/// so the agent avoids repeating failed approaches.
+fn buildSummariesSection(
+    arena: Allocator,
+) []const u8 {
+    const fs_path = resolveToFs(
+        arena,
+        SUMMARIES_PATH,
+    ) orelse return "";
+
+    const file = std.fs.cwd().openFile(
+        fs_path,
+        .{},
+    ) catch return "";
+    defer file.close();
+
+    const content = file.readToEndAlloc(
+        arena,
+        MAX_HISTORY_SIZE,
+    ) catch return "";
+
+    if (content.len == 0) return "";
+
+    // Parse each JSONL line and extract the summary.
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(
+        arena,
+        "\n## Previous experiment summaries\n\n" ++
+            "These describe what was tried and " ++
+            "why it succeeded or failed. Do NOT " ++
+            "repeat failed approaches.\n\n",
+    ) catch return "";
+
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        if (line.len < 2) continue;
+
+        const exp_num = extractJsonNumber(
+            line,
+            "\"experiment\":",
+        ) orelse "?";
+        const summary = extractJsonString(
+            line,
+            "\"summary\":\"",
+        ) orelse continue;
+
+        const row = std.fmt.allocPrint(
+            arena,
+            "  Experiment {s}: {s}\n",
+            .{ exp_num, summary },
+        ) catch continue;
+        buf.appendSlice(arena, row) catch continue;
+    }
+
+    // Header was added but no summaries parsed.
+    if (buf.items.len < 80) return "";
+
+    std.debug.assert(buf.items.len > 0);
+    return buf.items;
+}
+
 /// Append a bench result to the history JSONL file.
 fn appendExperiment(
     arena: Allocator,
@@ -3000,6 +3087,94 @@ fn appendExperiment(
     file.seekFromEnd(0) catch return;
     file.writeAll(line) catch return;
     file.writeAll("\n") catch {};
+}
+
+/// Append an experiment summary to the summaries
+/// JSONL file. Each line is a JSON object with the
+/// experiment number and Claude's final assessment
+/// of what was tried and why it succeeded or failed.
+fn appendSummary(
+    arena: Allocator,
+    experiment_number: u32,
+    text: []const u8,
+) void {
+    std.debug.assert(text.len > 0);
+    std.debug.assert(experiment_number > 0);
+
+    var ts_buf: [TIMESTAMP_LEN]u8 = undefined;
+    const ts = formatTimestamp(&ts_buf, '-');
+
+    // Truncate to keep summaries compact — the first
+    // 500 chars capture the key decision and rationale.
+    const max_len: usize = 500;
+    const trimmed = if (text.len > max_len)
+        text[0..max_len]
+    else
+        text;
+
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(
+        arena,
+        "{\"experiment\":",
+    ) catch return;
+
+    const num_str = std.fmt.allocPrint(
+        arena,
+        "{d}",
+        .{experiment_number},
+    ) catch return;
+    buf.appendSlice(arena, num_str) catch return;
+    buf.appendSlice(
+        arena,
+        ",\"timestamp\":\"",
+    ) catch return;
+    buf.appendSlice(arena, ts) catch return;
+    buf.appendSlice(
+        arena,
+        "\",\"summary\":\"",
+    ) catch return;
+
+    // Escape the summary text for JSON.
+    for (trimmed) |c| {
+        switch (c) {
+            '"' => {
+                buf.appendSlice(
+                    arena,
+                    "\\\"",
+                ) catch return;
+            },
+            '\\' => {
+                buf.appendSlice(
+                    arena,
+                    "\\\\",
+                ) catch return;
+            },
+            '\n' => {
+                buf.append(arena, ' ') catch return;
+            },
+            '\r' => {},
+            else => {
+                buf.append(arena, c) catch return;
+            },
+        }
+    }
+    buf.appendSlice(arena, "\"}\n") catch return;
+
+    std.debug.assert(buf.items.len > 0);
+
+    const fs_path = resolveToFs(
+        arena,
+        SUMMARIES_PATH,
+    ) orelse return;
+
+    const file = std.fs.cwd().createFile(
+        fs_path,
+        .{ .truncate = false },
+    ) catch return;
+    defer file.close();
+
+    file.seekFromEnd(0) catch return;
+    file.writeAll(buf.items) catch return;
 }
 
 /// Remove newlines to produce a single-line JSON string.
