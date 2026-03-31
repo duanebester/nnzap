@@ -96,6 +96,18 @@ pub fn startsWith(
     return std.mem.startsWith(u8, haystack, prefix);
 }
 
+pub fn indexOf(
+    haystack: []const u8,
+    needle: []const u8,
+) ?usize {
+    return std.mem.indexOf(u8, haystack, needle);
+}
+
+pub fn truncate(s: []const u8, max: usize) []const u8 {
+    std.debug.assert(max > 0);
+    return if (s.len <= max) s else s[0..max];
+}
+
 pub fn trimCR(line: []const u8) []const u8 {
     if (line.len > 0 and line[line.len - 1] == '\r') {
         return line[0 .. line.len - 1];

@@ -29,6 +29,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const tools = @import("tools.zig");
+const api = @import("api_client.zig");
 
 // ============================================================
 // Constants (Rule 4 — hard limits)
@@ -46,7 +47,6 @@ const MAX_HISTORY_SIZE: usize = 2 * 1024 * 1024;
 const MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT: usize = 1 * 1024 * 1024;
 const COMMAND_TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
-const TIMESTAMP_LEN: u32 = 20;
 
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY_MS: u64 = 2_000;
@@ -116,41 +116,11 @@ const ALLOWED_READ_FILES = [_][]const u8{
     "build.zig.zon",
 };
 
-// ============================================================
-// Types
-// ============================================================
-
-const ToolCall = struct {
-    id: []const u8,
-    name: []const u8,
-    input_json: []const u8,
-};
-
-const ToolOutput = struct {
-    stdout: []const u8,
-    success: bool,
-};
-
-const ToolResult = struct {
-    tool_use_id: []const u8,
-    content: []const u8,
-    is_error: bool,
-};
-
-const ApiResponse = struct {
-    success: bool,
-    stop_reason: []const u8,
-    content_json: []const u8,
-    text: []const u8,
-    tool_calls: []const ToolCall,
-    error_message: []const u8,
-    retryable: bool,
-};
-
-const ParsedContent = struct {
-    text: []const u8,
-    tool_calls: []const ToolCall,
-};
+// Type aliases for the shared API client types.
+const ToolCall = api.ToolCall;
+const ToolOutput = api.ToolOutput;
+const ToolResult = api.ToolResult;
+const ApiResponse = api.ApiResponse;
 
 // ============================================================
 // System prompt
@@ -507,11 +477,11 @@ const TOOL_SCHEMAS =
 
 pub fn main() void {
     mainInner() catch |err| {
-        log(
+        api.log(
             "\nFATAL: agent crashed: {s}\n",
             .{@errorName(err)},
         );
-        log(
+        api.log(
             "Hint: if the agent edited source files " ++
                 "before crashing, run:\n" ++
                 "  ./zig-out/bin/engine_research " ++
@@ -535,22 +505,22 @@ fn mainInner() !void {
     ensureHistoryDir(arena);
 
     const api_key = loadApiKey() orelse {
-        fatal(
+        api.fatal(
             "Set ANTHROPIC_API_KEY env var.\n" ++
                 "  export ANTHROPIC_API_KEY=sk-ant-...\n",
         );
         unreachable;
     };
     const model = loadModel();
-    log("Model: {s}\n", .{model});
-    log(
+    api.log("Model: {s}\n", .{model});
+    api.log(
         "Limits: max={d} experiments, " ++
             "max={d} turns/experiment\n",
         .{ MAX_EXPERIMENTS, MAX_TURNS_PER_EXPERIMENT },
     );
 
     if (!buildToolbox(arena)) {
-        fatal("zig build failed.\n");
+        api.fatal("zig build failed.\n");
         unreachable;
     }
 
@@ -568,7 +538,7 @@ fn mainInner() !void {
     // ── Outer loop: one experiment per iteration ─────
     var experiment: u32 = 0;
     while (experiment < MAX_EXPERIMENTS) : (experiment += 1) {
-        log(
+        api.log(
             "\n" ++
                 "============================================" ++
                 "==\n" ++
@@ -603,7 +573,7 @@ fn mainInner() !void {
         // ── Inner loop: turns within one experiment ──
         var turn: u32 = 0;
         while (turn < MAX_TURNS_PER_EXPERIMENT) : (turn += 1) {
-            log(
+            api.log(
                 "\n--- Experiment {d}, Turn {d} ---\n",
                 .{ experiment + 1, turn + 1 },
             );
@@ -611,7 +581,7 @@ fn mainInner() !void {
             const ctx_bytes = contextSizeBytes(
                 messages[0..count],
             );
-            log(
+            api.log(
                 "  Context: {d} messages, {d} KB\n",
                 .{ count, ctx_bytes / 1024 },
             );
@@ -629,7 +599,7 @@ fn mainInner() !void {
 
             if (!resp.success) {
                 total_api_errors += 1;
-                log(
+                api.log(
                     "  API error (unrecoverable) " ++
                         "after {s}: {s}\n",
                     .{
@@ -644,7 +614,7 @@ fn mainInner() !void {
                 break;
             }
 
-            log(
+            api.log(
                 "  API response: {s} " ++
                     "({d} tool calls, {d} KB)\n",
                 .{
@@ -658,25 +628,25 @@ fn mainInner() !void {
             );
 
             if (resp.text.len > 0) {
-                logClaudeText(resp.text);
+                api.logClaudeText(resp.text);
                 last_claude_text = resp.text;
             }
 
-            messages[count] = buildAssistantMsg(
+            messages[count] = api.buildAssistantMsg(
                 arena,
                 resp.content_json,
             );
             count += 1;
 
             // Check if Claude wants to stop (end_turn).
-            const is_tool_use = eql(
+            const is_tool_use = api.eql(
                 resp.stop_reason,
                 "tool_use",
             );
             if (!is_tool_use or
                 resp.tool_calls.len == 0)
             {
-                log(
+                api.log(
                     "  Claude signalled end of " ++
                         "experiment.\n",
                     .{},
@@ -700,8 +670,8 @@ fn mainInner() !void {
 
             // Track bench calls.
             for (resp.tool_calls) |call| {
-                if (eql(call.name, "bench") or
-                    eql(call.name, "bench_infer"))
+                if (api.eql(call.name, "bench") or
+                    api.eql(call.name, "bench_infer"))
                 {
                     total_bench_count += 1;
                     bench_ran = true;
@@ -715,7 +685,7 @@ fn mainInner() !void {
                 result_bytes += r.content.len;
                 if (r.is_error) err_count += 1;
             }
-            log(
+            api.log(
                 "  Tools done: {d} calls, " ++
                     "{d} errors, {d} KB result, " ++
                     "{s}\n",
@@ -730,14 +700,14 @@ fn mainInner() !void {
                 },
             );
 
-            messages[count] = buildToolResultsMsg(
+            messages[count] = api.buildToolResultsMsg(
                 arena,
                 results,
             );
             count += 1;
 
             if (count + 2 >= MAX_MESSAGES) {
-                log("  Message limit reached.\n", .{});
+                api.log("  Message limit reached.\n", .{});
                 break;
             }
         }
@@ -745,7 +715,7 @@ fn mainInner() !void {
         total_turns += turn + 1;
 
         // Save this experiment's conversation log.
-        saveRunLog(arena, messages[0..count]);
+        api.saveRunLog(arena, messages[0..count], "../" ++ HISTORY_DIR);
 
         // Persist a one-line summary so future
         // experiments know what was tried and why
@@ -764,14 +734,14 @@ fn mainInner() !void {
 
         // If the API failed, stop the outer loop too.
         if (api_failed) {
-            log(
+            api.log(
                 "  Stopping: API failure.\n",
                 .{},
             );
             break;
         }
 
-        log(
+        api.log(
             "  Experiment {d} done " ++
                 "({d} turns).\n",
             .{ experiment + 1, turn + 1 },
@@ -780,7 +750,7 @@ fn mainInner() !void {
 
     // ── Run summary ─────────────────────────────────
     const run_elapsed = timestampMs() - run_start;
-    log(
+    api.log(
         "\n" ++
             "============================================" ++
             "==\n" ++
@@ -856,7 +826,7 @@ fn loadModel() []const u8 {
 /// Returns the file contents or a fallback message.
 fn loadEngineeringRules(arena: Allocator) []const u8 {
     const fs_path = resolveToFs(arena, CLAUDE_MD_PATH) orelse {
-        log(
+        api.log(
             "WARNING: cannot resolve {s}\n",
             .{CLAUDE_MD_PATH},
         );
@@ -867,7 +837,7 @@ fn loadEngineeringRules(arena: Allocator) []const u8 {
         fs_path,
         .{},
     ) catch |err| {
-        log(
+        api.log(
             "WARNING: cannot open {s}: {s}\n",
             .{ CLAUDE_MD_PATH, @errorName(err) },
         );
@@ -880,7 +850,7 @@ fn loadEngineeringRules(arena: Allocator) []const u8 {
         arena,
         MAX_FILE_SIZE,
     ) catch |err| {
-        log(
+        api.log(
             "WARNING: cannot read {s}: {s}\n",
             .{ CLAUDE_MD_PATH, @errorName(err) },
         );
@@ -888,11 +858,11 @@ fn loadEngineeringRules(arena: Allocator) []const u8 {
     };
 
     if (content.len == 0) {
-        log("WARNING: {s} is empty.\n", .{CLAUDE_MD_PATH});
+        api.log("WARNING: {s} is empty.\n", .{CLAUDE_MD_PATH});
         return "(CLAUDE.md is empty)";
     }
 
-    log(
+    api.log(
         "Engineering rules: {d} KB ({s})\n",
         .{ content.len / 1024, CLAUDE_MD_PATH },
     );
@@ -902,14 +872,14 @@ fn loadEngineeringRules(arena: Allocator) []const u8 {
 /// Build the toolbox with `zig build`.
 fn buildToolbox(arena: Allocator) bool {
     const build_start = timestampMs();
-    log("Building toolbox...\n", .{});
+    api.log("Building toolbox...\n", .{});
 
     const result = std.process.Child.run(.{
         .allocator = arena,
         .argv = &.{ "zig", "build" },
         .max_output_bytes = MAX_OUTPUT_BYTES,
     }) catch {
-        log("  spawn failed.\n", .{});
+        api.log("  spawn failed.\n", .{});
         return false;
     };
 
@@ -919,9 +889,9 @@ fn buildToolbox(arena: Allocator) bool {
         else => false,
     };
     if (!ok) {
-        log("Build failed:\n{s}\n", .{result.stderr});
+        api.log("Build failed:\n{s}\n", .{result.stderr});
     } else {
-        log(
+        api.log(
             "  done ({s}).\n",
             .{nanosToMsStr(arena, build_ms * 1_000_000)},
         );
@@ -953,7 +923,7 @@ fn callApiWithRetry(
                 base << shift,
                 cap,
             );
-            log(
+            api.log(
                 "  Retrying in {d}ms " ++
                     "(attempt {d}/{d})...\n",
                 .{
@@ -976,20 +946,20 @@ fn callApiWithRetry(
         if (resp.success) return resp;
 
         if (!resp.retryable) {
-            log(
+            api.log(
                 "  API error (not retryable): {s}\n",
                 .{resp.error_message},
             );
             return resp;
         }
 
-        log(
+        api.log(
             "  API error (retryable): {s}\n",
             .{resp.error_message},
         );
     }
 
-    return errResp(
+    return api.errResp(
         "max retries exhausted",
         false,
     );
@@ -1014,11 +984,14 @@ fn callApi(
     std.debug.assert(api_key.len > 0);
     std.debug.assert(messages.len > 0);
 
-    const body = buildRequestJson(
+    const body = api.buildRequestJson(
         arena,
         model,
         messages,
-    ) catch return errResp(
+        SYSTEM_PROMPT,
+        TOOL_SCHEMAS,
+        MAX_TOKENS_STR,
+    ) catch return api.errResp(
         "request build failed",
         false,
     );
@@ -1026,13 +999,13 @@ fn callApi(
     // Save request for debugging and as curl input.
     const request_path = "../" ++ HISTORY_DIR ++
         "/_request.json";
-    writeFile(request_path, body) catch {
-        return errResp(
+    api.writeFile(request_path, body) catch {
+        return api.errResp(
             "failed to write request file",
             false,
         );
     };
-    log(
+    api.log(
         "  API request: {d} KB\n",
         .{body.len / 1024},
     );
@@ -1044,7 +1017,7 @@ fn callApi(
         arena,
         "@{s}",
         .{request_path},
-    ) catch return errResp(
+    ) catch return api.errResp(
         "failed to format curl arg",
         false,
     );
@@ -1052,12 +1025,12 @@ fn callApi(
         arena,
         "x-api-key: {s}",
         .{api_key},
-    ) catch return errResp(
+    ) catch return api.errResp(
         "failed to format key header",
         false,
     );
 
-    log("  Waiting for API response...\n", .{});
+    api.log("  Waiting for API response...\n", .{});
 
     const result = std.process.Child.run(.{
         .allocator = arena,
@@ -1089,7 +1062,7 @@ fn callApi(
             "curl spawn failed: {s}",
             .{@errorName(err)},
         ) catch "curl spawn failed";
-        return errResp(msg, true);
+        return api.errResp(msg, true);
     };
 
     // Check curl process exit.
@@ -1100,7 +1073,7 @@ fn callApi(
 
     if (!curl_ok) {
         const detail = if (result.stderr.len > 0)
-            truncate(result.stderr, 500)
+            api.truncate(result.stderr, 500)
         else
             "unknown curl error";
         const msg = std.fmt.allocPrint(
@@ -1108,12 +1081,12 @@ fn callApi(
             "curl failed: {s}",
             .{detail},
         ) catch "curl failed";
-        return errResp(msg, true);
+        return api.errResp(msg, true);
     }
 
     const output = result.stdout;
     if (output.len < 4) {
-        return errResp("empty curl output", true);
+        return api.errResp("empty curl output", true);
     }
 
     // Split response body from the HTTP status code.
@@ -1124,7 +1097,7 @@ fn callApi(
         output,
         '\n',
     ) orelse {
-        return errResp(
+        return api.errResp(
             "malformed curl output (no status line)",
             true,
         );
@@ -1143,13 +1116,13 @@ fn callApi(
     ) catch 0;
 
     if (status_code == 0) {
-        return errResp(
+        return api.errResp(
             "failed to parse HTTP status from curl",
             true,
         );
     }
 
-    log(
+    api.log(
         "  API response body: {d} KB (HTTP {d})\n",
         .{ response_data.len / 1024, status_code },
     );
@@ -1163,10 +1136,10 @@ fn callApi(
     }
 
     if (response_data.len == 0) {
-        return errResp("empty API response", true);
+        return api.errResp("empty API response", true);
     }
 
-    return parseApiResponse(arena, response_data);
+    return api.parseApiResponse(arena, response_data);
 }
 
 /// Produce a descriptive error for non-200 API responses.
@@ -1176,10 +1149,10 @@ fn handleNonOkStatus(
     body: []const u8,
 ) ApiResponse {
     // Extract the API error message if present.
-    const api_msg = extractJsonString(
+    const api_msg = api.extractJsonString(
         body,
         "\"message\":\"",
-    ) orelse extractJsonString(
+    ) orelse api.extractJsonString(
         body,
         "\"message\": \"",
     ) orelse "";
@@ -1187,7 +1160,7 @@ fn handleNonOkStatus(
     const detail = if (api_msg.len > 0)
         api_msg
     else
-        truncate(body, 500);
+        api.truncate(body, 500);
 
     const msg = std.fmt.allocPrint(
         arena,
@@ -1195,7 +1168,7 @@ fn handleNonOkStatus(
         .{ code, detail },
     ) catch "HTTP error (unknown)";
 
-    log("  API HTTP {d}: {s}\n", .{ code, detail });
+    api.log("  API HTTP {d}: {s}\n", .{ code, detail });
 
     // 429 = rate limited, 529 = overloaded,
     // 500/502/503 = server errors — all retryable.
@@ -1203,170 +1176,7 @@ fn handleNonOkStatus(
         code == 529 or
         code >= 500);
 
-    return errResp(msg, retryable);
-}
-
-/// Build the full JSON request body.
-fn buildRequestJson(
-    arena: Allocator,
-    model: []const u8,
-    messages: []const []const u8,
-) ![]u8 {
-    std.debug.assert(model.len > 0);
-    std.debug.assert(messages.len > 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(arena, "{\"model\":\"");
-    try buf.appendSlice(arena, model);
-    try buf.appendSlice(arena, "\",\"max_tokens\":");
-    try buf.appendSlice(arena, MAX_TOKENS_STR);
-    try buf.appendSlice(arena, ",\"system\":");
-    try appendJsonString(arena, &buf, SYSTEM_PROMPT);
-    try buf.appendSlice(arena, ",\"tools\":");
-    try buf.appendSlice(arena, TOOL_SCHEMAS);
-    try buf.appendSlice(arena, ",\"messages\":[");
-
-    for (messages, 0..) |msg, i| {
-        if (i > 0) try buf.append(arena, ',');
-        try buf.appendSlice(arena, msg);
-    }
-
-    try buf.appendSlice(arena, "]}");
-    return buf.items;
-}
-
-// ============================================================
-// Response parsing
-// ============================================================
-
-/// Parse the raw API response JSON.
-fn parseApiResponse(
-    arena: Allocator,
-    raw: []const u8,
-) ApiResponse {
-    std.debug.assert(raw.len > 0);
-
-    // Detect API error responses.
-    if (indexOf(raw, "\"type\":\"error\"") != null or
-        indexOf(raw, "\"type\": \"error\"") != null)
-    {
-        const msg = extractJsonString(
-            raw,
-            "\"message\":\"",
-        ) orelse "unknown API error";
-        return errResp(msg, false);
-    }
-
-    const stop = extractJsonString(
-        raw,
-        "\"stop_reason\":\"",
-    ) orelse extractJsonString(
-        raw,
-        "\"stop_reason\": \"",
-    ) orelse "unknown";
-
-    const content = extractRawArray(
-        raw,
-        "\"content\"",
-    ) orelse "[]";
-
-    const parsed = parseContentBlocks(
-        arena,
-        content,
-    );
-
-    return .{
-        .success = true,
-        .stop_reason = stop,
-        .content_json = content,
-        .text = parsed.text,
-        .tool_calls = parsed.tool_calls,
-        .error_message = "",
-        .retryable = false,
-    };
-}
-
-/// Split the content array into text and tool_use blocks.
-fn parseContentBlocks(
-    arena: Allocator,
-    content_json: []const u8,
-) ParsedContent {
-    const empty: ParsedContent = .{
-        .text = "",
-        .tool_calls = &.{},
-    };
-
-    const blocks = splitTopLevelObjects(
-        arena,
-        content_json,
-    ) catch return empty;
-
-    var text_buf: std.ArrayList(u8) = .empty;
-    var calls: [MAX_TOOL_CALLS]ToolCall = undefined;
-    var call_count: u32 = 0;
-
-    for (blocks) |block| {
-        if (containsField(block, "\"type\"", "text")) {
-            const t = extractJsonString(
-                block,
-                "\"text\":\"",
-            ) orelse extractJsonString(
-                block,
-                "\"text\": \"",
-            ) orelse continue;
-            if (text_buf.items.len > 0) {
-                text_buf.append(arena, '\n') catch {};
-            }
-            text_buf.appendSlice(arena, t) catch {};
-        }
-
-        if (containsField(
-            block,
-            "\"type\"",
-            "tool_use",
-        )) {
-            if (call_count >= MAX_TOOL_CALLS) continue;
-            const id = extractJsonString(
-                block,
-                "\"id\":\"",
-            ) orelse extractJsonString(
-                block,
-                "\"id\": \"",
-            ) orelse continue;
-            const name = extractJsonString(
-                block,
-                "\"name\":\"",
-            ) orelse extractJsonString(
-                block,
-                "\"name\": \"",
-            ) orelse continue;
-            const input = extractRawObject(
-                block,
-                "\"input\"",
-            ) orelse "{}";
-
-            calls[call_count] = .{
-                .id = id,
-                .name = name,
-                .input_json = input,
-            };
-            call_count += 1;
-        }
-    }
-
-    const result_calls = arena.alloc(
-        ToolCall,
-        call_count,
-    ) catch return .{
-        .text = text_buf.items,
-        .tool_calls = &.{},
-    };
-    @memcpy(result_calls, calls[0..call_count]);
-
-    return .{
-        .text = text_buf.items,
-        .tool_calls = result_calls,
-    };
+    return api.errResp(msg, retryable);
 }
 
 // ============================================================
@@ -1400,14 +1210,14 @@ fn executeSingleTool(
     std.debug.assert(call.id.len > 0);
     std.debug.assert(call.name.len > 0);
 
-    logToolCall(call.name, call.input_json);
+    api.logToolCall(call.name, call.input_json);
 
     const tool_start = timestampMs();
     const output = dispatchTool(arena, call);
     const tool_elapsed = timestampMs() - tool_start;
 
     const status = if (output.success) "ok" else "ERR";
-    log(
+    api.log(
         "    -> {s} ({s}, {d} bytes, {s})\n",
         .{
             call.name,
@@ -1421,12 +1231,12 @@ fn executeSingleTool(
     );
 
     // Persist bench/bench_infer results to the history log.
-    if ((eql(call.name, "bench") or
-        eql(call.name, "bench_infer")) and
+    if ((api.eql(call.name, "bench") or
+        api.eql(call.name, "bench_infer")) and
         output.success)
     {
         appendExperiment(arena, output.stdout);
-        log(
+        api.log(
             "    -> {s} result persisted\n",
             .{call.name},
         );
@@ -1434,7 +1244,7 @@ fn executeSingleTool(
 
     return .{
         .tool_use_id = call.id,
-        .content = truncate(
+        .content = api.truncate(
             output.stdout,
             MAX_TOOL_OUTPUT,
         ),
@@ -1450,70 +1260,70 @@ fn dispatchTool(
     std.debug.assert(call.name.len > 0);
 
     // Engine research toolbox commands.
-    if (eql(call.name, "snapshot")) {
+    if (api.eql(call.name, "snapshot")) {
         return callEngineResearch(
             arena,
             &.{"snapshot"},
         );
     }
-    if (eql(call.name, "snapshot_list")) {
+    if (api.eql(call.name, "snapshot_list")) {
         return callEngineResearch(
             arena,
             &.{"snapshot-list"},
         );
     }
-    if (eql(call.name, "rollback")) {
+    if (api.eql(call.name, "rollback")) {
         return executeRollback(arena, call.input_json);
     }
-    if (eql(call.name, "rollback_latest")) {
+    if (api.eql(call.name, "rollback_latest")) {
         return callEngineResearch(
             arena,
             &.{"rollback-latest"},
         );
     }
-    if (eql(call.name, "diff")) {
+    if (api.eql(call.name, "diff")) {
         return executeDiff(arena, call.input_json);
     }
-    if (eql(call.name, "check")) {
+    if (api.eql(call.name, "check")) {
         return callEngineResearch(
             arena,
             &.{"check"},
         );
     }
-    if (eql(call.name, "test")) {
+    if (api.eql(call.name, "test")) {
         return callEngineResearch(
             arena,
             &.{"test"},
         );
     }
-    if (eql(call.name, "bench")) {
+    if (api.eql(call.name, "bench")) {
         return callEngineResearch(
             arena,
             &.{"bench"},
         );
     }
-    if (eql(call.name, "bench_infer")) {
+    if (api.eql(call.name, "bench_infer")) {
         return callEngineResearch(
             arena,
             &.{"bench-infer"},
         );
     }
-    if (eql(call.name, "bench_compare")) {
+    if (api.eql(call.name, "bench_compare")) {
         return callEngineResearch(
             arena,
             &.{"bench-compare"},
         );
     }
-    if (eql(call.name, "history")) {
+    if (api.eql(call.name, "history")) {
         return executeHistory(
             arena,
             call.input_json,
         );
     }
-    if (eql(call.name, "show")) {
+    if (api.eql(call.name, "show")) {
         return executeShow(arena, call.input_json);
     }
-    if (eql(call.name, "show_function")) {
+    if (api.eql(call.name, "show_function")) {
         return executeShowFunction(
             arena,
             call.input_json,
@@ -1521,25 +1331,25 @@ fn dispatchTool(
     }
 
     // File I/O tools.
-    if (eql(call.name, "read_file")) {
+    if (api.eql(call.name, "read_file")) {
         return executeReadFile(
             arena,
             call.input_json,
         );
     }
-    if (eql(call.name, "write_file")) {
+    if (api.eql(call.name, "write_file")) {
         return executeWriteFile(
             arena,
             call.input_json,
         );
     }
-    if (eql(call.name, "edit_file")) {
+    if (api.eql(call.name, "edit_file")) {
         return executeEditFile(
             arena,
             call.input_json,
         );
     }
-    if (eql(call.name, "list_directory")) {
+    if (api.eql(call.name, "list_directory")) {
         return executeListDirectory(
             arena,
             call.input_json,
@@ -1547,12 +1357,12 @@ fn dispatchTool(
     }
 
     // Environment tool.
-    if (eql(call.name, "cwd")) {
+    if (api.eql(call.name, "cwd")) {
         return executeCwd(arena);
     }
 
     // Shell tool.
-    if (eql(call.name, "run_command")) {
+    if (api.eql(call.name, "run_command")) {
         return executeRunCommand(
             arena,
             call.input_json,
@@ -1560,12 +1370,12 @@ fn dispatchTool(
     }
 
     // Git commit tool.
-    if (eql(call.name, "commit")) {
+    if (api.eql(call.name, "commit")) {
         return executeCommit(arena, call.input_json);
     }
 
     // Summary recording tool.
-    if (eql(call.name, "add_summary")) {
+    if (api.eql(call.name, "add_summary")) {
         return executeAddSummary(arena, call.input_json);
     }
 
@@ -1586,7 +1396,7 @@ fn executeHistory(
     arena: Allocator,
     input: []const u8,
 ) ToolOutput {
-    const count_str = extractJsonNumber(
+    const count_str = api.extractJsonNumber(
         input,
         "\"count\":",
     ) orelse "5";
@@ -1875,7 +1685,7 @@ fn callEngineResearch(
 
     // Forward progress to the human on stderr.
     if (result.stderr.len > 0) {
-        stderr_file.writeAll(result.stderr) catch {};
+        api.stderr_file.writeAll(result.stderr) catch {};
     }
 
     const ok = switch (result.term) {
@@ -1931,7 +1741,7 @@ fn executeReadFile(
     }
 
     if (!isAllowedReadPath(path)) {
-        log(
+        api.log(
             "    read DENIED: {s}\n",
             .{path},
         );
@@ -1956,7 +1766,7 @@ fn executeReadFile(
         return .{ .stdout = msg, .success = false };
     };
 
-    log(
+    api.log(
         "    read {s}: {d} bytes\n",
         .{ path, content.len },
     );
@@ -2037,7 +1847,7 @@ fn executeWriteFile(
         };
     };
 
-    log(
+    api.log(
         "    wrote {s}: {d} bytes\n",
         .{ path, content.len },
     );
@@ -2152,12 +1962,12 @@ fn executeEditFile(
     };
 
     // Find the old text.
-    const pos = indexOf(
+    const pos = api.indexOf(
         current,
         old_text,
     ) orelse {
         // Provide context to help Claude fix the match.
-        const preview = truncate(old_text, 100);
+        const preview = api.truncate(old_text, 100);
         const msg = std.fmt.allocPrint(
             arena,
             "Error: old_content not found in {s}. " ++
@@ -2173,7 +1983,7 @@ fn executeEditFile(
     // Check for ambiguous matches.
     const after_first = pos + old_text.len;
     if (after_first < current.len) {
-        if (indexOf(
+        if (api.indexOf(
             current[after_first..],
             old_text,
         ) != null) {
@@ -2212,7 +2022,7 @@ fn executeEditFile(
     const removed = old_text.len;
     const added = new_text.len;
 
-    log(
+    api.log(
         "    edit {s}: -{d} +{d} chars " ++
             "({d} bytes total)\n",
         .{ path, removed, added, new_file.len },
@@ -2343,7 +2153,7 @@ fn executeRunCommand(
         };
     }
 
-    log("    cmd: {s}\n", .{truncate(command, 200)});
+    api.log("    cmd: {s}\n", .{api.truncate(command, 200)});
     return runShellCommand(arena, command);
 }
 
@@ -2569,7 +2379,7 @@ fn runShellCommand(
     // Append exit code when non-zero so the LLM knows.
     if (exit_code) |code| {
         if (code != 0) {
-            log("    exit code: {d}\n", .{code});
+            api.log("    exit code: {d}\n", .{code});
             const suffix = std.fmt.allocPrint(
                 arena,
                 "\n(exit code {d})",
@@ -2578,7 +2388,7 @@ fn runShellCommand(
             buf.appendSlice(arena, suffix) catch {};
         }
     } else {
-        log("    terminated abnormally\n", .{});
+        api.log("    terminated abnormally\n", .{});
     }
 
     const output = if (buf.items.len > 0)
@@ -2605,10 +2415,10 @@ fn resolveToFs(
     std.debug.assert(path.len > 0);
 
     // Paths local to the zap/ directory need no prefix.
-    if (startsWith(path, "src/") or
-        startsWith(path, "programs/") or
-        eql(path, "build.zig") or
-        eql(path, "build.zig.zon"))
+    if (api.startsWith(path, "src/") or
+        api.startsWith(path, "programs/") or
+        api.eql(path, "build.zig") or
+        api.eql(path, "build.zig.zon"))
     {
         return path;
     }
@@ -2628,24 +2438,24 @@ fn isAllowedReadPath(path: []const u8) bool {
     std.debug.assert(path.len > 0);
 
     // Reject path traversal.
-    if (indexOf(path, "..") != null) return false;
+    if (api.indexOf(path, "..") != null) return false;
 
     // Reject absolute paths.
     if (path.len > 0 and path[0] == '/') return false;
 
     // Allow exact root-level files.
     for (&ALLOWED_READ_FILES) |file| {
-        if (eql(path, file)) return true;
+        if (api.eql(path, file)) return true;
     }
 
     // Allow paths under allowed prefixes.
     for (&ALLOWED_READ_PREFIXES) |prefix| {
-        if (startsWith(path, prefix)) return true;
+        if (api.startsWith(path, prefix)) return true;
     }
 
     // Also allow any write-allowed file to be read.
     for (&ALLOWED_WRITE_FILES) |file| {
-        if (eql(path, file)) return true;
+        if (api.eql(path, file)) return true;
     }
 
     return false;
@@ -2656,13 +2466,13 @@ fn isAllowedWritePath(path: []const u8) bool {
     std.debug.assert(path.len > 0);
 
     // Reject path traversal.
-    if (indexOf(path, "..") != null) return false;
+    if (api.indexOf(path, "..") != null) return false;
 
     // Reject absolute paths.
     if (path.len > 0 and path[0] == '/') return false;
 
     for (&ALLOWED_WRITE_FILES) |allowed| {
-        if (eql(path, allowed)) return true;
+        if (api.eql(path, allowed)) return true;
     }
     return false;
 }
@@ -2682,10 +2492,10 @@ fn extractRequiredField(
     }
     if (input_json.len == 0) return null;
 
-    return extractJsonString(
+    return api.extractJsonString(
         input_json,
         "\"" ++ field ++ "\":\"",
-    ) orelse extractJsonString(
+    ) orelse api.extractJsonString(
         input_json,
         "\"" ++ field ++ "\": \"",
     );
@@ -2909,106 +2719,9 @@ fn buildInitialMessage(
         ) catch "Begin optimising.";
 
     std.debug.assert(text.len > 0);
-    const result = wrapUserTextMessage(arena, text);
+    const result = api.wrapUserTextMessage(arena, text);
     std.debug.assert(result.len > 0);
     return result;
-}
-
-/// Wrap Claude's raw content JSON as an assistant message.
-fn buildAssistantMsg(
-    arena: Allocator,
-    content_json: []const u8,
-) []const u8 {
-    std.debug.assert(content_json.len >= 2);
-
-    return std.fmt.allocPrint(
-        arena,
-        "{{\"role\":\"assistant\",\"content\":{s}}}",
-        .{content_json},
-    ) catch "{}";
-}
-
-/// Build a user message containing tool results.
-fn buildToolResultsMsg(
-    arena: Allocator,
-    results: []const ToolResult,
-) []const u8 {
-    std.debug.assert(results.len > 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    buf.appendSlice(
-        arena,
-        "{\"role\":\"user\",\"content\":[",
-    ) catch return "{}";
-
-    for (results, 0..) |r, i| {
-        if (i > 0) buf.append(arena, ',') catch {};
-        appendToolResultBlock(arena, &buf, r);
-    }
-
-    buf.appendSlice(arena, "]}") catch {};
-    return buf.items;
-}
-
-/// Append one tool_result block to a buffer.
-fn appendToolResultBlock(
-    arena: Allocator,
-    buf: *std.ArrayList(u8),
-    r: ToolResult,
-) void {
-    std.debug.assert(r.tool_use_id.len > 0);
-
-    buf.appendSlice(
-        arena,
-        "{\"type\":\"tool_result\"," ++
-            "\"tool_use_id\":\"",
-    ) catch return;
-    buf.appendSlice(
-        arena,
-        r.tool_use_id,
-    ) catch return;
-    buf.appendSlice(arena, "\",") catch return;
-
-    if (r.is_error) {
-        buf.appendSlice(
-            arena,
-            "\"is_error\":true,",
-        ) catch return;
-    }
-
-    buf.appendSlice(
-        arena,
-        "\"content\":",
-    ) catch return;
-    appendJsonString(
-        arena,
-        buf,
-        r.content,
-    ) catch return;
-    buf.append(arena, '}') catch return;
-}
-
-/// Wrap a plain text string as a user message.
-fn wrapUserTextMessage(
-    arena: Allocator,
-    text: []const u8,
-) []const u8 {
-    std.debug.assert(text.len > 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    buf.appendSlice(
-        arena,
-        "{\"role\":\"user\",\"content\":",
-    ) catch return "{}";
-    appendJsonString(
-        arena,
-        &buf,
-        text,
-    ) catch return "{}";
-    buf.append(arena, '}') catch return "{}";
-
-    std.debug.assert(buf.items.len > 0);
-    return buf.items;
 }
 
 // ============================================================
@@ -3021,12 +2734,12 @@ fn wrapUserTextMessage(
 
 fn ensureHistoryDir(arena: Allocator) void {
     const fs_path = resolveToFs(arena, HISTORY_DIR) orelse {
-        log("WARNING: cannot resolve history dir\n", .{});
+        api.log("WARNING: cannot resolve history dir\n", .{});
         return;
     };
     std.fs.cwd().makeDir(fs_path) catch |err| {
         if (err != error.PathAlreadyExists) {
-            log(
+            api.log(
                 "WARNING: mkdir {s}: {s}\n",
                 .{ fs_path, @errorName(err) },
             );
@@ -3044,22 +2757,22 @@ fn formatHistoryLine(
     std.debug.assert(line.len > 0);
     std.debug.assert(index > 0);
 
-    const ts = extractJsonString(
+    const ts = api.extractJsonString(
         line,
         "\"timestamp_utc\":\"",
-    ) orelse extractJsonString(
+    ) orelse api.extractJsonString(
         line,
         "\"timestamp_utc\": \"",
     ) orelse "?";
-    const throughput = extractJsonNumber(
+    const throughput = api.extractJsonNumber(
         line,
         "\"throughput_images_per_sec\":",
     ) orelse "?";
-    const accuracy = extractJsonNumber(
+    const accuracy = api.extractJsonNumber(
         line,
         "\"final_test_accuracy_pct\":",
     ) orelse "?";
-    const train_ms = extractJsonNumber(
+    const train_ms = api.extractJsonNumber(
         line,
         "\"total_training_ms\":",
     ) orelse "?";
@@ -3127,7 +2840,7 @@ fn buildHistorySummary(arena: Allocator) []const u8 {
         0;
     const visible = line_count - start;
 
-    log(
+    api.log(
         "History: {d} experiments " ++
             "(showing last {d}).\n",
         .{ line_count, visible },
@@ -3199,11 +2912,11 @@ fn buildSummariesSection(
     while (iter.next()) |line| {
         if (line.len < 2) continue;
 
-        const exp_num = extractJsonNumber(
+        const exp_num = api.extractJsonNumber(
             line,
             "\"experiment\":",
         ) orelse "?";
-        const summary = extractJsonString(
+        const summary = api.extractJsonString(
             line,
             "\"summary\":\"",
         ) orelse continue;
@@ -3230,7 +2943,7 @@ fn appendExperiment(
 ) void {
     std.debug.assert(benchmark_json.len > 0);
 
-    const line = collapseToLine(
+    const line = api.collapseToLine(
         arena,
         benchmark_json,
     ) catch return;
@@ -3261,8 +2974,8 @@ fn appendSummary(
     std.debug.assert(text.len > 0);
     std.debug.assert(experiment_number > 0);
 
-    var ts_buf: [TIMESTAMP_LEN]u8 = undefined;
-    const ts = formatTimestamp(&ts_buf, '-');
+    var ts_buf: [api.TIMESTAMP_LEN]u8 = undefined;
+    const ts = api.formatTimestamp(&ts_buf, '-');
 
     // Truncate to keep summaries compact — the first
     // 500 chars capture the key decision and rationale.
@@ -3337,475 +3050,22 @@ fn appendSummary(
     file.writeAll(buf.items) catch return;
 }
 
-/// Remove newlines to produce a single-line JSON string.
-fn collapseToLine(
-    arena: Allocator,
-    s: []const u8,
-) ![]const u8 {
-    std.debug.assert(s.len > 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    for (s) |c| {
-        if (c != '\n' and c != '\r') {
-            try buf.append(arena, c);
-        }
-    }
-
-    std.debug.assert(buf.items.len <= s.len);
-    return buf.items;
-}
-
-/// Save the full conversation as a JSON array.
-fn saveRunLog(
-    arena: Allocator,
-    messages: []const []const u8,
-) void {
-    std.debug.assert(messages.len > 0);
-
-    var ts_buf: [TIMESTAMP_LEN]u8 = undefined;
-    const ts = formatTimestamp(&ts_buf, '-');
-
-    const fs_dir = "../" ++ HISTORY_DIR;
-    const path = std.fmt.allocPrint(
-        arena,
-        "{s}/run_{s}.json",
-        .{ fs_dir, ts },
-    ) catch return;
-
-    var buf: std.ArrayList(u8) = .empty;
-    buf.appendSlice(arena, "[\n") catch return;
-    for (messages, 0..) |msg, i| {
-        if (i > 0) {
-            buf.appendSlice(
-                arena,
-                ",\n",
-            ) catch return;
-        }
-        buf.appendSlice(arena, "  ") catch return;
-        buf.appendSlice(arena, msg) catch return;
-    }
-    buf.appendSlice(arena, "\n]\n") catch return;
-
-    writeFile(path, buf.items) catch {};
-    log("Run log saved: {s}\n", .{path});
-}
-
 // ============================================================
-// Logging (all output goes to stderr)
+// Logging
 // ============================================================
 
 const stdout_file = std.fs.File{
     .handle = std.posix.STDOUT_FILENO,
 };
-const stderr_file = std.fs.File{
-    .handle = std.posix.STDERR_FILENO,
-};
-
-fn log(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print(fmt, args);
-}
-
-fn fatal(comptime msg: []const u8) void {
-    log("FATAL: " ++ msg, .{});
-    std.process.exit(1);
-}
 
 fn printHeader() void {
-    log(
+    api.log(
         "\nnnzap engine agent" ++
             " - LLM-powered engine optimiser\n" ++
             "==================================" ++
             "================\n\n",
         .{},
     );
-}
-
-fn logClaudeText(text: []const u8) void {
-    std.debug.assert(text.len > 0);
-    log(
-        "\n  Claude: {s}\n",
-        .{truncate(text, 2000)},
-    );
-}
-
-fn logToolCall(
-    name: []const u8,
-    input: []const u8,
-) void {
-    std.debug.assert(name.len > 0);
-    if (input.len <= 2) {
-        // Empty input like "{}" -- omit it.
-        log("  Tool:   {s}\n", .{name});
-    } else {
-        log(
-            "  Tool:   {s} {s}\n",
-            .{ name, truncate(input, 200) },
-        );
-    }
-}
-
-// ============================================================
-// JSON helpers
-// ============================================================
-
-/// Append a JSON-escaped, quoted string to a buffer.
-fn appendJsonString(
-    arena: Allocator,
-    buf: *std.ArrayList(u8),
-    s: []const u8,
-) !void {
-    try buf.append(arena, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => {
-                try buf.appendSlice(arena, "\\\"");
-            },
-            '\\' => {
-                try buf.appendSlice(arena, "\\\\");
-            },
-            '\n' => {
-                try buf.appendSlice(arena, "\\n");
-            },
-            '\r' => {
-                try buf.appendSlice(arena, "\\r");
-            },
-            '\t' => {
-                try buf.appendSlice(arena, "\\t");
-            },
-            else => {
-                if (c < 0x20) {
-                    const hex = try std.fmt.allocPrint(
-                        arena,
-                        "\\u{x:0>4}",
-                        .{c},
-                    );
-                    try buf.appendSlice(arena, hex);
-                } else {
-                    try buf.append(arena, c);
-                }
-            },
-        }
-    }
-    try buf.append(arena, '"');
-}
-
-/// Extract a JSON string value after a needle ending
-/// with `:"`.
-fn extractJsonString(
-    json: []const u8,
-    needle: []const u8,
-) ?[]const u8 {
-    std.debug.assert(needle.len > 0);
-
-    const idx = indexOf(json, needle) orelse {
-        return null;
-    };
-    const start = idx + needle.len;
-    if (start >= json.len) return null;
-    return findStringEnd(json[start..]);
-}
-
-/// Scan forward past a JSON string body, stopping at
-/// the first unescaped `"`.
-fn findStringEnd(s: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i < s.len) {
-        if (s[i] == '\\') {
-            i += 2;
-            continue;
-        }
-        if (s[i] == '"') return s[0..i];
-        i += 1;
-    }
-    return null;
-}
-
-/// Extract a raw JSON numeric value after a field name.
-/// The needle should end with `":` or `": ` — everything
-/// up to the first character that is not part of a JSON
-/// number (digits, '.', '-', '+', 'e', 'E') is returned.
-fn extractJsonNumber(
-    json: []const u8,
-    needle: []const u8,
-) ?[]const u8 {
-    std.debug.assert(needle.len > 0);
-
-    const idx = indexOf(json, needle) orelse return null;
-    var pos = idx + needle.len;
-
-    // Skip optional whitespace after the colon.
-    while (pos < json.len and
-        (json[pos] == ' ' or json[pos] == '\t'))
-    {
-        pos += 1;
-    }
-    if (pos >= json.len) return null;
-
-    const start = pos;
-    while (pos < json.len) {
-        const c = json[pos];
-        const is_numeric = (c >= '0' and c <= '9') or
-            c == '.' or c == '-' or c == '+' or
-            c == 'e' or c == 'E';
-        if (!is_numeric) break;
-        pos += 1;
-    }
-
-    if (pos == start) return null;
-    return json[start..pos];
-}
-
-/// Extract a raw JSON array value for a given field.
-fn extractRawArray(
-    json: []const u8,
-    field: []const u8,
-) ?[]const u8 {
-    std.debug.assert(field.len > 0);
-
-    const idx = indexOf(json, field) orelse {
-        return null;
-    };
-    var pos = idx + field.len;
-    pos = skipColonAndWhitespace(json, pos);
-    if (pos >= json.len) return null;
-    if (json[pos] != '[') return null;
-    return findMatchingBracket(
-        json[pos..],
-        '[',
-        ']',
-    );
-}
-
-/// Extract a raw JSON object value for a given field.
-fn extractRawObject(
-    json: []const u8,
-    field: []const u8,
-) ?[]const u8 {
-    std.debug.assert(field.len > 0);
-
-    const idx = indexOf(json, field) orelse {
-        return null;
-    };
-    var pos = idx + field.len;
-    pos = skipColonAndWhitespace(json, pos);
-    if (pos >= json.len) return null;
-    if (json[pos] != '{') return null;
-    return findMatchingBracket(
-        json[pos..],
-        '{',
-        '}',
-    );
-}
-
-/// Skip past `:`, spaces, tabs, and newlines.
-fn skipColonAndWhitespace(
-    json: []const u8,
-    start: usize,
-) usize {
-    var pos = start;
-    while (pos < json.len) {
-        const c = json[pos];
-        if (c == ':' or c == ' ' or c == '\n' or
-            c == '\r' or c == '\t')
-        {
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-    return pos;
-}
-
-/// Find the substring from `open` to its matching
-/// `close`, respecting nesting and JSON strings.
-fn findMatchingBracket(
-    s: []const u8,
-    open: u8,
-    close: u8,
-) ?[]const u8 {
-    std.debug.assert(s.len > 0);
-    std.debug.assert(s[0] == open);
-
-    var depth: u32 = 0;
-    var in_string = false;
-    var i: usize = 0;
-    while (i < s.len) {
-        const c = s[i];
-        if (c == '\\' and in_string) {
-            i += 2;
-            continue;
-        }
-        if (c == '"') in_string = !in_string;
-        if (!in_string) {
-            if (c == open) depth += 1;
-            if (c == close) {
-                depth -= 1;
-                if (depth == 0) {
-                    return s[0 .. i + 1];
-                }
-            }
-        }
-        i += 1;
-    }
-    return null;
-}
-
-/// Split a JSON array into its top-level objects.
-fn splitTopLevelObjects(
-    arena: Allocator,
-    array_json: []const u8,
-) ![]const []const u8 {
-    std.debug.assert(array_json.len >= 2);
-
-    var items: std.ArrayList([]const u8) = .empty;
-    var pos: usize = 0;
-
-    // Find opening bracket.
-    while (pos < array_json.len and
-        array_json[pos] != '[') : (pos += 1)
-    {}
-    pos += 1; // Skip '['.
-
-    while (pos < array_json.len) {
-        // Skip whitespace and commas.
-        while (pos < array_json.len) {
-            const c = array_json[pos];
-            if (c == ' ' or c == '\n' or
-                c == '\r' or c == '\t' or c == ',')
-            {
-                pos += 1;
-            } else {
-                break;
-            }
-        }
-        if (pos >= array_json.len) break;
-        if (array_json[pos] == ']') break;
-        if (array_json[pos] != '{') {
-            pos += 1;
-            continue;
-        }
-
-        const obj = findMatchingBracket(
-            array_json[pos..],
-            '{',
-            '}',
-        ) orelse break;
-        try items.append(arena, obj);
-        pos += obj.len;
-    }
-
-    return items.items;
-}
-
-/// Check if a JSON block has "type":"<value>".
-fn containsField(
-    block: []const u8,
-    key: []const u8,
-    value: []const u8,
-) bool {
-    std.debug.assert(key.len > 0);
-    std.debug.assert(value.len > 0);
-
-    const idx = indexOf(block, key) orelse {
-        return false;
-    };
-    var pos = idx + key.len;
-
-    pos = skipColonAndWhitespace(block, pos);
-    if (pos >= block.len) return false;
-    if (block[pos] != '"') return false;
-    pos += 1;
-
-    if (pos + value.len > block.len) return false;
-    if (!std.mem.eql(
-        u8,
-        block[pos..][0..value.len],
-        value,
-    )) {
-        return false;
-    }
-    pos += value.len;
-
-    if (pos >= block.len) return false;
-    return block[pos] == '"';
-}
-
-// ============================================================
-// String helpers
-// ============================================================
-
-fn indexOf(
-    haystack: []const u8,
-    needle: []const u8,
-) ?usize {
-    return std.mem.indexOf(u8, haystack, needle);
-}
-
-fn eql(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
-
-fn startsWith(s: []const u8, prefix: []const u8) bool {
-    if (s.len < prefix.len) return false;
-    return std.mem.eql(u8, s[0..prefix.len], prefix);
-}
-
-fn truncate(s: []const u8, max: usize) []const u8 {
-    std.debug.assert(max > 0);
-    return if (s.len <= max) s else s[0..max];
-}
-
-// ============================================================
-// File I/O
-// ============================================================
-
-fn writeFile(
-    path: []const u8,
-    content: []const u8,
-) !void {
-    std.debug.assert(path.len > 0);
-    std.debug.assert(content.len > 0);
-
-    const file = try std.fs.cwd().createFile(
-        path,
-        .{},
-    );
-    defer file.close();
-    try file.writeAll(content);
-}
-
-// ============================================================
-// Timestamp formatting
-// ============================================================
-
-fn formatTimestamp(
-    buf: *[TIMESTAMP_LEN]u8,
-    separator: u8,
-) []const u8 {
-    const secs: u64 = @intCast(std.time.timestamp());
-    const es = std.time.epoch.EpochSeconds{
-        .secs = secs,
-    };
-    const epoch_day = es.getEpochDay();
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_secs = es.getDaySeconds();
-
-    return std.fmt.bufPrint(
-        buf,
-        "{d:0>4}-{d:0>2}-{d:0>2}" ++
-            "T{d:0>2}{c}{d:0>2}{c}{d:0>2}Z",
-        .{
-            year_day.year,
-            @intFromEnum(month_day.month),
-            month_day.day_index + 1,
-            day_secs.getHoursIntoDay(),
-            separator,
-            day_secs.getMinutesIntoHour(),
-            separator,
-            day_secs.getSecondsIntoMinute(),
-        },
-    ) catch unreachable;
 }
 
 // ============================================================
@@ -3851,23 +3111,4 @@ fn nanosToMsStr(
         "{d}m{d:0>2}s",
         .{ mins, secs },
     ) catch "?m";
-}
-
-// ============================================================
-// Helpers
-// ============================================================
-
-fn errResp(
-    msg: []const u8,
-    retryable: bool,
-) ApiResponse {
-    return .{
-        .success = false,
-        .stop_reason = "",
-        .content_json = "[]",
-        .text = "",
-        .tool_calls = &.{},
-        .error_message = msg,
-        .retryable = retryable,
-    };
 }

@@ -4,9 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // ── Shared tools module ───────────────────────────────────────────
+    // ── Shared modules ────────────────────────────────────────────────
     const tools_module = b.createModule(.{
         .root_source_file = b.path("src/tools.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const api_client_module = b.createModule(.{
+        .root_source_file = b.path("src/api_client.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -62,6 +68,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/agent.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "api_client.zig", .module = api_client_module },
+            },
         }),
     });
     b.installArtifact(agent);
@@ -81,6 +90,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/engine_agent.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "tools.zig", .module = tools_module },
+                .{ .name = "api_client.zig", .module = api_client_module },
+            },
         }),
     });
     b.installArtifact(engine_agent);

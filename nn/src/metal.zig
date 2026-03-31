@@ -501,6 +501,12 @@ pub const Device = struct {
     command_queue: objc.Object,
     library: objc.Object,
     unified_memory: bool,
+    /// Half of MTLDevice.recommendedMaxWorkingSetSize — the
+    /// maximum bytes nnzap will allocate via Metal buffers.
+    /// Computed once at init. Keeps nnzap a well-behaved library
+    /// by leaving the other half for the OS, other apps, and the
+    /// CPU data pipeline.
+    memory_budget_bytes: u64,
 
     // Pre-compiled compute pipelines for all our kernels.
     vector_add: ComputePipeline,
@@ -575,11 +581,32 @@ pub const Device = struct {
         // Compile the Metal shader library from embedded source.
         const library = try compileLibrary(device);
 
+        // Half of what Metal itself recommends as the safe working
+        // set ceiling. recommendedMaxWorkingSetSize is typically
+        // 70-75% of total unified RAM on Apple Silicon — so /2
+        // gives nnzap ~35-37% of total RAM, leaving the rest
+        // available for the rest of the system.
+        const recommended_max: u64 = @intCast(device.msgSend(
+            c_ulong,
+            "recommendedMaxWorkingSetSize",
+            .{},
+        ));
+        const memory_budget_bytes: u64 = recommended_max / 2;
+        log.info(
+            "Memory budget: {d} MB " ++
+                "(recommendedMaxWorkingSetSize={d} MB, using half)",
+            .{
+                memory_budget_bytes / (1024 * 1024),
+                recommended_max / (1024 * 1024),
+            },
+        );
+
         // Set non-pipeline fields, then compile pipelines below.
         self.obj = device;
         self.command_queue = command_queue;
         self.library = library;
         self.unified_memory = unified_memory;
+        self.memory_budget_bytes = memory_budget_bytes;
 
         try self.compilePipelines(device, library);
     }
@@ -607,6 +634,23 @@ pub const Device = struct {
         num_elements: u32,
     ) !Buffer {
         std.debug.assert(num_elements > 0);
+
+        // Fail fast before asking Metal for memory we shouldn't take.
+        // currentAllocatedSize is queried live so the check is always
+        // fresh — no stale snapshot can mask a budget breach.
+        const incoming_bytes: u64 =
+            @as(u64, num_elements) * @sizeOf(f32);
+        const current_bytes: u64 = @intCast(self.obj.msgSend(
+            c_ulong,
+            "currentAllocatedSize",
+            .{},
+        ));
+        if (current_bytes + incoming_bytes > self.memory_budget_bytes) {
+            // Return the error — the caller has the context to log
+            // a useful message (which buffer, which network, etc.).
+            // Logging here would be noise without that context.
+            return error.MetalMemoryBudgetExceeded;
+        }
 
         return Buffer.init(self.obj, num_elements);
     }
@@ -1030,6 +1074,73 @@ pub fn setBytes(
         @as(c_ulong, @sizeOf(T)),
         @as(c_ulong, index),
     });
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "memory_budget is half of recommendedMaxWorkingSetSize" {
+    // Goal: confirm the budget stored at init is exactly half of
+    // what Metal reports as its recommended working set ceiling.
+    // Methodology: init a Device, re-query recommendedMaxWorkingSetSize
+    // via msgSend, and compare against the stored field.
+    var device: Device = undefined;
+    try device.init();
+
+    const recommended: u64 = @intCast(device.obj.msgSend(
+        c_ulong,
+        "recommendedMaxWorkingSetSize",
+        .{},
+    ));
+
+    // Budget must be positive — a zero budget would reject every
+    // allocation including the first parameter buffer.
+    try std.testing.expect(device.memory_budget_bytes > 0);
+
+    // Budget must equal exactly half of the Metal recommendation.
+    try std.testing.expectEqual(
+        recommended / 2,
+        device.memory_budget_bytes,
+    );
+}
+
+test "createBuffer succeeds within budget" {
+    // Goal: a small allocation (1,000 floats = 4 KB) must succeed,
+    // return the correct length, and be zero-filled on creation
+    // (buffer bleed prevention — stale data must never be visible).
+    var device: Device = undefined;
+    try device.init();
+
+    var buf = try device.createBuffer(1_000);
+    defer buf.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1_000), buf.len);
+
+    const slice = buf.asSlice();
+    try std.testing.expectEqual(@as(usize, 1_000), slice.len);
+
+    for (slice) |v| {
+        try std.testing.expectEqual(@as(f32, 0.0), v);
+    }
+}
+
+test "createBuffer returns MetalMemoryBudgetExceeded when over limit" {
+    // Goal: exercise the fail-fast error path in createBuffer.
+    // Methodology: shrink the budget to 1 byte so any allocation
+    // exceeds it, assert the correct error is returned, then restore
+    // the budget via defer so subsequent tests are unaffected.
+    var device: Device = undefined;
+    try device.init();
+
+    const saved_budget = device.memory_budget_bytes;
+    device.memory_budget_bytes = 1;
+    defer device.memory_budget_bytes = saved_budget;
+
+    try std.testing.expectError(
+        error.MetalMemoryBudgetExceeded,
+        device.createBuffer(1),
+    );
 }
 
 fn compileLibrary(device: objc.Object) !objc.Object {

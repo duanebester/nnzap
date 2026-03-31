@@ -118,9 +118,9 @@ nnzap/
       program.md                   -- AI agent instructions for hyperparameter experiments
       agent_program.md             -- Engine agent architecture documentation
       engine_program.md            -- AI agent instructions for engine optimisation experiments
-    reference/
-      mlx_reference.py             -- MLX baseline for comparison
-      pytorch_reference.py         -- PyTorch baseline for comparison
+  reference/
+    mlx_reference.py               -- MLX baseline for comparison
+    pytorch_reference.py           -- PyTorch baseline for comparison
   data/                            -- MNIST dataset (downloaded at runtime)
   docs/
     ARCHITECTURE.md                -- This file

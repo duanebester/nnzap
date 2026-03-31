@@ -78,9 +78,9 @@ nnzap/
 │   │   ├── program.md             # Agent instructions for hyperparameter experiments
 │   │   ├── agent_program.md       # Agent architecture documentation
 │   │   └── engine_program.md      # Agent instructions for engine optimisation
-│   └── reference/
-│       ├── mlx_reference.py       # MLX baseline for comparison
-│       └── pytorch_reference.py   # PyTorch baseline for comparison
+├── reference/
+│   ├── mlx_reference.py           # MLX baseline for comparison
+│   └── pytorch_reference.py       # PyTorch baseline for comparison
 ├── data/                          # MNIST dataset (downloaded at runtime)
 ├── docs/
 │   ├── ARCHITECTURE.md            # Detailed architecture documentation
