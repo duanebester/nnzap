@@ -342,6 +342,10 @@ const pipeline_specs = [_]PipelineSpec{
         .shader_name = "matmul_bias_relu",
     },
     .{
+        .field_name = "matmul_bias_relu_infer",
+        .shader_name = "matmul_bias_relu_infer",
+    },
+    .{
         .field_name = "matmul_bias_v2",
         .shader_name = "matmul_bias_v2",
     },
@@ -429,6 +433,7 @@ pub const Device = struct {
     matmul_bias_relu: ComputePipeline,
     matmul_bias_v2: ComputePipeline,
     matmul_bias_relu_v2: ComputePipeline,
+    matmul_bias_relu_infer: ComputePipeline,
     matmul_transA: ComputePipeline,
     matmul_transB: ComputePipeline,
 

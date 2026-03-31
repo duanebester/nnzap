@@ -139,6 +139,9 @@ fn dispatch(
     if (tools.eql(cmd, "check")) return toolCheck(arena);
     if (tools.eql(cmd, "test")) return toolTest(arena);
     if (tools.eql(cmd, "bench")) return toolBench(arena);
+    if (tools.eql(cmd, "bench-infer")) {
+        return toolBenchInfer(arena);
+    }
     if (tools.eql(cmd, "bench-compare")) {
         return toolBenchCompare(arena);
     }
@@ -199,6 +202,11 @@ fn toolHelp() !void {
         \\    {
         \\      "name": "bench",
         \\      "description": "Full training benchmark",
+        \\      "args": []
+        \\    },
+        \\    {
+        \\      "name": "bench-infer",
+        \\      "description": "Inference benchmark (GPU batched, GPU single, CPU single latency). Returns JSON.",
         \\      "args": []
         \\    },
         \\    {
@@ -745,6 +753,56 @@ fn toolBench(arena: Allocator) !void {
     };
 
     // Forward training output to stderr for diagnostics.
+    if (result.stderr.len > 0) {
+        tools.stderr_file.writeAll(result.stderr) catch {};
+    }
+
+    const success = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+
+    if (!success) {
+        try writeBenchError(arena, result.stderr);
+        return;
+    }
+
+    // Find and output the benchmark JSON.
+    try emitBenchmarkResult(arena, bench_fs);
+}
+
+fn toolBenchInfer(arena: Allocator) !void {
+    const bench_fs = try tools.resolveToFs(
+        arena,
+        tools.NN_DIR ++ "/" ++ tools.BENCH_DIR,
+    );
+
+    // Clean old benchmarks so we find exactly the new one.
+    _ = tools.cleanBenchmarkFiles(bench_fs);
+
+    std.debug.print(
+        "engine_research: running zig build run-infer...\n",
+        .{},
+    );
+
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &[_][]const u8{ "zig", "build", "run-infer" },
+        .cwd = "../" ++ tools.NN_DIR,
+        .max_output_bytes = tools.MAX_OUTPUT_BYTES,
+    }) catch |err| {
+        const json = try std.fmt.allocPrint(
+            arena,
+            "{{\"status\": \"error\", " ++
+                "\"error\": \"spawn_failed: " ++
+                "{s}\"}}\n",
+            .{@errorName(err)},
+        );
+        try tools.writeStdout(json);
+        return;
+    };
+
+    // Forward benchmark output to stderr for diagnostics.
     if (result.stderr.len > 0) {
         tools.stderr_file.writeAll(result.stderr) catch {};
     }

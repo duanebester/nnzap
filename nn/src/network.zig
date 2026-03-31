@@ -335,6 +335,152 @@ pub fn Network(
         }
 
         // ====================================================
+        // Inference forward pass (no pre_act writes)
+        // ====================================================
+
+        /// Encode an inference-only forward pass.  Uses the
+        /// matmul_bias_relu_infer kernel which skips the
+        /// pre_act buffer write — one fewer setBuffer call
+        /// and one fewer global memory store per ReLU layer.
+        /// The result is in post_activations[last], readable
+        /// via getOutput().
+        pub fn forwardInfer(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(batch_size <= max_batch_size);
+            std.debug.assert(
+                input.len >=
+                    batch_size * Layout.input_size,
+            );
+
+            inline for (0..Layout.num_layers) |i| {
+                const layer_input: Buffer =
+                    if (i == 0)
+                        input
+                    else
+                        self.post_activations[i - 1];
+
+                if (Layout.layers[i].act == .relu) {
+                    // Inference-only fused kernel: skips
+                    // pre_act write, one fewer buffer bind.
+                    encodeMatmulBiasReluInfer(
+                        Layout.layers[i].in,
+                        Layout.layers[i].out,
+                        Layout.weight_offsets[i],
+                        Layout.bias_offsets[i],
+                        device,
+                        encoder,
+                        layer_input,
+                        self.params,
+                        self.post_activations[i],
+                        batch_size,
+                    );
+                } else if (Layout.layers[i].act == .none) {
+                    // matmul_bias already skips pre_act —
+                    // no inference variant needed.
+                    encodeMatmulBias(
+                        Layout.layers[i].in,
+                        Layout.layers[i].out,
+                        Layout.weight_offsets[i],
+                        Layout.bias_offsets[i],
+                        device,
+                        encoder,
+                        layer_input,
+                        self.params,
+                        self.post_activations[i],
+                        batch_size,
+                    );
+                } else {
+                    // Tanh/sigmoid: separate dispatches.
+                    // pre_activations used as scratch only.
+                    encodeMatmulBias(
+                        Layout.layers[i].in,
+                        Layout.layers[i].out,
+                        Layout.weight_offsets[i],
+                        Layout.bias_offsets[i],
+                        device,
+                        encoder,
+                        layer_input,
+                        self.params,
+                        self.pre_activations[i],
+                        batch_size,
+                    );
+                    encodeActivation(
+                        Layout.layers[i].act,
+                        Layout.layers[i].out,
+                        device,
+                        encoder,
+                        self.pre_activations[i],
+                        self.post_activations[i],
+                        batch_size,
+                    );
+                }
+            }
+        }
+
+        // ====================================================
+        // CPU forward pass (pure Zig, no Metal)
+        // ====================================================
+
+        /// Pure-Zig CPU forward pass — no Metal dispatch.
+        /// Reads weights from the same unified-memory params
+        /// buffer (zero copy), computes matmul + bias + act
+        /// in tight loops.  Targets batch=1 latency where
+        /// Metal dispatch overhead exceeds compute time.
+        ///
+        /// Input: `input_data` is [batch_size x input_size].
+        /// Output: lands in post_activations[last], readable
+        /// via getOutput().asSlice().
+        pub fn forwardCPU(
+            self: *const Self,
+            input_data: []const f32,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(batch_size <= max_batch_size);
+            std.debug.assert(
+                input_data.len >=
+                    @as(usize, batch_size) *
+                        Layout.input_size,
+            );
+
+            const params = self.params.asSlice();
+
+            inline for (0..Layout.num_layers) |i| {
+                const layer_in: []const f32 =
+                    if (i == 0)
+                        input_data
+                    else
+                        self.post_activations[i - 1]
+                            .asSlice();
+
+                const weights =
+                    Layout.getWeightSlice(params, i);
+                const biases =
+                    Layout.getBiasSlice(params, i);
+
+                const output =
+                    self.post_activations[i].asSlice();
+
+                cpuMatmulBiasAct(
+                    Layout.layers[i].in,
+                    Layout.layers[i].out,
+                    Layout.layers[i].act,
+                    layer_in,
+                    weights,
+                    biases,
+                    output,
+                    batch_size,
+                );
+            }
+        }
+
+        // ====================================================
         // Backward pass
         // ====================================================
 
@@ -1249,6 +1395,62 @@ pub fn Network(
             // to allow batching independent dispatches.
         }
 
+        /// Encode fused matmul + bias + ReLU for inference:
+        ///   out = max(0, X * W + bias)
+        /// Same tiling as matmul_bias_relu but drops the
+        /// pre_act buffer write — one fewer setBuffer call,
+        /// one fewer global memory store per output element.
+        fn encodeMatmulBiasReluInfer(
+            comptime in_size: u32,
+            comptime out_size: u32,
+            comptime weight_offset: u32,
+            comptime bias_offset: u32,
+            device: *const Device,
+            encoder: objc.Object,
+            layer_input: Buffer,
+            params: Buffer,
+            post_act: Buffer,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(params.len > weight_offset);
+            std.debug.assert(params.len > bias_offset);
+
+            // Buffer layout matches matmul_bias_relu_infer
+            // kernel: same as training variant minus pre_act
+            // at buffer(7).
+            metal.setBuffer(encoder, layer_input, 0);
+            metal.setBufferWithOffset(
+                encoder,
+                params,
+                weight_offset,
+                1,
+            );
+            metal.setBuffer(encoder, post_act, 2);
+
+            const m_val: u32 = batch_size;
+            const k_val: u32 = in_size;
+            const n_val: u32 = out_size;
+            metal.setBytes(encoder, u32, &m_val, 3);
+            metal.setBytes(encoder, u32, &k_val, 4);
+            metal.setBytes(encoder, u32, &n_val, 5);
+
+            metal.setBufferWithOffset(
+                encoder,
+                params,
+                bias_offset,
+                6,
+            );
+
+            device.dispatch2D(
+                encoder,
+                device.matmul_bias_relu_infer,
+                out_size,
+                batch_size,
+            );
+            // Barrier managed by caller.
+        }
+
         /// Encode fused matmul + bias:
         ///   out = X * W + bias
         /// Replaces encodeMatmul + encodeBiasAdd with a
@@ -1587,6 +1789,217 @@ pub fn Network(
                 out_size,
                 in_size,
             );
+        }
+
+        // ====================================================
+        // CPU matmul helper (Rule 20 — hot loop extraction)
+        // ====================================================
+
+        /// CPU matmul + bias + activation.  Standalone
+        /// function with primitive args (no self) so the
+        /// compiler can keep everything in registers.
+        ///
+        /// Weight layout matches the GPU convention:
+        ///   weights[k * out_size + n] is row-major
+        ///   [in_size x out_size].
+        ///
+        /// output[m, n] = act( sum_k(input[m, k] *
+        ///     weights[k, n]) + bias[n] )
+        /// SIMD-optimised matmul + bias + activation.
+        /// Uses mkn loop order so the inner loop reads
+        /// contiguous weight rows (cache-friendly), and
+        /// @Vector SIMD for the accumulation.
+        fn cpuMatmulBiasAct(
+            comptime in_size: u32,
+            comptime out_size: u32,
+            comptime act: layout.Activation,
+            input: []const f32,
+            weights: []const f32,
+            biases: []const f32,
+            output: []f32,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(
+                weights.len >= in_size * out_size,
+            );
+            std.debug.assert(biases.len >= out_size);
+            std.debug.assert(
+                input.len >=
+                    @as(usize, batch_size) * in_size,
+            );
+            std.debug.assert(
+                output.len >=
+                    @as(usize, batch_size) * out_size,
+            );
+
+            for (0..batch_size) |m| {
+                const in_row =
+                    input[m * in_size ..][0..in_size];
+                const out_row =
+                    output[m * out_size ..][0..out_size];
+
+                // Delegate to the SIMD inner kernel.
+                cpuMatmulRow(
+                    in_size,
+                    out_size,
+                    act,
+                    in_row,
+                    weights,
+                    biases[0..out_size],
+                    out_row,
+                );
+            }
+        }
+
+        /// SIMD inner kernel: one output row.
+        /// Extracted per Rule 20 (hot loop extraction)
+        /// so the compiler sees only primitive/slice args.
+        ///
+        /// Accumulates output = bias + sum_k(input[k] *
+        /// W[k*N..][0..N]) using @Vector, then applies
+        /// the activation function.
+        fn cpuMatmulRow(
+            comptime in_size: u32,
+            comptime out_size: u32,
+            comptime act: layout.Activation,
+            in_row: *const [in_size]f32,
+            weights: []const f32,
+            biases: *const [out_size]f32,
+            out_row: *[out_size]f32,
+        ) void {
+            // SIMD vector width.  Apple Silicon NEON has
+            // 128-bit registers = 4 floats.  We process
+            // out_size in chunks of VEC_LEN.
+            const VEC_LEN = 8;
+            const vec_count = out_size / VEC_LEN;
+            const vec_tail = out_size % VEC_LEN;
+
+            comptime {
+                std.debug.assert(in_size > 0);
+                std.debug.assert(out_size > 0);
+            }
+            std.debug.assert(
+                weights.len >= in_size * out_size,
+            );
+
+            // Accumulators: one SIMD vector per chunk,
+            // initialised from biases.
+            var accum: [vec_count]@Vector(
+                VEC_LEN,
+                f32,
+            ) = undefined;
+            inline for (0..vec_count) |v| {
+                const off = v * VEC_LEN;
+                accum[v] = biases[off..][0..VEC_LEN].*;
+            }
+
+            // Scalar tail accumulator.
+            var tail_accum: [vec_tail]f32 = undefined;
+            if (vec_tail > 0) {
+                const tail_off = vec_count * VEC_LEN;
+                inline for (0..vec_tail) |t| {
+                    tail_accum[t] = biases[tail_off + t];
+                }
+            }
+
+            // mkn: for each input element, broadcast and
+            // multiply with the contiguous weight row.
+            for (0..in_size) |k| {
+                const x_k: @Vector(VEC_LEN, f32) =
+                    @splat(in_row[k]);
+                const w_row = weights[k * out_size ..];
+
+                inline for (0..vec_count) |v| {
+                    const off = v * VEC_LEN;
+                    const w_vec: @Vector(
+                        VEC_LEN,
+                        f32,
+                    ) = w_row[off..][0..VEC_LEN].*;
+                    accum[v] += x_k * w_vec;
+                }
+
+                // Scalar tail.
+                if (vec_tail > 0) {
+                    const tail_off =
+                        vec_count * VEC_LEN;
+                    inline for (0..vec_tail) |t| {
+                        tail_accum[t] +=
+                            in_row[k] *
+                            w_row[tail_off + t];
+                    }
+                }
+            }
+
+            // Write results with activation.
+            inline for (0..vec_count) |v| {
+                const off = v * VEC_LEN;
+                const result = applyActVec(
+                    VEC_LEN,
+                    act,
+                    accum[v],
+                );
+                out_row[off..][0..VEC_LEN].* = result;
+            }
+
+            // Scalar tail activation + write.
+            if (vec_tail > 0) {
+                const tail_off = vec_count * VEC_LEN;
+                inline for (0..vec_tail) |t| {
+                    out_row[tail_off + t] =
+                        applyActScalar(
+                        act,
+                        tail_accum[t],
+                    );
+                }
+            }
+        }
+
+        /// Apply activation function to a SIMD vector.
+        fn applyActVec(
+            comptime len: u32,
+            comptime act: layout.Activation,
+            v: @Vector(len, f32),
+        ) @Vector(len, f32) {
+            comptime std.debug.assert(len > 0);
+            return switch (act) {
+                .relu => @max(
+                    v,
+                    @as(@Vector(len, f32), @splat(0.0)),
+                ),
+                .none => v,
+                .tanh_act, .sigmoid => blk: {
+                    // Scalar fallback for transcendental
+                    // functions (no SIMD @exp).
+                    var result: [len]f32 = undefined;
+                    const arr: [len]f32 = v;
+                    inline for (0..len) |i| {
+                        result[i] = applyActScalar(
+                            act,
+                            arr[i],
+                        );
+                    }
+                    break :blk result;
+                },
+            };
+        }
+
+        /// Apply activation to a single scalar value.
+        fn applyActScalar(
+            comptime act: layout.Activation,
+            val: f32,
+        ) f32 {
+            comptime std.debug.assert(
+                act == .relu or act == .none or
+                    act == .tanh_act or act == .sigmoid,
+            );
+            return switch (act) {
+                .relu => @max(0.0, val),
+                .tanh_act => 1.0 - 2.0 /
+                    (@exp(2.0 * val) + 1.0),
+                .sigmoid => 1.0 / (1.0 + @exp(-val)),
+                .none => val,
+            };
         }
     };
 }

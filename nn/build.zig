@@ -44,6 +44,28 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // ── Inference benchmark ───────────────────────────────────────────
+    const infer_bench = b.addExecutable(.{
+        .name = "inference_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/inference_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nn", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(infer_bench);
+
+    const run_infer_step = b.step("run-infer", "Run the inference benchmark");
+    const run_infer_cmd = b.addRunArtifact(infer_bench);
+    run_infer_step.dependOn(&run_infer_cmd.step);
+    run_infer_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_infer_cmd.addArgs(args);
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────
     const mod_tests = b.addTest(.{
         .root_module = mod,

@@ -82,6 +82,7 @@ const ALLOWED_WRITE_FILES = [_][]const u8{
     "nn/src/shaders/compute.metal",
     "nn/src/layout.zig",
     "nn/examples/mnist.zig",
+    "nn/examples/inference_bench.zig",
 };
 
 // ============================================================
@@ -160,30 +161,49 @@ const ParsedContent = struct {
 
 const SYSTEM_PROMPT =
     \\You are an autonomous systems-performance research
-    \\agent optimising nnzap's core engine. nnzap is a
-    \\Zig + Metal GPU-accelerated neural network library
-    \\for Apple Silicon with zero-copy unified memory.
+    \\agent optimising nnzap's inference performance.
+    \\nnzap is a Zig + Metal GPU-accelerated neural
+    \\network library for Apple Silicon with zero-copy
+    \\unified memory.
     \\
-    \\Goal: maximise throughput_images_per_sec on MNIST
-    \\without regressing test accuracy below 97.0%.
+    \\## Goal
+    \\
+    \\Minimise single-sample inference latency (both GPU
+    \\and CPU paths) and maximise GPU batched inference
+    \\throughput.  The primary benchmark is bench_infer,
+    \\which measures three things:
+    \\
+    \\  1. gpu_batched — images/sec (higher is better).
+    \\  2. gpu_single_sample — p50/p99 us (lower is better).
+    \\  3. cpu_single_sample — p50/p99 us (lower is better).
+    \\
+    \\Training accuracy must not regress below 97.0%.
+    \\Run bench (training) to verify accuracy is intact
+    \\after structural changes, but bench_infer is your
+    \\primary measurement tool.
     \\
     \\You edit source files directly. This is NOT
-    \\hyperparameter tuning -- you change Metal kernels,
-    \\dispatch strategies, buffer layouts, and pipeline
-    \\architecture.
+    \\hyperparameter tuning — you change Metal kernels,
+    \\dispatch strategies, buffer layouts, CPU matmul
+    \\implementations, and pipeline architecture.
     \\
     \\## Files
     \\
-    \\- nn/src/metal.zig -- Metal device, buffers, pipelines,
+    \\- nn/src/metal.zig — Metal device, buffers, pipelines,
     \\  dispatch (1D/2D), command buffer management.
-    \\- nn/src/network.zig -- Forward/backward pass encoding,
-    \\  loss functions, optimizer updates.
-    \\- nn/src/shaders/compute.metal -- GPU kernels (MSL):
-    \\  matmul, activations, bias, SGD/Adam, softmax+CE.
-    \\- nn/src/layout.zig -- Comptime network layout: buffer
+    \\- nn/src/network.zig — Forward/backward pass encoding,
+    \\  forwardInfer (GPU inference, no pre_act writes),
+    \\  forwardCPU (pure Zig, no Metal), cpuMatmulBiasAct
+    \\  (CPU hot loop — the main optimisation target).
+    \\- nn/src/shaders/compute.metal — GPU kernels (MSL):
+    \\  matmul variants, matmul_bias_relu_infer (inference
+    \\  kernel, no pre_act store), activations, loss, etc.
+    \\- nn/src/layout.zig — Comptime network layout: buffer
     \\  sizes, offsets, activation sizes.
-    \\- nn/examples/mnist.zig -- Training loop, batch iteration,
-    \\  evaluation, benchmark recording.
+    \\- nn/examples/inference_bench.zig — Inference benchmark
+    \\  binary: GPU batched, GPU single, CPU single phases.
+    \\- nn/examples/mnist.zig — Training loop (for accuracy
+    \\  regression checks via bench).
     \\
     \\## Tools
     \\
@@ -191,20 +211,20 @@ const SYSTEM_PROMPT =
     \\
     \\Engine research (safety + measurement):
     \\  snapshot, snapshot_list, rollback, rollback_latest,
-    \\  diff, check, test, bench, bench_compare,
-    \\  history, show, show_function, commit,
-    \\  add_summary
+    \\  diff, check, test, bench, bench_infer,
+    \\  bench_compare, history, show, show_function,
+    \\  commit, add_summary
     \\
     \\File I/O (locked to project directory):
     \\  read_file, write_file, edit_file, list_directory
     \\
     \\Environment:
-    \\  cwd -- returns the absolute working directory for
+    \\  cwd — returns the absolute working directory for
     \\  run_command, list_directory, etc. Call this first
     \\  if you are unsure where commands execute.
     \\
     \\Shell (locked to project directory, 120s timeout):
-    \\  run_command -- execute any shell command, e.g.
+    \\  run_command — execute any shell command, e.g.
     \\  grep, zig build, wc, head, etc.
     \\
     \\Prefer edit_file over write_file when making small
@@ -219,22 +239,25 @@ const SYSTEM_PROMPT =
     \\## Protocol
     \\
     \\This conversation is ONE experiment. You will:
-    \\1. snapshot -- safety net before any edits.
+    \\1. snapshot — safety net before any edits.
     \\2. Read the target code with show, show_function,
     \\   read_file, or run_command (e.g. grep).
     \\3. Edit the source with edit_file (targeted
     \\   find-and-replace) or write_file (full rewrite
     \\   for large changes). Read before you write.
-    \\4. check -- compile validation (~2s). If it fails,
+    \\4. check — compile validation (~2s). If it fails,
     \\   read the error, fix or rollback_latest.
-    \\5. test -- numerical correctness. If it fails,
+    \\5. test — numerical correctness. If it fails,
     \\   rollback_latest.
-    \\6. bench -- full MNIST training benchmark.
+    \\6. bench_infer — inference benchmark (~5s). This is
+    \\   your primary metric.
     \\7. Evaluate: see decision rules below.
     \\8. Keep (commit with a descriptive message) or
     \\   rollback_latest + add_summary describing what
     \\   was tried and WHY it failed. Then try another
     \\   approach from step 2.
+    \\9. Optionally run bench (training) after structural
+    \\   changes to confirm accuracy >= 97.0%.
     \\
     \\When you have exhausted ideas or found a KEEP,
     \\STOP. The outer loop will start a new conversation
@@ -242,19 +265,23 @@ const SYSTEM_PROMPT =
     \\
     \\## Decision rules
     \\
-    \\- Throughput up >= 5%: KEEP.
-    \\- Throughput +/- 5%, accuracy up: KEEP.
-    \\- Throughput +/- 5%, accuracy same: KEEP if the
-    \\  code is cleaner or enables future work.
-    \\- Throughput down > 5%: ROLLBACK.
-    \\- Accuracy below 97.0%: ROLLBACK.
+    \\Primary metric: gpu_single_sample p50 latency from
+    \\bench_infer. Secondary: cpu_single_sample p50 and
+    \\gpu_batched images/sec.
+    \\
+    \\- Any primary metric improves >= 10%: KEEP.
+    \\- Primary flat, secondary improves >= 10%: KEEP.
+    \\- All metrics flat but code is cleaner or enables
+    \\  future work: KEEP.
+    \\- Any primary metric regresses > 10%: ROLLBACK.
+    \\- Training accuracy below 97.0%: ROLLBACK.
     \\- Compile or test failure: ROLLBACK immediately.
     \\
     \\## Constraints
     \\
-    \\- check must pass before test or bench.
+    \\- check must pass before test or bench_infer.
     \\- test must pass. NEVER modify test expectations.
-    \\- Accuracy must stay >= 97.0% (baseline ~97.8%).
+    \\- Training accuracy must stay >= 97.0%.
     \\- ONE optimisation per experiment. Isolate variables.
     \\- Read the full function before modifying it.
     \\- When adding Metal kernels, wire the pipeline in
@@ -263,44 +290,56 @@ const SYSTEM_PROMPT =
     \\  assertions per function, 100-column limit,
     \\  snake_case naming, comments explain WHY.
     \\
-    \\## Current baseline
+    \\## Current inference baseline
     \\
-    \\- Naive matmul: 1 thread per output element,
-    \\  no tiling, no shared memory.
-    \\- One command buffer + one encoder per batch.
-    \\- Synchronous commitAndWait after every batch.
-    \\- Hardcoded 16x16 threadgroup for 2D kernels.
-    \\- No kernel fusion (separate matmul, bias,
-    \\  activation dispatches).
-    \\- ~85k images/sec throughput.
+    \\Architecture: 784 -> 128 (relu) -> 64 (relu) -> 10.
+    \\109,386 parameters.
+    \\
+    \\GPU path (forwardInfer in network.zig):
+    \\  Uses matmul_bias_relu_infer kernel (tiled 16x16,
+    \\  no pre_act write) for ReLU layers, matmul_bias
+    \\  for the output layer.  One command buffer + one
+    \\  encoder + commitAndWait per single-sample call.
+    \\  Baseline: ~280 us p50 single-sample, ~850k img/s
+    \\  batched.
+    \\
+    \\CPU path (forwardCPU in network.zig):
+    \\  Pure Zig cpuMatmulBiasAct — naive triple loop
+    \\  (m, n, k order), no SIMD, no blocking, no cache
+    \\  optimisation.  Reads weights from unified memory.
+    \\  Baseline: ~830 us p50 single-sample.
     \\
     \\## Optimisation phases (priority order)
     \\
-    \\Phase 1 -- Dispatch tuning (low-risk, high-reward):
-    \\  Tune threadgroup sizes (8x8, 32x8, 32x32).
-    \\  Use dispatchThreadgroups over dispatchThreads.
-    \\  Batch multiple steps per command buffer.
+    \\Phase 1 — CPU forward pass (highest headroom):
+    \\  Loop reordering (ikj for row-major cache hits).
+    \\  @Vector SIMD for the inner dot product.
+    \\  Blocking/tiling for L1 cache (e.g. 64x64 tiles).
+    \\  Fuse bias+relu into the matmul write loop.
+    \\  Comptime-unroll for the specific layer dimensions
+    \\  (784x128, 128x64, 64x10 — all known at comptime).
+    \\  Prefetch with @prefetch hints.
     \\
-    \\Phase 2 -- Kernel optimisation:
-    \\  Tiled matmul with threadgroup memory (16x16).
-    \\  Fuse bias_add into matmul kernel.
-    \\  Fuse activation into matmul+bias.
-    \\  Vectorised float4 loads in elementwise kernels.
+    \\Phase 2 — GPU single-sample latency:
+    \\  Reduce Metal dispatch overhead for batch=1.
+    \\  Smaller threadgroup sizes (8x8) for tiny matrices.
+    \\  commandBufferWithUnretainedReferences (less
+    \\  retain/release overhead).
+    \\  Pre-encoded command buffers (encode once, replay).
+    \\  Fused all-layers kernel (one dispatch for entire
+    \\  forward pass — risky but high ceiling).
     \\
-    \\Phase 3 -- Pipeline:
-    \\  Double-buffered command buffers.
-    \\  Async commit instead of commitAndWait.
-    \\  Minimise memory barriers.
+    \\Phase 3 — GPU batched throughput:
+    \\  Encode multiple inferences per command buffer.
+    \\  Tune batch size and threadgroup dimensions.
+    \\  Register-tiled matmul (1x2, 2x2 output per thread).
+    \\  Async commit with completion handlers.
     \\
-    \\Phase 4 -- Memory:
-    \\  Private storage for GPU-only buffers.
-    \\  Write-combined cache for input buffers.
-    \\  Buffer reuse across layers.
-    \\
-    \\Phase 5 -- Advanced:
-    \\  SIMD group reductions.
-    \\  Half-precision activations/gradients.
-    \\  Fused backward pass kernels.
+    \\Phase 4 — Cross-cutting:
+    \\  Find the GPU/CPU crossover batch size.
+    \\  Hybrid path: CPU for tiny final layer (64x10),
+    \\  GPU for large layers.
+    \\  Half-precision (float16) for activations.
     \\
     \\## Metal kernel editing rules
     \\
@@ -308,7 +347,7 @@ const SYSTEM_PROMPT =
     \\- Bounds check: if (gid.x >= width) return;
     \\- threadgroup_barrier after threadgroup writes.
     \\- Avoid divergent branches in a SIMD group.
-    \\- Prefer adding new kernels (e.g. matmul_tiled)
+    \\- Prefer adding new kernels (e.g. matmul_infer_v2)
     \\  alongside existing ones for safe comparison.
     \\
     \\## Recovery
@@ -320,8 +359,8 @@ const SYSTEM_PROMPT =
     \\
     \\- check fails: fix or rollback_latest + add_summary.
     \\- test fails: rollback_latest + add_summary.
-    \\- bench crashes: rollback_latest + add_summary.
-    \\- bench regresses: rollback_latest + add_summary.
+    \\- bench_infer crashes: rollback_latest + add_summary.
+    \\- bench_infer regresses: rollback_latest + add_summary.
     \\
     \\## FOCUS
     \\
@@ -374,6 +413,9 @@ const TOOL_SCHEMAS =
     \\   "input_schema":{"type":"object","properties":{},"required":[]}},
     \\  {"name":"bench",
     \\   "description":"Full MNIST training benchmark (~10s). Returns JSON with throughput_images_per_sec and final_test_accuracy_pct.",
+    \\   "input_schema":{"type":"object","properties":{},"required":[]}},
+    \\  {"name":"bench_infer",
+    \\   "description":"Inference benchmark (~5s). Returns JSON with gpu_batched images/sec, gpu_single_sample p50/p99 latency, and cpu_single_sample p50/p99 latency.",
     \\   "input_schema":{"type":"object","properties":{},"required":[]}},
     \\  {"name":"bench_compare",
     \\   "description":"Compare all benchmark results side by side.",
@@ -654,7 +696,9 @@ fn mainInner() !void {
 
             // Track bench calls.
             for (resp.tool_calls) |call| {
-                if (eql(call.name, "bench")) {
+                if (eql(call.name, "bench") or
+                    eql(call.name, "bench_infer"))
+                {
                     total_bench_count += 1;
                     bench_ran = true;
                 }
@@ -1372,10 +1416,16 @@ fn executeSingleTool(
         },
     );
 
-    // Persist bench results to the history log.
-    if (eql(call.name, "bench") and output.success) {
+    // Persist bench/bench_infer results to the history log.
+    if ((eql(call.name, "bench") or
+        eql(call.name, "bench_infer")) and
+        output.success)
+    {
         appendExperiment(arena, output.stdout);
-        log("    -> bench result persisted\n", .{});
+        log(
+            "    -> {s} result persisted\n",
+            .{call.name},
+        );
     }
 
     return .{
@@ -1436,6 +1486,12 @@ fn dispatchTool(
         return callEngineResearch(
             arena,
             &.{"bench"},
+        );
+    }
+    if (eql(call.name, "bench_infer")) {
+        return callEngineResearch(
+            arena,
+            &.{"bench-infer"},
         );
     }
     if (eql(call.name, "bench_compare")) {

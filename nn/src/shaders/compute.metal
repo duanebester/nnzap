@@ -226,6 +226,66 @@ kernel void matmul_bias_relu(
 }
 
 // ============================================================================
+// Inference-only fused matmul + bias + ReLU (no pre_act store)
+// ============================================================================
+
+/// Fused matmul + bias_add + ReLU for inference:
+///   out = max(0, W*x + bias)
+/// Identical tiling strategy to matmul_bias_relu but omits the
+/// pre_act buffer write, since inference has no backward pass.
+/// This saves one setBuffer call and one global memory store per
+/// output element.
+kernel void matmul_bias_relu_infer(
+    device const float* W    [[buffer(0)]],  // [M x K]
+    device const float* x    [[buffer(1)]],  // [K x N]
+    device float*       out  [[buffer(2)]],  // [M x N]
+    constant uint& M         [[buffer(3)]],
+    constant uint& K         [[buffer(4)]],
+    constant uint& N         [[buffer(5)]],
+    device const float* bias [[buffer(6)]],  // [N]
+    uint2 gid                [[thread_position_in_grid]],
+    uint2 lid                [[thread_position_in_threadgroup]])
+{
+    threadgroup float tileW[TS * TS];
+    threadgroup float tileX[TS * TS];
+
+    const uint row = gid.y;
+    const uint col = gid.x;
+
+    float sum = 0.0f;
+
+    const uint num_tiles = (K + TS - 1) / TS;
+    for (uint t = 0; t < num_tiles; t++) {
+        const uint w_col = t * TS + lid.x;
+        if (row < M && w_col < K) {
+            tileW[lid.y * TS + lid.x] = W[row * K + w_col];
+        } else {
+            tileW[lid.y * TS + lid.x] = 0.0f;
+        }
+
+        const uint x_row = t * TS + lid.y;
+        if (x_row < K && col < N) {
+            tileX[lid.y * TS + lid.x] = x[x_row * N + col];
+        } else {
+            tileX[lid.y * TS + lid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < TS; i++) {
+            sum += tileW[lid.y * TS + i]
+                 * tileX[i * TS + lid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        out[row * N + col] = max(0.0f, sum + bias[col]);
+    }
+}
+
+// ============================================================================
 // Register-tiled matmul + bias (1×2 output per thread)
 // ============================================================================
 
