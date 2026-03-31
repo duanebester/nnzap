@@ -1,4 +1,4 @@
-//! nnzap MNIST benchmark (#13)
+//! nn MNIST benchmark (#13)
 //!
 //! Architecture: 784 → 128 (relu) → 64 (relu) → 10 (none)
 //! Loss:         softmax + cross-entropy (fused backward)
@@ -20,18 +20,19 @@
 //! Run:  zig build run
 
 const std = @import("std");
-const nnzap = @import("nnzap");
+const nn = @import("nn");
 
-const Mnist = nnzap.Mnist;
-const Buffer = nnzap.Buffer;
-const Device = nnzap.Device;
-const Benchmark = nnzap.Benchmark;
-const EpochResult = nnzap.benchmark.EpochResult;
-const nanosToMs = nnzap.benchmark.nanosToMs;
+const Mnist = nn.Mnist;
+const Buffer = nn.Buffer;
+const Device = nn.Device;
+const Object = nn.metal.Object;
+const Benchmark = nn.Benchmark;
+const EpochResult = nn.benchmark.EpochResult;
+const nanosToMs = nn.benchmark.nanosToMs;
 
 // -- Network architecture (comptime-resolved) ---------
 
-const MnistLayout = nnzap.NetworkLayout(&.{
+const MnistLayout = nn.NetworkLayout(&.{
     .{ .in = 784, .out = 128, .act = .relu },
     .{ .in = 128, .out = 64, .act = .relu },
     .{ .in = 64, .out = 10, .act = .none },
@@ -39,7 +40,7 @@ const MnistLayout = nnzap.NetworkLayout(&.{
 
 const max_batch: u32 = 64;
 const num_classes: u32 = MnistLayout.output_size;
-const MnistNet = nnzap.Network(MnistLayout, max_batch);
+const MnistNet = nn.Network(MnistLayout, max_batch);
 
 // -- Hyperparameters ----------------------------------
 
@@ -65,10 +66,19 @@ const EvalResult = struct {
 };
 
 // -- GPU buffer set for training + evaluation ---------
+// Multi-buffered input/target: we encode BATCHES_PER_CMD
+// training steps into a single Metal command buffer to
+// amortise command-buffer creation and Obj-C message send
+// overhead.  Each step needs its own input/target slot
+// because all CPU fills happen before the GPU starts.
+
+const BATCHES_PER_CMD: u32 = 64;
+const BUFFER_COUNT: u32 = BATCHES_PER_CMD;
 
 const Buffers = struct {
-    input: Buffer,
-    target: Buffer,
+    /// Double-buffered input/target for pipelining.
+    inputs: [BUFFER_COUNT]Buffer,
+    targets: [BUFFER_COUNT]Buffer,
     loss_grad: Buffer,
     probs: Buffer,
     loss: Buffer,
@@ -76,15 +86,35 @@ const Buffers = struct {
     fn init(device: *const Device) !Buffers {
         var self: Buffers = undefined;
 
-        self.input = try device.createBuffer(
-            max_batch * MnistLayout.input_size,
-        );
-        errdefer self.input.deinit();
+        var input_count: u32 = 0;
+        errdefer {
+            var i: u32 = 0;
+            while (i < input_count) : (i += 1) {
+                self.inputs[i].deinit();
+            }
+        }
 
-        self.target = try device.createBuffer(
-            max_batch * num_classes,
-        );
-        errdefer self.target.deinit();
+        for (&self.inputs) |*buf| {
+            buf.* = try device.createBuffer(
+                max_batch * MnistLayout.input_size,
+            );
+            input_count += 1;
+        }
+
+        var target_count: u32 = 0;
+        errdefer {
+            var i: u32 = 0;
+            while (i < target_count) : (i += 1) {
+                self.targets[i].deinit();
+            }
+        }
+
+        for (&self.targets) |*buf| {
+            buf.* = try device.createBuffer(
+                max_batch * num_classes,
+            );
+            target_count += 1;
+        }
 
         self.loss_grad = try device.createBuffer(
             max_batch * num_classes,
@@ -106,8 +136,8 @@ const Buffers = struct {
         self.loss.deinit();
         self.probs.deinit();
         self.loss_grad.deinit();
-        self.target.deinit();
-        self.input.deinit();
+        for (&self.targets) |*b| b.deinit();
+        for (&self.inputs) |*b| b.deinit();
         self.* = undefined;
     }
 };
@@ -120,7 +150,7 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     std.debug.print(
-        "\nnnzap MNIST benchmark\n" ++
+        "\nnn MNIST benchmark\n" ++
             "=====================\n\n",
         .{},
     );
@@ -138,7 +168,7 @@ pub fn main() !void {
     // -- Dataset --
 
     std.debug.print("Loading MNIST... ", .{});
-    var mnist = try Mnist.load(allocator, "data/mnist");
+    var mnist = try Mnist.load(allocator, "../data/mnist");
     defer mnist.deinit(allocator);
     std.debug.print("done.\n", .{});
 
@@ -321,6 +351,12 @@ pub fn main() !void {
 /// set.  Shuffles `indices` in-place (only the training
 /// portion — validation indices are untouched).  Returns
 /// the mean CE loss computed on the final training batch.
+///
+/// Encodes BATCHES_PER_CMD training steps into each Metal
+/// command buffer to amortise command-buffer creation and
+/// Obj-C message send overhead (~15 dispatches per batch,
+/// so grouping 8 batches saves 7 × beginCommandBuffer +
+/// beginCompute + endEncoding + commit round-trips).
 fn trainEpoch(
     device: *const Device,
     net: *const MnistNet,
@@ -332,69 +368,182 @@ fn trainEpoch(
     std.debug.assert(indices.len == train_count);
     std.debug.assert(batches_per_epoch > 0);
 
-    // Fisher-Yates shuffle for this epoch.
     random.shuffle(u32, indices);
 
+    // Track the previous command buffer for async overlap.
+    var prev_cmd: ?Object = null;
+
     var batch: u32 = 0;
-    while (batch < batches_per_epoch) : (batch += 1) {
-        const off: usize = @as(usize, batch) * max_batch;
-        const idx = indices[off..][0..max_batch];
+    while (batch < batches_per_epoch) {
+        const remaining = batches_per_epoch - batch;
+        const group_size = @min(BATCHES_PER_CMD, remaining);
 
-        Mnist.fillImageBatch(
-            mnist.train_images,
-            idx,
-            bufs.input.asSlice(),
+        // Phase 1: CPU fills all buffer slots for this
+        // group while the GPU processes the previous group.
+        fillBatchGroup(
+            mnist,
+            bufs,
+            indices,
+            batch,
+            group_size,
         );
-        Mnist.fillLabelBatch(
-            mnist.train_labels,
-            idx,
-            bufs.target.asSlice(),
-        );
 
-        const is_last = (batch == batches_per_epoch - 1);
-        const cmd = device.beginCommandBuffer();
-        const enc = device.beginCompute(cmd);
-
-        net.forward(device, enc, bufs.input, max_batch);
-
-        // Loss reporting on final batch only.
-        if (is_last) {
-            encodeLoss(device, net, bufs, max_batch, enc);
+        // Wait for the previous command buffer to finish
+        // before encoding (SGD wrote to params there).
+        if (prev_cmd) |pc| {
+            pc.msgSend(void, "waitUntilCompleted", .{});
         }
 
-        MnistNet.encodeSoftmaxCEGrad(
+        // Phase 2: encode all batches in a single
+        // command buffer + compute encoder.
+        prev_cmd = encodeTrainGroup(
             device,
-            enc,
-            net.getOutput().*,
-            bufs.target,
-            bufs.loss_grad,
-            num_classes,
-            max_batch,
+            net,
+            bufs,
+            batch,
+            group_size,
         );
 
-        net.backward(
-            device,
-            enc,
-            bufs.input,
-            bufs.loss_grad,
-            max_batch,
-        );
+        batch += group_size;
+    }
 
-        net.update(device, enc, learning_rate);
-
-        enc.msgSend(void, "endEncoding", .{});
-        device.commitAndWait(cmd);
+    // Wait for the final command buffer.
+    if (prev_cmd) |pc| {
+        pc.msgSend(void, "waitUntilCompleted", .{});
     }
 
     return sumSlice(bufs.loss.asSlice()) /
         @as(f32, max_batch);
 }
 
+/// Fill input/target buffer slots for a group of batches.
+/// Called on the CPU while the GPU may still be running
+/// the previous group's command buffer.
+fn fillBatchGroup(
+    mnist: *const Mnist,
+    bufs: *const Buffers,
+    indices: []u32,
+    start_batch: u32,
+    group_size: u32,
+) void {
+    std.debug.assert(group_size > 0);
+    std.debug.assert(group_size <= BATCHES_PER_CMD);
+
+    var g: u32 = 0;
+    while (g < group_size) : (g += 1) {
+        const batch = start_batch + g;
+        const off: usize = @as(usize, batch) * max_batch;
+        const idx = indices[off..][0..max_batch];
+
+        Mnist.fillImageBatch(
+            mnist.train_images,
+            idx,
+            bufs.inputs[g].asSlice(),
+        );
+        Mnist.fillLabelBatch(
+            mnist.train_labels,
+            idx,
+            bufs.targets[g].asSlice(),
+        );
+    }
+}
+
+/// Encode a group of training steps (forward + backward +
+/// SGD update) into a single command buffer.  Returns the
+/// command buffer object so the caller can wait on it.
+fn encodeTrainGroup(
+    device: *const Device,
+    net: *const MnistNet,
+    bufs: *const Buffers,
+    start_batch: u32,
+    group_size: u32,
+) Object {
+    std.debug.assert(group_size > 0);
+    std.debug.assert(group_size <= BATCHES_PER_CMD);
+
+    const cmd = device.beginCommandBuffer();
+    const enc = device.beginCompute(cmd);
+
+    var g: u32 = 0;
+    while (g < group_size) : (g += 1) {
+        const batch = start_batch + g;
+        const is_last =
+            (batch == batches_per_epoch - 1);
+
+        net.forward(
+            device,
+            enc,
+            bufs.inputs[g],
+            max_batch,
+        );
+
+        if (is_last) {
+            encodeLoss(
+                device,
+                net,
+                bufs,
+                bufs.targets[g],
+                max_batch,
+                enc,
+            );
+        }
+
+        encodeSoftmaxCEGradAndBackward(
+            device,
+            net,
+            enc,
+            bufs,
+            g,
+        );
+
+        net.update(device, enc, learning_rate);
+    }
+
+    enc.msgSend(void, "endEncoding", .{});
+    device.commit(cmd);
+    return cmd;
+}
+
+/// Encode softmax-CE gradient, backward pass, using the
+/// specified buffer slot for input/target data.
+fn encodeSoftmaxCEGradAndBackward(
+    device: *const Device,
+    net: *const MnistNet,
+    enc: Object,
+    bufs: *const Buffers,
+    buf_idx: u32,
+) void {
+    std.debug.assert(buf_idx < BUFFER_COUNT);
+    std.debug.assert(bufs.inputs[buf_idx].len > 0);
+    std.debug.assert(bufs.targets[buf_idx].len > 0);
+
+    MnistNet.encodeSoftmaxCEGrad(
+        device,
+        enc,
+        net.getOutput().*,
+        bufs.targets[buf_idx],
+        bufs.loss_grad,
+        num_classes,
+        max_batch,
+    );
+
+    net.backward(
+        device,
+        enc,
+        bufs.inputs[buf_idx],
+        bufs.loss_grad,
+        max_batch,
+    );
+}
+
 /// Encode softmax → CE loss into an active encoder.
+/// Takes the target buffer explicitly so callers can
+/// pass the correct double-buffer slot.
 fn encodeLoss(
     device: *const Device,
     net: *const MnistNet,
     bufs: *const Buffers,
+    target: Buffer,
     batch_size: u32,
     enc: anytype,
 ) void {
@@ -413,7 +562,7 @@ fn encodeLoss(
         device,
         enc,
         bufs.probs,
-        bufs.target,
+        target,
         bufs.loss,
         num_classes,
         batch_size,
@@ -451,21 +600,30 @@ fn evaluate(
         const current: u32 = @min(max_batch, remaining);
         const idx = indices[offset..][0..current];
 
+        // Evaluation uses buffer slot 0 (synchronous, no
+        // need for double-buffering).
         Mnist.fillImageBatch(
             images,
             idx,
-            bufs.input.asSlice(),
+            bufs.inputs[0].asSlice(),
         );
         Mnist.fillLabelBatch(
             labels_onehot,
             idx,
-            bufs.target.asSlice(),
+            bufs.targets[0].asSlice(),
         );
 
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
-        net.forward(device, enc, bufs.input, current);
-        encodeLoss(device, net, bufs, current, enc);
+        net.forward(device, enc, bufs.inputs[0], current);
+        encodeLoss(
+            device,
+            net,
+            bufs,
+            bufs.targets[0],
+            current,
+            enc,
+        );
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndWait(cmd);
 

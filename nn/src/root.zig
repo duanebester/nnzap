@@ -1,4 +1,4 @@
-//! nnzap — GPU-accelerated neural network library for Apple Silicon
+//! nn — GPU-accelerated neural network library for Apple Silicon
 //!
 //! Uses Metal compute shaders + Zig comptime for zero-copy, zero-overhead
 //! neural network training and inference on Apple Silicon unified memory.

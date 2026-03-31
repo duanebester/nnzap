@@ -1,7 +1,7 @@
 .{
-    .name = .nnzap,
+    .name = .nn,
     .version = "0.0.0",
-    .fingerprint = 0x4e5c785dd35b82bc,
+    .fingerprint = 0x10ad1889b318114e,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .zig_objc = .{
@@ -13,6 +13,5 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        
     },
 }

@@ -92,32 +92,46 @@ The `[]f32` slice Zig writes to **IS** the Metal buffer. No copies. No marshalin
 
 ```
 nnzap/
-  build.zig            -- Build script (links zig-objc, Metal, Foundation, CoreGraphics)
-  build.zig.zon        -- Package manifest (zig_objc dependency)
-  .gitignore           -- Excludes build artifacts, snapshots, benchmarks
-  src/
-    root.zig           -- Library entry point, re-exports metal + layout + network
-    metal.zig          -- Metal compute backend (Device, Buffer, MultiBuffered, pipelines)
-    layout.zig         -- Comptime network layout (sizes, offsets, shapes, slice helpers)
-    network.zig        -- Network struct with forward/backward pass (comptime-parameterised)
-    main.zig           -- MNIST training loop, evaluation, benchmark recording
-    benchmark.zig      -- Benchmark result struct, JSON serialisation, epoch/test recording
-    mnist.zig          -- MNIST IDX data loader, normalisation, one-hot encoding
-    shaders/
-      compute.metal    -- All GPU compute kernels (MSL)
-  scripts/
-    autoresearch.zig   -- Hyperparameter research CLI (config editing, experiment runner)
-    program.md         -- AI agent instructions for hyperparameter experiments
-    engine_research.zig -- Engine research CLI (snapshot/rollback, compile/test/bench)
-    engine_program.md  -- AI agent instructions for engine optimisation experiments
+  nn/                              -- Neural network library package
+    build.zig                      -- Library build (links zig-objc, Metal, Foundation, CoreGraphics)
+    build.zig.zon                  -- Package manifest (zig_objc dependency)
+    src/
+      root.zig                     -- Library entry point, re-exports metal + layout + network
+      metal.zig                    -- Metal compute backend (Device, Buffer, MultiBuffered, pipelines)
+      layout.zig                   -- Comptime network layout (sizes, offsets, shapes, slice helpers)
+      network.zig                  -- Network struct with forward/backward pass (comptime-parameterised)
+      benchmark.zig                -- Benchmark result struct, JSON serialisation, epoch/test recording
+      mnist.zig                    -- MNIST IDX data loader, normalisation, one-hot encoding
+      shaders/
+        compute.metal              -- All GPU compute kernels (MSL)
+    examples/
+      mnist.zig                    -- MNIST training loop, evaluation, benchmark recording
+  zap/                             -- Autonomous experiment runner package
+    build.zig                      -- CLI tools build
+    build.zig.zon                  -- Package manifest
+    src/
+      autoresearch.zig             -- Hyperparameter research CLI (config editing, experiment runner)
+      agent.zig                    -- LLM-powered hyperparameter experiment agent
+      engine_research.zig          -- Engine research CLI (snapshot/rollback, compile/test/bench)
+      engine_agent.zig             -- LLM-powered engine optimisation agent
+    programs/
+      program.md                   -- AI agent instructions for hyperparameter experiments
+      agent_program.md             -- Engine agent architecture documentation
+      engine_program.md            -- AI agent instructions for engine optimisation experiments
+    reference/
+      mlx_reference.py             -- MLX baseline for comparison
+      pytorch_reference.py         -- PyTorch baseline for comparison
+  data/                            -- MNIST dataset (downloaded at runtime)
   docs/
-    ARCHITECTURE.md    -- This file
-    STRATEGY.md        -- Where nnzap wins (Moreau pattern, target domains)
+    ARCHITECTURE.md                -- This file
+    STRATEGY.md                    -- Where nnzap wins (Moreau pattern, target domains)
+  CLAUDE.md                        -- Engineering principles
+  README.md                        -- Project overview
 ```
 
 ## What's implemented
 
-### 1. Metal shared buffers (`metal.zig`)
+### 1. Metal shared buffers (`nn/src/metal.zig`)
 
 The foundation: `MTLBuffer` objects allocated with `.storage_shared` — unified memory that both CPU and GPU can access without copying.
 
@@ -162,7 +176,7 @@ pub const Buffer = struct {
 
 Key insight: `asSlice()` returns a `[]f32` backed by GPU-visible memory. When you write `slice[i] = 42.0`, the GPU can see that value immediately — no upload step needed. `init` returns `!Buffer` because the Metal allocation can fail (null pointer check). This is the `zig-objc` `msgSend` pattern from [mitchellh/zig-objc](https://github.com/mitchellh/zig-objc).
 
-### 2. Multi-buffering (`metal.zig`)
+### 2. Multi-buffering (`nn/src/metal.zig`)
 
 Overlap CPU data loading with GPU compute by ping-ponging between N sets of buffers. Generic over any type `T` and configurable buffer count `N` (2 for double, 3 for triple):
 
@@ -250,7 +264,7 @@ The overlap pattern for a training loop:
   │ Step N:   GPU reads buf[0]    │  CPU fills buf[2]  │ buf[1] ready │
 ```
 
-### 3. Metal compute shaders (`compute.metal`)
+### 3. Metal compute shaders (`nn/src/shaders/compute.metal`)
 
 All GPU kernels live in a single Metal Shading Language file:
 
@@ -295,7 +309,7 @@ kernel void matmul(
 
 Each GPU thread computes one element of the output matrix. Metal dispatches thousands of these threads across the GPU cores automatically. Dimension arguments use `constant uint&` — Metal's read-only optimized memory for small values passed from the CPU.
 
-### 4. ComputePipeline and Device struct (`metal.zig`)
+### 4. ComputePipeline and Device struct (`nn/src/metal.zig`)
 
 Each kernel is wrapped in a `ComputePipeline` struct that holds the compiled `MTLComputePipelineState`:
 
@@ -364,7 +378,7 @@ The shader MSL source is embedded into the binary via `@embedFile("shaders/compu
 
 Both use Metal's non-uniform threadgroup API (`dispatchThreads:threadsPerThreadgroup:`) so we don't need to manually pad grid dimensions to tile boundaries.
 
-### 5. Comptime layout (`layout.zig`)
+### 5. Comptime layout (`nn/src/layout.zig`)
 
 Network architecture is defined as a comptime array of `LayerDesc` structs. Each layer specifies its input size, output size, and activation function. All memory layout math happens at compile time — zero runtime cost:
 
@@ -425,7 +439,7 @@ pub fn getBiasSlice(params: []f32, comptime layer: usize) []f32 {
 
 Because the offsets are comptime-known, these compile down to simple pointer arithmetic — no hash maps, no string lookups, no dynamic dispatch. The comptime assert on `layer` catches out-of-bounds layer indices at compile time, and the runtime assert on `params.len` guards against undersized buffers.
 
-### 6. Helper functions (`metal.zig`)
+### 6. Helper functions (`nn/src/metal.zig`)
 
 Clean wrappers around Metal's verbose `setBuffer:offset:atIndex:` and `setBytes:length:atIndex:` calls:
 
@@ -451,7 +465,7 @@ pub fn setBytes(encoder: objc.Object, comptime T: type, value: *const T, index: 
 
 `setBytes` takes a `comptime T` and a `*const T` pointer — type-safe and explicit about the size being sent to the GPU. These turn a 5-line `msgSend` into a 1-liner, keeping the dispatch code readable.
 
-### 7. Network forward pass (`network.zig`)
+### 7. Network forward pass (`nn/src/network.zig`)
 
 The `Network` struct wires all the individual kernels into a complete forward pass. It's parameterised by a comptime `NetworkLayout` and a comptime `max_batch_size`, so all buffer sizes are resolved at compile time:
 
@@ -490,7 +504,7 @@ The matrix layout convention is `[batch × features]` row-major: each row is one
 
 Three private helper functions (`encodeMatmul`, `encodeBiasAdd`, `encodeActivation`) take only primitive/comptime arguments — no `self` — following Rule 20 (hot loop extraction). The activation pipeline is selected at comptime via a switch on `Layout.layers[i].act`.
 
-### 8. Network backward pass (`network.zig`)
+### 8. Network backward pass (`nn/src/network.zig`)
 
 The backward pass mirrors the forward pass in reverse, computing
 gradients for every weight and bias in the network via
@@ -558,7 +572,7 @@ computed gradients or apply parameter updates.
 between each dispatch to ensure gradient writes are visible to
 subsequent reads within the same command encoder.
 
-### 9. Adam optimiser (`network.zig` + `compute.metal`)
+### 9. Adam optimiser (`nn/src/network.zig` + `nn/src/shaders/compute.metal`)
 
 The Adam optimiser (Kingma & Ba, 2014) maintains per-parameter
 first and second moment estimates for adaptive learning rates.
@@ -566,7 +580,7 @@ The implementation follows the same pattern as SGD: a Metal
 compute kernel handles the math, and the `Network` struct
 provides a high-level method.
 
-**Metal kernel** (`compute.metal`):
+**Metal kernel** (`nn/src/shaders/compute.metal`):
 
 ```metal
 kernel void adam_update(
@@ -610,10 +624,10 @@ net.updateAdam(device, enc, 0.001, 0.9, 0.999, 1e-8);
 
 ## Verified working
 
-Actual output from `zig build run`:
+Actual output from `cd nn && zig build run`:
 
 ```
-$ zig build run
+$ cd nn && zig build run
 
 nnzap -- GPU neural network engine for Apple Silicon
 
@@ -673,7 +687,7 @@ Backward pass VERIFIED!
 - **Apple Foundation framework** — Required by Metal for `NSString`, `NSError`, etc. Linked with `linkFramework("Foundation")`.
 - **Apple CoreGraphics framework** — Linked with `linkFramework("CoreGraphics")`.
 
-## Agent (`scripts/agent.zig`)
+## Agent (`zap/src/agent.zig`)
 
 The agent is a Zig binary that talks to Claude via the Anthropic Messages API.
 Claude decides which experiments to run; the agent executes them using the
@@ -700,7 +714,7 @@ autoresearch toolbox, sends results back, and loops until Claude stops or
            │ spawns
            ▼
 ┌──────────────────────┐
-│  nnzap (main.zig)     │  The training binary.
+│  nn (mnist.zig)       │  The training binary.
 └──────────────────────┘
 ```
 
@@ -802,9 +816,9 @@ MAX_HISTORY_INJECT   = 30_000    // History bytes injected into prompt
 - [x] **10a. MSE loss kernels** — mse_forward and mse_backward GPU shaders, wired into Network
 - [x] **12. Softmax + cross-entropy** — Numerically stable softmax, CE loss, fused softmax+CE backward kernel
 - [x] **13. Adam optimiser** — `adam_update` GPU kernel, bias-corrected moments, `updateAdam` method
-- [x] **14. Autoresearch toolbox** — Zig CLI (`scripts/autoresearch.zig`) for autonomous hyperparameter optimization
-- [x] **15. Engine research toolbox** — Zig CLI (`scripts/engine_research.zig`) for autonomous engine optimisation (Metal dispatch, kernels, buffers)
-- [x] **16. Agent** — LLM-powered experiment runner (`scripts/agent.zig`) that calls Claude via the Anthropic API, executes autoresearch tools, persists results to JSONL history, and accumulates context across runs
+- [x] **14. Autoresearch toolbox** — Zig CLI (`zap/src/autoresearch.zig`) for autonomous hyperparameter optimization
+- [x] **15. Engine research toolbox** — Zig CLI (`zap/src/engine_research.zig`) for autonomous engine optimisation (Metal dispatch, kernels, buffers)
+- [x] **16. Agent** — LLM-powered experiment runner (`zap/src/agent.zig`) that calls Claude via the Anthropic API, executes autoresearch tools, persists results to JSONL history, and accumulates context across runs
 
 ### Next
 

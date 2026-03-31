@@ -17,15 +17,15 @@ architecture. You edit source files directly.
 
 Before you touch anything, understand the system:
 
-| File | Role |
-| ---- | ---- |
-| `src/metal.zig` | Metal device, buffer allocation, compute pipeline creation, dispatch functions (1D/2D), command buffer management |
-| `src/network.zig` | Network forward/backward pass, loss functions, optimizer updates. Each forward/backward encodes all layer operations into a single compute encoder |
-| `src/shaders/compute.metal` | GPU kernels: matmul (naive 1-thread-per-element), activations, bias ops, SGD/Adam updates, softmax+CE |
-| `src/layout.zig` | Comptime network layout — all buffer sizes, weight/bias offsets, and activation sizes resolved at compile time |
-| `src/main.zig` | MNIST training loop, batch iteration, evaluation |
-| `src/mnist.zig` | MNIST data loading and parsing |
-| `src/benchmark.zig` | Benchmark result serialisation |
+| File                              | Role                                                                                                                                               |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `../nn/src/metal.zig`             | Metal device, buffer allocation, compute pipeline creation, dispatch functions (1D/2D), command buffer management                                  |
+| `../nn/src/network.zig`           | Network forward/backward pass, loss functions, optimizer updates. Each forward/backward encodes all layer operations into a single compute encoder |
+| `../nn/src/shaders/compute.metal` | GPU kernels: matmul (naive 1-thread-per-element), activations, bias ops, SGD/Adam updates, softmax+CE                                              |
+| `../nn/src/layout.zig`            | Comptime network layout — all buffer sizes, weight/bias offsets, and activation sizes resolved at compile time                                     |
+| `../nn/examples/mnist.zig`        | MNIST training loop, batch iteration, evaluation                                                                                                   |
+| `../nn/src/mnist.zig`             | MNIST data loading and parsing                                                                                                                     |
+| `../nn/src/benchmark.zig`         | Benchmark result serialisation                                                                                                                     |
 
 ### Current performance characteristics
 
@@ -64,20 +64,21 @@ to stderr (human-readable). Exit code 0 means success.
 
 ### Available commands
 
-| Command | Description |
-| ------- | ----------- |
-| `help` | List all commands and their arguments |
-| `snapshot` | Save current engine source files (safety net before edits) |
-| `snapshot-list` | List all saved snapshots with timestamps |
-| `rollback <id>` | Restore engine source files from a specific snapshot |
-| `rollback-latest` | Restore from the most recent snapshot |
-| `diff <id>` | Show source file changes since the given snapshot |
-| `check` | Compile only — fast validation that your edits parse and type-check |
-| `test` | Run the full test suite |
-| `bench` | Full training benchmark — outputs JSON with throughput and accuracy |
-| `bench-compare` | Compare all benchmark results side by side |
-| `show <file>` | View the contents of a source file |
-| `show-function <file> <fn>` | View a specific function within a source file |
+| Command                     | Description                                                           |
+| --------------------------- | --------------------------------------------------------------------- |
+| `help`                      | List all commands and their arguments                                 |
+| `snapshot`                  | Save current engine source files (safety net before edits)            |
+| `snapshot-list`             | List all saved snapshots with timestamps                              |
+| `rollback <id>`             | Restore engine source files from a specific snapshot                  |
+| `rollback-latest`           | Restore from the most recent snapshot                                 |
+| `diff <id>`                 | Show source file changes since the given snapshot                     |
+| `check`                     | Compile only — fast validation that your edits parse and type-check   |
+| `test`                      | Run the full test suite                                               |
+| `bench`                     | Full training benchmark — outputs JSON with throughput and accuracy   |
+| `bench-compare`             | Compare all benchmark results side by side                            |
+| `record_result`             | Record what you changed, keep/rollback decision, and what to try next |
+| `show <file>`               | View the contents of a source file                                    |
+| `show-function <file> <fn>` | View a specific function within a source file                         |
 
 ### Command details
 
@@ -121,9 +122,9 @@ with throughput, accuracy, and timing breakdown.
 **`show-function`** — Read a specific function before modifying it:
 
 ```bash
-./zig-out/bin/engine-research show-function src/metal.zig dispatch2D
-./zig-out/bin/engine-research show-function src/shaders/compute.metal matmul_forward
-./zig-out/bin/engine-research show-function src/network.zig forward
+./zig-out/bin/engine-research show-function ../nn/src/metal.zig dispatch2D
+./zig-out/bin/engine-research show-function ../nn/src/shaders/compute.metal matmul_forward
+./zig-out/bin/engine-research show-function ../nn/src/network.zig forward
 ```
 
 Always read the full function before you change it. Understand the
@@ -153,21 +154,23 @@ largest impact.
 To set up a new engine research session:
 
 1. **Build the toolbox**:
+
    ```bash
    zig build
    ```
 
 2. **Read the codebase** — understand before you optimise:
-   - `README.md` — project overview
-   - `CLAUDE.md` — engineering principles (you MUST follow these)
-   - `src/metal.zig` — Metal device and dispatch infrastructure
-   - `src/network.zig` — forward/backward pass encoding
-   - `src/shaders/compute.metal` — every GPU kernel
-   - `src/layout.zig` — comptime buffer layout
-   - `src/main.zig` — training loop and batch iteration
+   - `../README.md` — project overview
+   - `../CLAUDE.md` — engineering principles (you MUST follow these)
+   - `../nn/src/metal.zig` — Metal device and dispatch infrastructure
+   - `../nn/src/network.zig` — forward/backward pass encoding
+   - `../nn/src/shaders/compute.metal` — every GPU kernel
+   - `../nn/src/layout.zig` — comptime buffer layout
+   - `../nn/examples/mnist.zig` — training loop and batch iteration
 
 3. **Verify MNIST data exists**: check `data/mnist/` has the four IDX
    files. If missing, download them:
+
    ```bash
    mkdir -p data/mnist && cd data/mnist
    curl -O http://yann.lecun.com/exdb/mnist/train-images-idx3-ubyte.gz
@@ -178,11 +181,13 @@ To set up a new engine research session:
    ```
 
 4. **Create the baseline snapshot**:
+
    ```bash
    ./zig-out/bin/engine-research snapshot
    ```
 
 5. **Run the baseline benchmark**:
+
    ```bash
    ./zig-out/bin/engine-research bench
    ```
@@ -201,13 +206,13 @@ safety (snapshot/rollback), validation (check/test), and measurement
 
 The files you will typically edit:
 
-- **`src/shaders/compute.metal`** — GPU kernels (MSL). This is where
+- **`../nn/src/shaders/compute.metal`** — GPU kernels (MSL). This is where
   matmul tiling, kernel fusion, and SIMD group optimisations live.
-- **`src/metal.zig`** — Dispatch functions, threadgroup size selection,
+- **`../nn/src/metal.zig`** — Dispatch functions, threadgroup size selection,
   command buffer management, pipeline creation.
-- **`src/network.zig`** — Forward/backward pass encoding, how operations
+- **`../nn/src/network.zig`** — Forward/backward pass encoding, how operations
   are dispatched, where memory barriers go.
-- **`src/main.zig`** — Training loop structure, double-buffering,
+- **`../nn/examples/mnist.zig`** — Training loop structure, double-buffering,
   async command buffer submission.
 
 ### Editing rules
@@ -245,15 +250,18 @@ LOOP:
   6. bench                            # Full benchmark
   7. Parse JSON: throughput_images_per_sec, final_test_accuracy_pct
   8. If improved:
-       Record the result. This is the new baseline.
+       This is the new baseline.
      If regressed or broken:
        rollback-latest                # Revert and try something else
-  9. Pick next optimisation. GOTO 1.
+  9. record_result                    # MANDATORY — annotate the history
+  10. Stop. The agent starts a fresh conversation for the next experiment.
 ```
 
-Keep a mental log of what you have tried, the throughput delta for each
-experiment, and why you think each change helped or hurt. Use this log
-to guide your next experiment — do not repeat failed approaches.
+You MUST call `record_result` before stopping. It enriches the benchmark
+history with what you changed, whether you kept or rolled back, the
+throughput delta, which files were modified, and what to try next. This
+is how future experiments learn from yours — without it, the next
+conversation sees only raw numbers with no context.
 
 ## Constraints
 
@@ -279,12 +287,12 @@ invalid and must be rolled back:
 
 After each `bench` call, the JSON result contains:
 
-| Field | Goal |
-| ----- | ---- |
-| `throughput_images_per_sec` | **Primary — higher is better** |
-| `total_training_ms` | Secondary — lower is better |
-| `final_test_accuracy_pct` | Guard rail — must stay ≥ 97.0% |
-| `final_validation_accuracy_pct` | Overfitting signal |
+| Field                           | Goal                           |
+| ------------------------------- | ------------------------------ |
+| `throughput_images_per_sec`     | **Primary — higher is better** |
+| `total_training_ms`             | Secondary — lower is better    |
+| `final_test_accuracy_pct`       | Guard rail — must stay ≥ 97.0% |
+| `final_validation_accuracy_pct` | Overfitting signal             |
 
 ### Decision rules
 
@@ -478,7 +486,7 @@ how to recover from each failure mode:
 
 ## GPU kernel editing guide
 
-When editing `src/shaders/compute.metal`, keep these Metal-specific
+When editing `../nn/src/shaders/compute.metal`, keep these Metal-specific
 rules in mind:
 
 - **`[[buffer(N)]]`** indices must match the `setBuffer` calls in

@@ -51,6 +51,10 @@ const HISTORY_DIR: []const u8 = ".agent_history";
 const HISTORY_PATH: []const u8 =
     ".agent_history/experiments.jsonl";
 
+// Filesystem paths (relative to zap/ working directory).
+const FS_HISTORY_DIR: []const u8 = "../" ++ HISTORY_DIR;
+const FS_HISTORY_PATH: []const u8 = "../" ++ HISTORY_PATH;
+
 // ============================================================
 // Types
 // ============================================================
@@ -924,11 +928,11 @@ fn wrapUserTextMessage(
 // ============================================================
 
 fn ensureHistoryDir() void {
-    std.fs.cwd().makeDir(HISTORY_DIR) catch |err| {
+    std.fs.cwd().makeDir(FS_HISTORY_DIR) catch |err| {
         if (err != error.PathAlreadyExists) {
             log(
                 "WARNING: mkdir {s}: {s}\n",
-                .{ HISTORY_DIR, @errorName(err) },
+                .{ FS_HISTORY_DIR, @errorName(err) },
             );
         }
     };
@@ -939,7 +943,7 @@ fn ensureHistoryDir() void {
 /// MAX_HISTORY_INJECT to avoid blowing up the context.
 fn loadHistoryContent(arena: Allocator) []const u8 {
     const file = std.fs.cwd().openFile(
-        HISTORY_PATH,
+        FS_HISTORY_PATH,
         .{},
     ) catch return "";
     defer file.close();
@@ -973,7 +977,7 @@ fn appendExperiment(
     ) catch return;
 
     const file = std.fs.cwd().createFile(
-        HISTORY_PATH,
+        FS_HISTORY_PATH,
         .{ .truncate = false },
     ) catch return;
     defer file.close();
@@ -1013,7 +1017,7 @@ fn saveRunLog(
     const path = std.fmt.allocPrint(
         arena,
         "{s}/run_{s}.json",
-        .{ HISTORY_DIR, ts },
+        .{ FS_HISTORY_DIR, ts },
     ) catch return;
 
     var buf: std.ArrayList(u8) = .empty;

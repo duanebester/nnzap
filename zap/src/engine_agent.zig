@@ -27,16 +27,15 @@
 //!     -> per-run conversation log
 
 const std = @import("std");
-const http = std.http;
-const Uri = std.Uri;
 const Allocator = std.mem.Allocator;
+const tools = @import("tools.zig");
 
 // ============================================================
 // Constants (Rule 4 — hard limits)
 // ============================================================
 
-const MAX_TURNS: u32 = 200;
-const MIN_TURNS: u32 = 10;
+const MAX_EXPERIMENTS: u32 = 50;
+const MAX_TURNS_PER_EXPERIMENT: u32 = 80;
 const MAX_MESSAGES: u32 = 512;
 const MAX_TOOL_CALLS: u32 = 16;
 const MAX_TOOL_OUTPUT: usize = 50_000;
@@ -44,7 +43,6 @@ const MAX_TOOL_ARGS: u32 = 16;
 const MAX_API_RESPONSE: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HISTORY_SIZE: usize = 2 * 1024 * 1024;
-const MAX_HISTORY_INJECT: usize = 30_000;
 const MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT: usize = 1 * 1024 * 1024;
 const COMMAND_TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
@@ -54,11 +52,15 @@ const MAX_RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY_MS: u64 = 2_000;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
 
+// Curl timeout for the full API round-trip. Claude
+// Opus on large contexts can think for minutes.
+const API_TIMEOUT_SECS_STR: []const u8 = "600";
+
 const API_URL: []const u8 =
     "https://api.anthropic.com/v1/messages";
 const API_VERSION: []const u8 = "2023-06-01";
 const DEFAULT_MODEL: []const u8 =
-    "claude-sonnet-4-20250514";
+    "claude-opus-4-6";
 const MAX_TOKENS_STR: []const u8 = "16384";
 
 const TOOL_PATH: []const u8 =
@@ -73,11 +75,11 @@ const HISTORY_PATH: []const u8 =
 // ============================================================
 
 const ALLOWED_WRITE_FILES = [_][]const u8{
-    "src/metal.zig",
-    "src/network.zig",
-    "src/shaders/compute.metal",
-    "src/layout.zig",
-    "src/main.zig",
+    "nn/src/metal.zig",
+    "nn/src/network.zig",
+    "nn/src/shaders/compute.metal",
+    "nn/src/layout.zig",
+    "nn/examples/mnist.zig",
 };
 
 // ============================================================
@@ -91,8 +93,10 @@ const CLAUDE_MD_PATH: []const u8 = "CLAUDE.md";
 // ============================================================
 
 const ALLOWED_READ_PREFIXES = [_][]const u8{
+    "nn/src/",
+    "nn/examples/",
     "src/",
-    "scripts/",
+    "programs/",
     "docs/",
     "data/",
     "benchmarks/",
@@ -103,6 +107,8 @@ const ALLOWED_READ_PREFIXES = [_][]const u8{
 const ALLOWED_READ_FILES = [_][]const u8{
     "README.md",
     "CLAUDE.md",
+    "nn/build.zig",
+    "nn/build.zig.zon",
     "build.zig",
     "build.zig.zon",
 };
@@ -166,15 +172,15 @@ const SYSTEM_PROMPT =
     \\
     \\## Files
     \\
-    \\- src/metal.zig -- Metal device, buffers, pipelines,
+    \\- nn/src/metal.zig -- Metal device, buffers, pipelines,
     \\  dispatch (1D/2D), command buffer management.
-    \\- src/network.zig -- Forward/backward pass encoding,
+    \\- nn/src/network.zig -- Forward/backward pass encoding,
     \\  loss functions, optimizer updates.
-    \\- src/shaders/compute.metal -- GPU kernels (MSL):
+    \\- nn/src/shaders/compute.metal -- GPU kernels (MSL):
     \\  matmul, activations, bias, SGD/Adam, softmax+CE.
-    \\- src/layout.zig -- Comptime network layout: buffer
+    \\- nn/src/layout.zig -- Comptime network layout: buffer
     \\  sizes, offsets, activation sizes.
-    \\- src/main.zig -- Training loop, batch iteration,
+    \\- nn/examples/mnist.zig -- Training loop, batch iteration,
     \\  evaluation, benchmark recording.
     \\
     \\## Tools
@@ -184,10 +190,15 @@ const SYSTEM_PROMPT =
     \\Engine research (safety + measurement):
     \\  snapshot, snapshot_list, rollback, rollback_latest,
     \\  diff, check, test, bench, bench_compare,
-    \\  show, show_function
+    \\  history, show, show_function, commit
     \\
     \\File I/O (locked to project directory):
     \\  read_file, write_file, edit_file, list_directory
+    \\
+    \\Environment:
+    \\  cwd -- returns the absolute working directory for
+    \\  run_command, list_directory, etc. Call this first
+    \\  if you are unsure where commands execute.
     \\
     \\Shell (locked to project directory, 120s timeout):
     \\  run_command -- execute any shell command, e.g.
@@ -204,9 +215,9 @@ const SYSTEM_PROMPT =
     \\
     \\## Protocol
     \\
-    \\For each experiment:
+    \\This conversation is ONE experiment. You will:
     \\1. snapshot -- safety net before any edits.
-    \\2. Read the target code with show_function,
+    \\2. Read the target code with show, show_function,
     \\   read_file, or run_command (e.g. grep).
     \\3. Edit the source with edit_file (targeted
     \\   find-and-replace) or write_file (full rewrite
@@ -217,8 +228,13 @@ const SYSTEM_PROMPT =
     \\   rollback_latest.
     \\6. bench -- full MNIST training benchmark.
     \\7. Evaluate: see decision rules below.
-    \\8. Keep (new baseline) or rollback_latest.
-    \\9. Pick next optimisation. Repeat from step 1.
+    \\8. Keep (commit with a descriptive message) or
+    \\   rollback_latest.
+    \\
+    \\After step 8, STOP. The outer loop will start a
+    \\new conversation for the next experiment. Do NOT
+    \\try to run multiple experiments in one conversation.
+    \\Focus on making ONE change well.
     \\
     \\## Decision rules
     \\
@@ -298,22 +314,16 @@ const SYSTEM_PROMPT =
     \\- bench crashes: rollback_latest.
     \\- bench regresses: record result, rollback_latest.
     \\
-    \\## NEVER STOP
+    \\## FOCUS
     \\
-    \\Do NOT ask the human if you should continue.
-    \\The human may be asleep. You are autonomous.
-    \\Run experiments continuously. When ideas from
-    \\the phase list are exhausted, combine successful
-    \\optimisations or try different parameters.
-    \\
-    \\Each experiment takes ~1-3 minutes. Target 20-60
-    \\experiments per hour. A sleeping human gets 8
-    \\hours of sleep -- that is 160-480 experiments.
-    \\Use them wisely. Phase 1 and 2 deliver the
-    \\largest gains -- spend most time there.
-    \\
-    \\The first user message includes benchmark history
-    \\from previous runs. Use it to avoid repeating work.
+    \\This conversation is one experiment. Make it count.
+    \\Read only what you need, make ONE targeted change,
+    \\validate it, and report the result. Do not try to
+    \\run multiple experiments — the outer loop handles
+    \\that. The first user message includes a compact
+    \\summary of past benchmarks. Use the history tool
+    \\for full experiment details. You can pick up
+    \\where previous experiments left off.
 ;
 
 // ============================================================
@@ -359,11 +369,17 @@ const TOOL_SCHEMAS =
     \\  {"name":"bench_compare",
     \\   "description":"Compare all benchmark results side by side.",
     \\   "input_schema":{"type":"object","properties":{},"required":[]}},
+    \\  {"name":"history",
+    \\   "description":"Return the last N full experiment benchmark records as a JSON array. Use this for detailed per-epoch data, config, etc. The initial summary only shows key metrics.",
+    \\   "input_schema":{"type":"object",
+    \\     "properties":{"count":{"type":"integer",
+    \\       "description":"Number of recent records to return (default 5, max 20)"}},
+    \\     "required":[]}},
     \\  {"name":"show",
     \\   "description":"View an engine source file as structured JSON with line numbers.",
     \\   "input_schema":{"type":"object",
     \\     "properties":{"file":{"type":"string",
-    \\       "description":"Source file path, e.g. src/metal.zig"}},
+    \\       "description":"Source file path, e.g. nn/src/metal.zig"}},
     \\     "required":["file"]}},
     \\  {"name":"show_function",
     \\   "description":"Extract a specific function from a source file with line numbers.",
@@ -378,14 +394,14 @@ const TOOL_SCHEMAS =
     \\   "description":"Read raw contents of a project file. Locked to project directory.",
     \\   "input_schema":{"type":"object",
     \\     "properties":{"path":{"type":"string",
-    \\       "description":"File path relative to project root, e.g. src/metal.zig"}},
+    \\       "description":"File path relative to project root, e.g. nn/src/metal.zig"}},
     \\     "required":["path"]}},
     \\  {"name":"write_file",
     \\   "description":"Replace entire contents of an engine source file. Use edit_file for small changes instead.",
     \\   "input_schema":{"type":"object",
     \\     "properties":{
     \\       "path":{"type":"string",
-    \\         "description":"Engine file path, e.g. src/metal.zig"},
+    \\         "description":"Engine file path, e.g. nn/src/metal.zig"},
     \\       "content":{"type":"string",
     \\         "description":"Complete new file contents"}},
     \\     "required":["path","content"]}},
@@ -394,7 +410,7 @@ const TOOL_SCHEMAS =
     \\   "input_schema":{"type":"object",
     \\     "properties":{
     \\       "path":{"type":"string",
-    \\         "description":"Engine file path, e.g. src/metal.zig"},
+    \\         "description":"Engine file path, e.g. nn/src/metal.zig"},
     \\       "old_content":{"type":"string",
     \\         "description":"Exact text to find (must match exactly)"},
     \\       "new_content":{"type":"string",
@@ -404,14 +420,23 @@ const TOOL_SCHEMAS =
     \\   "description":"List files and subdirectories in a project directory.",
     \\   "input_schema":{"type":"object",
     \\     "properties":{"path":{"type":"string",
-    \\       "description":"Directory path relative to project root, e.g. src/ or src/shaders"}},
+    \\       "description":"Directory path relative to project root, e.g. nn/src/ or nn/src/shaders"}},
     \\     "required":["path"]}},
+    \\  {"name":"cwd",
+    \\   "description":"Return the absolute path of the working directory used by run_command and list_directory. Useful for orienting yourself in the filesystem.",
+    \\   "input_schema":{"type":"object","properties":{},"required":[]}},
     \\  {"name":"run_command",
-    \\   "description":"Execute a shell command in the project root directory. 120s timeout. Use for grep, wc, head, tail, find, cat, etc. Do NOT run long-lived processes (servers, watchers).",
+    \\   "description":"Execute a shell command in the project root directory via /bin/sh. 120s timeout. Use for grep, wc, head, tail, find, cat, etc. Do NOT run long-lived processes (servers, watchers). IMPORTANT: A non-zero exit code does NOT mean the tool failed — e.g. grep returns exit code 1 when no matches are found, which is normal. The exit code will be appended to the output when non-zero.",
     \\   "input_schema":{"type":"object",
     \\     "properties":{"command":{"type":"string",
-    \\       "description":"Shell command to execute, e.g. grep -rn 'matmul' src/"}},
-    \\     "required":["command"]}}
+    \\       "description":"Shell command to execute. Use single quotes for patterns, e.g. grep -rn 'matmul' src/. For regex alternation in grep use -E flag with pipe: grep -rEn 'foo|bar' src/. Avoid backslash-escaped double quotes inside the command; prefer single quotes."}},
+    \\     "required":["command"]}},
+    \\  {"name":"commit",
+    \\   "description":"Git commit all current changes. Call after a successful KEEP decision to preserve the optimization. The message should summarize what was optimized and the throughput improvement.",
+    \\   "input_schema":{"type":"object",
+    \\     "properties":{"message":{"type":"string",
+    \\       "description":"Commit message summarizing the optimization"}},
+    \\     "required":["message"]}}
     \\]
 ;
 
@@ -446,7 +471,7 @@ fn mainInner() !void {
     const run_start = timestampMs();
 
     printHeader();
-    ensureHistoryDir();
+    ensureHistoryDir(arena);
 
     const api_key = loadApiKey() orelse {
         fatal(
@@ -458,8 +483,9 @@ fn mainInner() !void {
     const model = loadModel();
     log("Model: {s}\n", .{model});
     log(
-        "Limits: min={d} max={d} turns\n",
-        .{ MIN_TURNS, MAX_TURNS },
+        "Limits: max={d} experiments, " ++
+            "max={d} turns/experiment\n",
+        .{ MAX_EXPERIMENTS, MAX_TURNS_PER_EXPERIMENT },
     );
 
     if (!buildToolbox(arena)) {
@@ -467,114 +493,134 @@ fn mainInner() !void {
         unreachable;
     }
 
-    const history = loadHistoryContent(arena);
     const rules = loadEngineeringRules(arena);
-    const first_msg = buildInitialMessage(
-        arena,
-        history,
-        rules,
-    );
 
-    var messages: [MAX_MESSAGES][]const u8 = undefined;
-    var count: u32 = 0;
-    messages[0] = first_msg;
-    count = 1;
-
-    // Counters for the run summary.
-    var bench_count: u32 = 0;
-    var tool_call_count: u32 = 0;
-    var api_error_count: u32 = 0;
+    // Global counters for the run summary.
+    var total_experiments: u32 = 0;
+    var total_turns: u32 = 0;
+    var total_bench_count: u32 = 0;
+    var total_tool_calls: u32 = 0;
+    var total_api_errors: u32 = 0;
     var total_api_ms: i64 = 0;
     var total_tool_ms: i64 = 0;
 
-    var turn: u32 = 0;
-    while (turn < MAX_TURNS) : (turn += 1) {
-        log("\n--- Turn {d} ---\n", .{turn + 1});
-
-        // Log context size before API call.
-        const ctx_bytes = contextSizeBytes(
-            messages[0..count],
-        );
+    // ── Outer loop: one experiment per iteration ─────
+    var experiment: u32 = 0;
+    while (experiment < MAX_EXPERIMENTS) : (experiment += 1) {
         log(
-            "  Context: {d} messages, {d} KB\n",
-            .{ count, ctx_bytes / 1024 },
+            "\n" ++
+                "============================================" ++
+                "==\n" ++
+                "  Experiment {d}/{d}\n" ++
+                "============================================" ++
+                "==\n",
+            .{ experiment + 1, MAX_EXPERIMENTS },
         );
 
-        const api_start = timestampMs();
-        const resp = callApiWithRetry(
+        // Fresh history and context for each experiment.
+        const history = buildHistorySummary(arena);
+        const orientation = buildOrientation(arena);
+        const first_msg = buildInitialMessage(
             arena,
-            api_key,
-            model,
-            messages[0..count],
+            history,
+            rules,
+            orientation,
         );
-        const api_elapsed = timestampMs() - api_start;
-        total_api_ms += api_elapsed;
 
-        if (!resp.success) {
-            api_error_count += 1;
+        var messages: [MAX_MESSAGES][]const u8 = undefined;
+        var count: u32 = 0;
+        messages[0] = first_msg;
+        count = 1;
+
+        var bench_ran = false;
+        var experiment_complete = false;
+        var api_failed = false;
+
+        // ── Inner loop: turns within one experiment ──
+        var turn: u32 = 0;
+        while (turn < MAX_TURNS_PER_EXPERIMENT) : (turn += 1) {
             log(
-                "  API error (unrecoverable) " ++
-                    "after {s}: {s}\n",
+                "\n--- Experiment {d}, Turn {d} ---\n",
+                .{ experiment + 1, turn + 1 },
+            );
+
+            const ctx_bytes = contextSizeBytes(
+                messages[0..count],
+            );
+            log(
+                "  Context: {d} messages, {d} KB\n",
+                .{ count, ctx_bytes / 1024 },
+            );
+
+            const api_start = timestampMs();
+            const resp = callApiWithRetry(
+                arena,
+                api_key,
+                model,
+                messages[0..count],
+            );
+            const api_elapsed = timestampMs() -
+                api_start;
+            total_api_ms += api_elapsed;
+
+            if (!resp.success) {
+                total_api_errors += 1;
+                log(
+                    "  API error (unrecoverable) " ++
+                        "after {s}: {s}\n",
+                    .{
+                        nanosToMsStr(
+                            arena,
+                            api_elapsed * 1_000_000,
+                        ),
+                        resp.error_message,
+                    },
+                );
+                api_failed = true;
+                break;
+            }
+
+            log(
+                "  API response: {s} " ++
+                    "({d} tool calls, {d} KB)\n",
                 .{
                     nanosToMsStr(
                         arena,
                         api_elapsed * 1_000_000,
                     ),
-                    resp.error_message,
+                    resp.tool_calls.len,
+                    resp.content_json.len / 1024,
                 },
             );
-            break;
-        }
 
-        log(
-            "  API response: {s} " ++
-                "({d} tool calls, {d} KB)\n",
-            .{
-                nanosToMsStr(
-                    arena,
-                    api_elapsed * 1_000_000,
-                ),
-                resp.tool_calls.len,
-                resp.content_json.len / 1024,
-            },
-        );
+            if (resp.text.len > 0) {
+                logClaudeText(resp.text);
+            }
 
-        if (resp.text.len > 0) logClaudeText(resp.text);
+            messages[count] = buildAssistantMsg(
+                arena,
+                resp.content_json,
+            );
+            count += 1;
 
-        messages[count] = buildAssistantMsg(
-            arena,
-            resp.content_json,
-        );
-        count += 1;
-
-        // Check if Claude wants to stop.
-        const is_tool_use = eql(
-            resp.stop_reason,
-            "tool_use",
-        );
-        if (!is_tool_use or resp.tool_calls.len == 0) {
-            if (turn + 1 < MIN_TURNS) {
-                // Force Claude to keep going.
+            // Check if Claude wants to stop (end_turn).
+            const is_tool_use = eql(
+                resp.stop_reason,
+                "tool_use",
+            );
+            if (!is_tool_use or
+                resp.tool_calls.len == 0)
+            {
                 log(
-                    "  (turn {d}/{d} minimum " ++
-                        "-- nudging to continue)\n",
-                    .{ turn + 1, MIN_TURNS },
+                    "  Claude signalled end of " ++
+                        "experiment.\n",
+                    .{},
                 );
-                messages[count] = wrapUserTextMessage(
-                    arena,
-                    "You have not reached the " ++
-                        "minimum experiment count " ++
-                        "yet. Keep optimising. " ++
-                        "Try the next phase or " ++
-                        "a different approach.",
-                );
-                count += 1;
-            } else {
-                log("  Claude chose to stop.\n", .{});
+                experiment_complete = true;
                 break;
             }
-        } else {
-            // Execute tool calls and send results.
+
+            // Execute tool calls.
             const tools_start = timestampMs();
             const results = executeTools(
                 arena,
@@ -583,14 +629,15 @@ fn mainInner() !void {
             const tools_elapsed = timestampMs() -
                 tools_start;
             total_tool_ms += tools_elapsed;
-            tool_call_count += @intCast(
+            total_tool_calls += @intCast(
                 resp.tool_calls.len,
             );
 
-            // Count bench calls for the summary.
+            // Track bench calls.
             for (resp.tool_calls) |call| {
                 if (eql(call.name, "bench")) {
-                    bench_count += 1;
+                    total_bench_count += 1;
+                    bench_ran = true;
                 }
             }
 
@@ -621,44 +668,77 @@ fn mainInner() !void {
                 results,
             );
             count += 1;
+
+            if (count + 2 >= MAX_MESSAGES) {
+                log("  Message limit reached.\n", .{});
+                break;
+            }
         }
 
-        if (count + 2 >= MAX_MESSAGES) {
-            log("Message limit reached.\n", .{});
+        total_turns += turn + 1;
+
+        // Save this experiment's conversation log.
+        saveRunLog(arena, messages[0..count]);
+
+        if (experiment_complete or bench_ran) {
+            total_experiments += 1;
+        }
+
+        // If the API failed, stop the outer loop too.
+        if (api_failed) {
+            log(
+                "  Stopping: API failure.\n",
+                .{},
+            );
             break;
         }
+
+        log(
+            "  Experiment {d} done " ++
+                "({d} turns).\n",
+            .{ experiment + 1, turn + 1 },
+        );
     }
 
-    // ── Run summary ─────────────────────────────────────
+    // ── Run summary ─────────────────────────────────
     const run_elapsed = timestampMs() - run_start;
     log(
         "\n" ++
-            "==============================================\n" ++
+            "============================================" ++
+            "==\n" ++
             "  Run summary\n" ++
-            "==============================================\n" ++
-            "  Turns:       {d}\n" ++
+            "============================================" ++
+            "==\n" ++
+            "  Experiments: {d}\n" ++
+            "  Total turns: {d}\n" ++
             "  Tool calls:  {d}\n" ++
             "  Benchmarks:  {d}\n" ++
             "  API errors:  {d}\n" ++
             "  API time:    {s}\n" ++
             "  Tool time:   {s}\n" ++
             "  Total time:  {s}\n" ++
-            "  Context:     {d} messages, {d} KB\n" ++
-            "==============================================\n",
+            "============================================" ++
+            "==\n",
         .{
-            turn + 1,
-            tool_call_count,
-            bench_count,
-            api_error_count,
-            nanosToMsStr(arena, total_api_ms * 1_000_000),
-            nanosToMsStr(arena, total_tool_ms * 1_000_000),
-            nanosToMsStr(arena, run_elapsed * 1_000_000),
-            count,
-            contextSizeBytes(messages[0..count]) / 1024,
+            total_experiments,
+            total_turns,
+            total_tool_calls,
+            total_bench_count,
+            total_api_errors,
+            nanosToMsStr(
+                arena,
+                total_api_ms * 1_000_000,
+            ),
+            nanosToMsStr(
+                arena,
+                total_tool_ms * 1_000_000,
+            ),
+            nanosToMsStr(
+                arena,
+                run_elapsed * 1_000_000,
+            ),
         },
     );
-
-    saveRunLog(arena, messages[0..count]);
 }
 
 /// Sum the byte lengths of all messages in the array.
@@ -697,8 +777,16 @@ fn loadModel() []const u8 {
 /// Load CLAUDE.md engineering rules from disk.
 /// Returns the file contents or a fallback message.
 fn loadEngineeringRules(arena: Allocator) []const u8 {
+    const fs_path = resolveToFs(arena, CLAUDE_MD_PATH) orelse {
+        log(
+            "WARNING: cannot resolve {s}\n",
+            .{CLAUDE_MD_PATH},
+        );
+        return "(CLAUDE.md not found — " ++
+            "follow standard engineering practices)";
+    };
     const file = std.fs.cwd().openFile(
-        CLAUDE_MD_PATH,
+        fs_path,
         .{},
     ) catch |err| {
         log(
@@ -829,7 +917,16 @@ fn callApiWithRetry(
     );
 }
 
-/// Call the Anthropic Messages API using std.http.
+/// Call the Anthropic Messages API via curl.
+///
+/// Using curl instead of std.http because:
+///   1. Proper --connect-timeout and --max-time
+///      prevent indefinite hangs.
+///   2. curl handles TLS in a separate process —
+///      a connection reset cannot kill the agent
+///      with a signal.
+///   3. Battle-tested on macOS with no silent
+///      failure modes.
 fn callApi(
     arena: Allocator,
     api_key: []const u8,
@@ -848,94 +945,141 @@ fn callApi(
         false,
     );
 
-    // Save last request for debugging.
-    writeFile(
-        HISTORY_DIR ++ "/_request.json",
-        body,
-    ) catch {};
+    // Save request for debugging and as curl input.
+    const request_path = "../" ++ HISTORY_DIR ++
+        "/_request.json";
+    writeFile(request_path, body) catch {
+        return errResp(
+            "failed to write request file",
+            false,
+        );
+    };
     log(
         "  API request: {d} KB\n",
         .{body.len / 1024},
     );
 
-    const uri = Uri.parse(API_URL) catch {
-        return errResp(
-            "failed to parse API URL",
-            false,
-        );
-    };
-
-    var client = http.Client{ .allocator = arena };
-    defer client.deinit();
-
-    var req = client.request(.POST, uri, .{
-        .headers = .{
-            .accept_encoding = .{
-                .override = "identity",
-            },
-        },
-        .extra_headers = &.{
-            .{
-                .name = "Content-Type",
-                .value = "application/json",
-            },
-            .{
-                .name = "x-api-key",
-                .value = api_key,
-            },
-            .{
-                .name = "anthropic-version",
-                .value = API_VERSION,
-            },
-        },
-    }) catch {
-        return errResp(
-            "failed to open HTTP request",
-            true,
-        );
-    };
-    defer req.deinit();
-
-    req.transfer_encoding = .{
-        .content_length = body.len,
-    };
-    req.sendBodyComplete(body) catch {
-        return errResp(
-            "failed to send request body",
-            true,
-        );
-    };
-
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = req.receiveHead(
-        &redirect_buf,
-    ) catch {
-        return errResp(
-            "failed to receive response",
-            true,
-        );
-    };
-
-    const status = response.head.status;
-
-    // Read the body regardless of status — it may
-    // contain a useful error message from the API.
-    var transfer_buf: [64]u8 = undefined;
-    var reader = response.reader(&transfer_buf);
-    const response_data = reader.allocRemaining(
+    // Build curl arguments. The -w flag appends the
+    // HTTP status code on a final line so we can
+    // split body from status deterministically.
+    const data_arg = std.fmt.allocPrint(
         arena,
-        std.Io.Limit.limited(MAX_API_RESPONSE),
-    ) catch {
+        "@{s}",
+        .{request_path},
+    ) catch return errResp(
+        "failed to format curl arg",
+        false,
+    );
+    const key_header = std.fmt.allocPrint(
+        arena,
+        "x-api-key: {s}",
+        .{api_key},
+    ) catch return errResp(
+        "failed to format key header",
+        false,
+    );
+
+    log("  Waiting for API response...\n", .{});
+
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &.{
+            "curl",
+            "-s",
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            API_TIMEOUT_SECS_STR,
+            "-X",
+            "POST",
+            API_URL,
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            key_header,
+            "-H",
+            "anthropic-version: " ++ API_VERSION,
+            "-d",
+            data_arg,
+            "-w",
+            "\n%{http_code}",
+        },
+        .max_output_bytes = MAX_API_RESPONSE,
+    }) catch |err| {
+        const msg = std.fmt.allocPrint(
+            arena,
+            "curl spawn failed: {s}",
+            .{@errorName(err)},
+        ) catch "curl spawn failed";
+        return errResp(msg, true);
+    };
+
+    // Check curl process exit.
+    const curl_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+
+    if (!curl_ok) {
+        const detail = if (result.stderr.len > 0)
+            truncate(result.stderr, 500)
+        else
+            "unknown curl error";
+        const msg = std.fmt.allocPrint(
+            arena,
+            "curl failed: {s}",
+            .{detail},
+        ) catch "curl failed";
+        return errResp(msg, true);
+    }
+
+    const output = result.stdout;
+    if (output.len < 4) {
+        return errResp("empty curl output", true);
+    }
+
+    // Split response body from the HTTP status code.
+    // curl -w '\n%{http_code}' appends it after a
+    // newline at the very end.
+    const last_nl = std.mem.lastIndexOfScalar(
+        u8,
+        output,
+        '\n',
+    ) orelse {
         return errResp(
-            "failed to read response body",
+            "malformed curl output (no status line)",
             true,
         );
     };
 
-    if (status != .ok) {
+    const response_data = output[0..last_nl];
+    const status_str = std.mem.trim(
+        u8,
+        output[last_nl + 1 ..],
+        " \r\n",
+    );
+    const status_code = std.fmt.parseInt(
+        u16,
+        status_str,
+        10,
+    ) catch 0;
+
+    if (status_code == 0) {
+        return errResp(
+            "failed to parse HTTP status from curl",
+            true,
+        );
+    }
+
+    log(
+        "  API response body: {d} KB (HTTP {d})\n",
+        .{ response_data.len / 1024, status_code },
+    );
+
+    if (status_code != 200) {
         return handleNonOkStatus(
             arena,
-            status,
+            status_code,
             response_data,
         );
     }
@@ -944,22 +1088,15 @@ fn callApi(
         return errResp("empty API response", true);
     }
 
-    log(
-        "  API response body: {d} KB\n",
-        .{response_data.len / 1024},
-    );
-
     return parseApiResponse(arena, response_data);
 }
 
 /// Produce a descriptive error for non-200 API responses.
 fn handleNonOkStatus(
     arena: Allocator,
-    status: std.http.Status,
+    code: u16,
     body: []const u8,
 ) ApiResponse {
-    const code: u16 = @intFromEnum(status);
-
     // Extract the API error message if present.
     const api_msg = extractJsonString(
         body,
@@ -1277,6 +1414,12 @@ fn dispatchTool(
             &.{"bench-compare"},
         );
     }
+    if (eql(call.name, "history")) {
+        return executeHistory(
+            arena,
+            call.input_json,
+        );
+    }
     if (eql(call.name, "show")) {
         return executeShow(arena, call.input_json);
     }
@@ -1313,12 +1456,22 @@ fn dispatchTool(
         );
     }
 
+    // Environment tool.
+    if (eql(call.name, "cwd")) {
+        return executeCwd(arena);
+    }
+
     // Shell tool.
     if (eql(call.name, "run_command")) {
         return executeRunCommand(
             arena,
             call.input_json,
         );
+    }
+
+    // Git commit tool.
+    if (eql(call.name, "commit")) {
+        return executeCommit(arena, call.input_json);
     }
 
     return .{
@@ -1331,13 +1484,99 @@ fn dispatchTool(
 // Engine research tool dispatchers
 // ============================================================
 
+/// Return the last N full experiment records from
+/// the history JSONL. The agent calls this for
+/// detailed data beyond the compact startup summary.
+fn executeHistory(
+    arena: Allocator,
+    input: []const u8,
+) ToolOutput {
+    const count_str = extractJsonNumber(
+        input,
+        "\"count\":",
+    ) orelse "5";
+    const count = @min(
+        std.fmt.parseInt(u32, count_str, 10) catch 5,
+        20,
+    );
+    if (count == 0) {
+        return .{ .stdout = "[]", .success = true };
+    }
+
+    const fs_path = resolveToFs(arena, HISTORY_PATH) orelse
+        return .{
+            .stdout = "Error: cannot resolve history path.",
+            .success = false,
+        };
+
+    const file = std.fs.cwd().openFile(
+        fs_path,
+        .{},
+    ) catch return .{
+        .stdout = "No history file found.",
+        .success = true,
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(
+        arena,
+        MAX_HISTORY_SIZE,
+    ) catch return .{
+        .stdout = "Error reading history.",
+        .success = false,
+    };
+    if (content.len == 0) return .{
+        .stdout = "No experiments yet.",
+        .success = true,
+    };
+
+    // Split into lines and take the last N.
+    var lines: [512][]const u8 = undefined;
+    var line_count: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        if (line.len < 2) continue;
+        if (line_count < 512) {
+            lines[line_count] = line;
+            line_count += 1;
+        }
+    }
+    if (line_count == 0) return .{
+        .stdout = "No experiments yet.",
+        .success = true,
+    };
+
+    std.debug.assert(count > 0);
+    const start = if (line_count > count)
+        line_count - count
+    else
+        0;
+
+    var buf: std.ArrayList(u8) = .empty;
+    buf.append(arena, '[') catch {};
+    for (lines[start..line_count], 0..) |line, i| {
+        if (i > 0) {
+            buf.appendSlice(arena, ",\n") catch {};
+        }
+        buf.appendSlice(arena, line) catch {};
+    }
+    buf.append(arena, ']') catch {};
+
+    std.debug.assert(buf.items.len > 0);
+    return .{ .stdout = buf.items, .success = true };
+}
+
 /// Rollback to a specific snapshot by ID.
 fn executeRollback(
     arena: Allocator,
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const id = extractRequiredField(
+    const raw_id = extractRequiredField(
         input,
         "id",
     ) orelse {
@@ -1346,7 +1585,24 @@ fn executeRollback(
             .success = false,
         };
     };
-    std.debug.assert(id.len > 0);
+
+    const id = unescapeJsonString(
+        arena,
+        raw_id,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape id",
+            .success = false,
+        };
+    };
+
+    if (id.len == 0) {
+        return .{
+            .stdout = "Error: empty id",
+            .success = false,
+        };
+    }
+
     return callEngineResearch(
         arena,
         &.{ "rollback", id },
@@ -1359,7 +1615,7 @@ fn executeDiff(
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const id = extractRequiredField(
+    const raw_id = extractRequiredField(
         input,
         "id",
     ) orelse {
@@ -1368,7 +1624,24 @@ fn executeDiff(
             .success = false,
         };
     };
-    std.debug.assert(id.len > 0);
+
+    const id = unescapeJsonString(
+        arena,
+        raw_id,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape id",
+            .success = false,
+        };
+    };
+
+    if (id.len == 0) {
+        return .{
+            .stdout = "Error: empty id",
+            .success = false,
+        };
+    }
+
     return callEngineResearch(
         arena,
         &.{ "diff", id },
@@ -1381,7 +1654,7 @@ fn executeShow(
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const file = extractRequiredField(
+    const raw_file = extractRequiredField(
         input,
         "file",
     ) orelse {
@@ -1390,7 +1663,24 @@ fn executeShow(
             .success = false,
         };
     };
-    std.debug.assert(file.len > 0);
+
+    const file = unescapeJsonString(
+        arena,
+        raw_file,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape file",
+            .success = false,
+        };
+    };
+
+    if (file.len == 0) {
+        return .{
+            .stdout = "Error: empty file path",
+            .success = false,
+        };
+    }
+
     return callEngineResearch(
         arena,
         &.{ "show", file },
@@ -1403,7 +1693,7 @@ fn executeShowFunction(
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const file = extractRequiredField(
+    const raw_file = extractRequiredField(
         input,
         "file",
     ) orelse {
@@ -1412,7 +1702,7 @@ fn executeShowFunction(
             .success = false,
         };
     };
-    const func = extractRequiredField(
+    const raw_func = extractRequiredField(
         input,
         "function_name",
     ) orelse {
@@ -1421,7 +1711,39 @@ fn executeShowFunction(
             .success = false,
         };
     };
-    std.debug.assert(file.len > 0);
+
+    const file = unescapeJsonString(
+        arena,
+        raw_file,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape file",
+            .success = false,
+        };
+    };
+    const func = unescapeJsonString(
+        arena,
+        raw_func,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape function_name",
+            .success = false,
+        };
+    };
+
+    if (file.len == 0) {
+        return .{
+            .stdout = "Error: empty file path",
+            .success = false,
+        };
+    }
+    if (func.len == 0) {
+        return .{
+            .stdout = "Error: empty function_name",
+            .success = false,
+        };
+    }
+
     return callEngineResearch(
         arena,
         &.{ "show-function", file, func },
@@ -1486,7 +1808,7 @@ fn executeReadFile(
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const path = extractRequiredField(
+    const raw_path = extractRequiredField(
         input,
         "path",
     ) orelse {
@@ -1495,7 +1817,23 @@ fn executeReadFile(
             .success = false,
         };
     };
-    std.debug.assert(path.len > 0);
+
+    const path = unescapeJsonString(
+        arena,
+        raw_path,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape path",
+            .success = false,
+        };
+    };
+
+    if (path.len == 0) {
+        return .{
+            .stdout = "Error: empty path",
+            .success = false,
+        };
+    }
 
     if (!isAllowedReadPath(path)) {
         log(
@@ -1537,7 +1875,7 @@ fn executeWriteFile(
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const path = extractRequiredField(
+    const raw_path = extractRequiredField(
         input,
         "path",
     ) orelse {
@@ -1546,16 +1884,33 @@ fn executeWriteFile(
             .success = false,
         };
     };
-    std.debug.assert(path.len > 0);
+
+    const path = unescapeJsonString(
+        arena,
+        raw_path,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape path",
+            .success = false,
+        };
+    };
+
+    if (path.len == 0) {
+        return .{
+            .stdout = "Error: empty path",
+            .success = false,
+        };
+    }
 
     if (!isAllowedWritePath(path)) {
         const msg = std.fmt.allocPrint(
             arena,
             "Error: write not allowed to '{s}'. " ++
-                "Allowed: src/metal.zig, " ++
-                "src/network.zig, " ++
-                "src/shaders/compute.metal, " ++
-                "src/layout.zig, src/main.zig",
+                "Allowed: nn/src/metal.zig, " ++
+                "nn/src/network.zig, " ++
+                "nn/src/shaders/compute.metal, " ++
+                "nn/src/layout.zig, " ++
+                "nn/examples/mnist.zig",
             .{path},
         ) catch "Error: path not allowed";
         return .{ .stdout = msg, .success = false };
@@ -1580,7 +1935,7 @@ fn executeWriteFile(
         };
     };
 
-    writeFileContent(path, content) catch {
+    writeFileContent(arena, path, content) catch {
         return .{
             .stdout = "Error: failed to write file",
             .success = false,
@@ -1607,7 +1962,7 @@ fn executeEditFile(
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const path = extractRequiredField(
+    const raw_path = extractRequiredField(
         input,
         "path",
     ) orelse {
@@ -1616,7 +1971,23 @@ fn executeEditFile(
             .success = false,
         };
     };
-    std.debug.assert(path.len > 0);
+
+    const path = unescapeJsonString(
+        arena,
+        raw_path,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape path",
+            .success = false,
+        };
+    };
+
+    if (path.len == 0) {
+        return .{
+            .stdout = "Error: empty path",
+            .success = false,
+        };
+    }
 
     if (!isAllowedWritePath(path)) {
         const msg = std.fmt.allocPrint(
@@ -1736,7 +2107,7 @@ fn executeEditFile(
         };
     };
 
-    writeFileContent(path, new_file) catch {
+    writeFileContent(arena, path, new_file) catch {
         return .{
             .stdout = "Error: failed to write file",
             .success = false,
@@ -1768,7 +2139,7 @@ fn executeListDirectory(
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const path = extractRequiredField(
+    const raw_path = extractRequiredField(
         input,
         "path",
     ) orelse {
@@ -1777,7 +2148,23 @@ fn executeListDirectory(
             .success = false,
         };
     };
-    std.debug.assert(path.len > 0);
+
+    const path = unescapeJsonString(
+        arena,
+        raw_path,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape path",
+            .success = false,
+        };
+    };
+
+    if (path.len == 0) {
+        return .{
+            .stdout = "Error: empty path",
+            .success = false,
+        };
+    }
 
     if (!isAllowedReadPath(path)) {
         const msg = std.fmt.allocPrint(
@@ -1788,18 +2175,40 @@ fn executeListDirectory(
         return .{ .stdout = msg, .success = false };
     }
 
-    // Use run_command internally for simplicity.
-    const cmd = std.fmt.allocPrint(
-        arena,
-        "ls -la {s}",
-        .{path},
-    ) catch {
+    const fs_path = resolveToFs(arena, path) orelse {
         return .{
-            .stdout = "Error: formatting command",
+            .stdout = "Error: failed to resolve path",
             .success = false,
         };
     };
-    return runShellCommand(arena, cmd);
+
+    // Invoke ls directly (no shell) to avoid injection.
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &.{ "/bin/ls", "-la", fs_path },
+        .max_output_bytes = MAX_COMMAND_OUTPUT,
+    }) catch |err| {
+        const msg = std.fmt.allocPrint(
+            arena,
+            "Error: failed to run ls: {s}",
+            .{@errorName(err)},
+        ) catch "Error: ls failed";
+        return .{ .stdout = msg, .success = false };
+    };
+
+    const ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+
+    const output = if (result.stdout.len > 0)
+        result.stdout
+    else if (result.stderr.len > 0)
+        result.stderr
+    else
+        "(no output)";
+
+    return .{ .stdout = output, .success = ok };
 }
 
 // ============================================================
@@ -1812,12 +2221,22 @@ fn executeRunCommand(
     input: []const u8,
 ) ToolOutput {
     std.debug.assert(input.len > 0);
-    const command = extractRequiredField(
+    const raw_command = extractRequiredField(
         input,
         "command",
     ) orelse {
         return .{
             .stdout = "Error: missing 'command' field",
+            .success = false,
+        };
+    };
+
+    const command = unescapeJsonString(
+        arena,
+        raw_command,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape command",
             .success = false,
         };
     };
@@ -1834,6 +2253,93 @@ fn executeRunCommand(
 }
 
 /// Actually run a shell command and capture output.
+/// Return the absolute working directory so the LLM
+/// can orient itself before issuing shell commands.
+fn executeCwd(arena: Allocator) ToolOutput {
+    const abs = tools.cwdAbsolute(arena) catch {
+        return .{
+            .stdout = "Error: cannot resolve cwd",
+            .success = false,
+        };
+    };
+    return .{ .stdout = abs, .success = true };
+}
+
+/// Git commit all current changes with a descriptive
+/// message. Called after a successful KEEP decision.
+fn executeCommit(
+    arena: Allocator,
+    input: []const u8,
+) ToolOutput {
+    std.debug.assert(input.len > 0);
+
+    const raw_msg = extractRequiredField(
+        input,
+        "message",
+    ) orelse {
+        return .{
+            .stdout = "Error: missing 'message' field",
+            .success = false,
+        };
+    };
+
+    const msg = unescapeJsonString(
+        arena,
+        raw_msg,
+    ) catch {
+        return .{
+            .stdout = "Error: failed to unescape message",
+            .success = false,
+        };
+    };
+
+    if (msg.len == 0) {
+        return .{
+            .stdout = "Error: empty commit message",
+            .success = false,
+        };
+    }
+
+    // Sanitise the message for shell safety: replace
+    // single quotes with escaped equivalents.
+    var safe_msg: std.ArrayList(u8) = .empty;
+    for (msg) |c| {
+        if (c == '\'') {
+            safe_msg.appendSlice(
+                arena,
+                "'\\''",
+            ) catch {
+                return .{
+                    .stdout = "Error: allocation failure",
+                    .success = false,
+                };
+            };
+        } else {
+            safe_msg.append(arena, c) catch {
+                return .{
+                    .stdout = "Error: allocation failure",
+                    .success = false,
+                };
+            };
+        }
+    }
+
+    std.debug.assert(safe_msg.items.len >= msg.len);
+
+    const cmd = std.fmt.allocPrint(
+        arena,
+        "git add -A && git commit -m '{s}'",
+        .{safe_msg.items},
+    ) catch {
+        return .{
+            .stdout = "Error: allocation failure",
+            .success = false,
+        };
+    };
+
+    return runShellCommand(arena, cmd);
+}
+
 fn runShellCommand(
     arena: Allocator,
     command: []const u8,
@@ -1853,9 +2359,13 @@ fn runShellCommand(
         return .{ .stdout = msg, .success = false };
     };
 
-    const ok = switch (result.term) {
-        .Exited => |code| code == 0,
-        else => false,
+    // Determine exit status. Normal exits (even non-zero) are not tool
+    // errors — grep returns 1 for "no matches", diff returns 1 for
+    // "files differ", etc.  Only signals/abnormal termination count as
+    // true tool errors.
+    const exit_code: ?u32 = switch (result.term) {
+        .Exited => |code| @as(?u32, code),
+        else => null,
     };
 
     // Combine stdout and stderr for full context.
@@ -1879,31 +2389,61 @@ fn runShellCommand(
         ) catch {};
     }
 
+    // Append exit code when non-zero so the LLM knows.
+    if (exit_code) |code| {
+        if (code != 0) {
+            log("    exit code: {d}\n", .{code});
+            const suffix = std.fmt.allocPrint(
+                arena,
+                "\n(exit code {d})",
+                .{code},
+            ) catch "";
+            buf.appendSlice(arena, suffix) catch {};
+        }
+    } else {
+        log("    terminated abnormally\n", .{});
+    }
+
     const output = if (buf.items.len > 0)
         buf.items
     else
         "(no output)";
 
-    // Log exit code on failure for debugging.
-    if (!ok) {
-        switch (result.term) {
-            .Exited => |code| log(
-                "    exit code: {d}\n",
-                .{code},
-            ),
-            else => log(
-                "    terminated abnormally\n",
-                .{},
-            ),
-        }
-    }
-
-    return .{ .stdout = output, .success = ok };
+    return .{ .stdout = output, .success = exit_code != null };
 }
 
 // ============================================================
 // Path validation
 // ============================================================
+
+/// Convert a monorepo-root-relative path to a filesystem
+/// path relative to the zap/ working directory by
+/// prepending "../".  Paths that already start with
+/// "src/", "programs/", or "build.zig" are local to zap
+/// and returned unchanged.
+fn resolveToFs(
+    arena: Allocator,
+    path: []const u8,
+) ?[]const u8 {
+    std.debug.assert(path.len > 0);
+
+    // Paths local to the zap/ directory need no prefix.
+    if (startsWith(path, "src/") or
+        startsWith(path, "programs/") or
+        eql(path, "build.zig") or
+        eql(path, "build.zig.zon"))
+    {
+        return path;
+    }
+
+    // Everything else lives in the monorepo root or a
+    // sibling directory — prepend "../" to reach it.
+    return std.fmt.allocPrint(
+        arena,
+        "../{s}",
+        .{path},
+    ) catch null;
+}
 
 /// Check if a path is safe for reading.
 /// Rejects path traversal and files outside the project.
@@ -1981,8 +2521,11 @@ fn readFileContent(
 ) ?[]const u8 {
     std.debug.assert(path.len > 0);
 
+    const fs_path = resolveToFs(arena, path) orelse
+        return null;
+
     const file = std.fs.cwd().openFile(
-        path,
+        fs_path,
         .{},
     ) catch return null;
     defer file.close();
@@ -1998,14 +2541,18 @@ fn readFileContent(
 
 /// Write contents to a file, creating or truncating it.
 fn writeFileContent(
+    arena: Allocator,
     path: []const u8,
     content: []const u8,
 ) !void {
     std.debug.assert(path.len > 0);
     std.debug.assert(content.len <= MAX_FILE_SIZE);
 
+    const fs_path = resolveToFs(arena, path) orelse
+        return error.PathResolutionFailed;
+
     const file = try std.fs.cwd().createFile(
-        path,
+        fs_path,
         .{},
     );
     defer file.close();
@@ -2079,11 +2626,55 @@ fn unescapeJsonString(
 // Message building
 // ============================================================
 
+/// Build a filesystem orientation section so the LLM
+/// knows where it is without burning tool calls.
+fn buildOrientation(arena: Allocator) []const u8 {
+    const cwd = tools.cwdAbsolute(arena) catch
+        return "(cwd unavailable)\n";
+
+    const root_ls = runQuietLs(arena, "..") orelse
+        "(cannot list)";
+    const nn_ls = runQuietLs(arena, "../nn") orelse
+        "(cannot list)";
+
+    return std.fmt.allocPrint(
+        arena,
+        "## Filesystem orientation\n\n" ++
+            "run_command cwd: {s}\n" ++
+            "Monorepo root is \"../\" from cwd.\n\n" ++
+            "Monorepo root contents:\n{s}\n" ++
+            "nn/ contents:\n{s}\n",
+        .{ cwd, root_ls, nn_ls },
+    ) catch "(orientation unavailable)\n";
+}
+
+/// Run `ls -1` on a directory and return stdout.
+fn runQuietLs(
+    arena: Allocator,
+    dir: []const u8,
+) ?[]const u8 {
+    std.debug.assert(dir.len > 0);
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &.{ "/bin/ls", "-1", dir },
+        .max_output_bytes = 4096,
+    }) catch return null;
+
+    const ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return null;
+    if (result.stdout.len == 0) return null;
+    return result.stdout;
+}
+
 /// Build the initial user message with history context.
 fn buildInitialMessage(
     arena: Allocator,
     history: []const u8,
     rules: []const u8,
+    orientation: []const u8,
 ) []const u8 {
     std.debug.assert(rules.len > 0);
     const has_history = history.len > 0;
@@ -2097,8 +2688,9 @@ fn buildInitialMessage(
         "rules apply to every line you write.\n\n";
 
     const history_section = if (has_history)
-        "## Benchmark history\n\n" ++
-            "Previous runs (JSONL — one per line):\n\n"
+        "## Benchmark history (compact)\n\n" ++
+            "Use the history tool for full " ++
+            "experiment details.\n\n"
     else
         "No previous benchmark history. " ++
             "This is the first run.\n\n";
@@ -2113,8 +2705,9 @@ fn buildInitialMessage(
     const text = if (has_history)
         std.fmt.allocPrint(
             arena,
-            "{s}{s}\n\n{s}{s}{s}",
+            "{s}\n{s}{s}\n\n{s}{s}{s}",
             .{
+                orientation,
                 rules_section,
                 rules,
                 history_section,
@@ -2125,8 +2718,9 @@ fn buildInitialMessage(
     else
         std.fmt.allocPrint(
             arena,
-            "{s}{s}\n\n{s}{s}",
+            "{s}\n{s}{s}\n\n{s}{s}",
             .{
+                orientation,
                 rules_section,
                 rules,
                 history_section,
@@ -2245,22 +2839,79 @@ fn wrapUserTextMessage(
 // Loaded on startup and injected into the first user message.
 // ============================================================
 
-fn ensureHistoryDir() void {
-    std.fs.cwd().makeDir(HISTORY_DIR) catch |err| {
+fn ensureHistoryDir(arena: Allocator) void {
+    const fs_path = resolveToFs(arena, HISTORY_DIR) orelse {
+        log("WARNING: cannot resolve history dir\n", .{});
+        return;
+    };
+    std.fs.cwd().makeDir(fs_path) catch |err| {
         if (err != error.PathAlreadyExists) {
             log(
                 "WARNING: mkdir {s}: {s}\n",
-                .{ HISTORY_DIR, @errorName(err) },
+                .{ fs_path, @errorName(err) },
             );
         }
     };
 }
 
-/// Load the raw history file content, truncated to
-/// MAX_HISTORY_INJECT to avoid blowing up the context.
-fn loadHistoryContent(arena: Allocator) []const u8 {
+/// Extract key metrics from one JSONL experiment line
+/// into a compact human-readable row.
+fn formatHistoryLine(
+    arena: Allocator,
+    index: u32,
+    line: []const u8,
+) ?[]const u8 {
+    std.debug.assert(line.len > 0);
+    std.debug.assert(index > 0);
+
+    const ts = extractJsonString(
+        line,
+        "\"timestamp_utc\":\"",
+    ) orelse extractJsonString(
+        line,
+        "\"timestamp_utc\": \"",
+    ) orelse "?";
+    const throughput = extractJsonNumber(
+        line,
+        "\"throughput_images_per_sec\":",
+    ) orelse "?";
+    const accuracy = extractJsonNumber(
+        line,
+        "\"final_test_accuracy_pct\":",
+    ) orelse "?";
+    const train_ms = extractJsonNumber(
+        line,
+        "\"total_training_ms\":",
+    ) orelse "?";
+
+    return std.fmt.allocPrint(
+        arena,
+        "  {d}. {s}  " ++
+            "throughput={s}  " ++
+            "acc={s}%  " ++
+            "time={s}ms\n",
+        .{
+            index,
+            ts,
+            throughput,
+            accuracy,
+            train_ms,
+        },
+    ) catch null;
+}
+
+/// Build a compact summary table from the experiment
+/// history JSONL. Only key metrics are included —
+/// the agent can call the history tool for full
+/// details of specific experiments.
+fn buildHistorySummary(arena: Allocator) []const u8 {
+    const max_visible: u32 = 10;
+
+    const fs_path = resolveToFs(arena, HISTORY_PATH) orelse
+        return "";
+
     const file = std.fs.cwd().openFile(
-        HISTORY_PATH,
+        fs_path,
         .{},
     ) catch return "";
     defer file.close();
@@ -2272,12 +2923,57 @@ fn loadHistoryContent(arena: Allocator) []const u8 {
 
     if (content.len == 0) return "";
 
+    // Split JSONL into individual lines.
+    var lines: [512][]const u8 = undefined;
+    var line_count: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        if (line.len < 2) continue;
+        if (line_count < 512) {
+            lines[line_count] = line;
+            line_count += 1;
+        }
+    }
+
+    if (line_count == 0) return "";
+
+    const start = if (line_count > max_visible)
+        line_count - max_visible
+    else
+        0;
+    const visible = line_count - start;
+
     log(
-        "Loaded {d} bytes of experiment history.\n",
-        .{content.len},
+        "History: {d} experiments " ++
+            "(showing last {d}).\n",
+        .{ line_count, visible },
     );
 
-    return truncate(content, MAX_HISTORY_INJECT);
+    var buf: std.ArrayList(u8) = .empty;
+    const header = std.fmt.allocPrint(
+        arena,
+        "{d} experiments total " ++
+            "(last {d} shown):\n\n",
+        .{ line_count, visible },
+    ) catch return "";
+    buf.appendSlice(arena, header) catch return "";
+
+    var idx: u32 = start;
+    while (idx < line_count) : (idx += 1) {
+        const row = formatHistoryLine(
+            arena,
+            idx + 1,
+            lines[idx],
+        ) orelse continue;
+        buf.appendSlice(arena, row) catch continue;
+    }
+
+    std.debug.assert(buf.items.len > 0);
+    return buf.items;
 }
 
 /// Append a bench result to the history JSONL file.
@@ -2292,8 +2988,11 @@ fn appendExperiment(
         benchmark_json,
     ) catch return;
 
+    const fs_path = resolveToFs(arena, HISTORY_PATH) orelse
+        return;
+
     const file = std.fs.cwd().createFile(
-        HISTORY_PATH,
+        fs_path,
         .{ .truncate = false },
     ) catch return;
     defer file.close();
@@ -2331,10 +3030,11 @@ fn saveRunLog(
     var ts_buf: [TIMESTAMP_LEN]u8 = undefined;
     const ts = formatTimestamp(&ts_buf, '-');
 
+    const fs_dir = "../" ++ HISTORY_DIR;
     const path = std.fmt.allocPrint(
         arena,
         "{s}/run_{s}.json",
-        .{ HISTORY_DIR, ts },
+        .{ fs_dir, ts },
     ) catch return;
 
     var buf: std.ArrayList(u8) = .empty;
@@ -2483,6 +3183,41 @@ fn findStringEnd(s: []const u8) ?[]const u8 {
         i += 1;
     }
     return null;
+}
+
+/// Extract a raw JSON numeric value after a field name.
+/// The needle should end with `":` or `": ` — everything
+/// up to the first character that is not part of a JSON
+/// number (digits, '.', '-', '+', 'e', 'E') is returned.
+fn extractJsonNumber(
+    json: []const u8,
+    needle: []const u8,
+) ?[]const u8 {
+    std.debug.assert(needle.len > 0);
+
+    const idx = indexOf(json, needle) orelse return null;
+    var pos = idx + needle.len;
+
+    // Skip optional whitespace after the colon.
+    while (pos < json.len and
+        (json[pos] == ' ' or json[pos] == '\t'))
+    {
+        pos += 1;
+    }
+    if (pos >= json.len) return null;
+
+    const start = pos;
+    while (pos < json.len) {
+        const c = json[pos];
+        const is_numeric = (c >= '0' and c <= '9') or
+            c == '.' or c == '-' or c == '+' or
+            c == 'e' or c == 'E';
+        if (!is_numeric) break;
+        pos += 1;
+    }
+
+    if (pos == start) return null;
+    return json[start..pos];
 }
 
 /// Extract a raw JSON array value for a given field.

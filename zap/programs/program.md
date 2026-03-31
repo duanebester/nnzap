@@ -26,18 +26,18 @@ to stderr (human-readable). Exit code 0 means success.
 
 ### Available tools
 
-| Tool                | Description                              |
-| ------------------- | ---------------------------------------- |
-| `help`              | List all tools and their arguments       |
-| `benchmark-list`    | List all benchmark JSON filenames        |
-| `benchmark-latest`  | Output the latest benchmark result       |
-| `benchmark-compare` | Compare all benchmark runs side by side  |
-| `config-show`       | Show current hyperparameters from main.zig |
-| `config-set K=V...` | Modify hyperparameters in main.zig       |
-| `config-backup`     | Backup src/main.zig before editing       |
-| `config-restore`    | Restore src/main.zig from backup         |
-| `train`             | Build + run MNIST training, output JSON  |
-| `clean`             | Delete old benchmark files               |
+| Tool                | Description                                             |
+| ------------------- | ------------------------------------------------------- |
+| `help`              | List all tools and their arguments                      |
+| `benchmark-list`    | List all benchmark JSON filenames                       |
+| `benchmark-latest`  | Output the latest benchmark result                      |
+| `benchmark-compare` | Compare all benchmark runs side by side                 |
+| `config-show`       | Show current hyperparameters from nn/examples/mnist.zig |
+| `config-set K=V...` | Modify hyperparameters in nn/examples/mnist.zig         |
+| `config-backup`     | Backup nn/examples/mnist.zig before editing             |
+| `config-restore`    | Restore nn/examples/mnist.zig from backup               |
+| `train`             | Build + run MNIST training, output JSON                 |
+| `clean`             | Delete old benchmark files                              |
 
 ### Tool details
 
@@ -52,9 +52,9 @@ Returns JSON like:
 ```json
 {
   "architecture": [
-    {"in": 784, "out": 128, "act": "relu"},
-    {"in": 128, "out": 64, "act": "relu"},
-    {"in": 64, "out": 10, "act": "none"}
+    { "in": 784, "out": 128, "act": "relu" },
+    { "in": 128, "out": 64, "act": "relu" },
+    { "in": 64, "out": 10, "act": "none" }
   ],
   "max_batch": 64,
   "learning_rate": 0.1,
@@ -81,6 +81,7 @@ Returns JSON like:
 ```
 
 Available keys:
+
 - `lr` — learning rate (float, e.g. `0.001`)
 - `batch` — batch size (int, power of 2, e.g. `64`)
 - `epochs` — number of training epochs (int, e.g. `10`)
@@ -121,13 +122,14 @@ optimizer, learning rate, batch size, and architecture for each.
 To set up a new experiment session:
 
 1. **Read the codebase** for context:
-   - `README.md` — project overview
-   - `CLAUDE.md` — engineering principles
-   - `src/main.zig` — the training loop (this is what gets modified)
-   - `src/shaders/compute.metal` — GPU kernels (read-only)
+   - `../README.md` — project overview
+   - `../CLAUDE.md` — engineering principles
+   - `../nn/examples/mnist.zig` — the training loop (this is what gets modified)
+   - `../nn/src/shaders/compute.metal` — GPU kernels (read-only)
 
 2. **Verify MNIST data exists**: check `data/mnist/` has the four IDX files.
    If missing, download them:
+
    ```bash
    mkdir -p data/mnist && cd data/mnist
    curl -O http://yann.lecun.com/exdb/mnist/train-images-idx3-ubyte.gz
@@ -167,15 +169,16 @@ incorrect results:
 
 After each `train` call, the JSON result contains:
 
-| Field                              | Goal           |
-| ---------------------------------- | -------------- |
-| `final_test_accuracy_pct`          | **Primary — higher is better** |
-| `throughput_images_per_sec`        | Secondary — higher is better |
-| `total_training_ms`               | Tertiary — lower is better |
-| `final_validation_accuracy_pct`   | Overfitting signal |
-| Per-epoch `validation_accuracy_pct`| Convergence trajectory |
+| Field                               | Goal                           |
+| ----------------------------------- | ------------------------------ |
+| `final_test_accuracy_pct`           | **Primary — higher is better** |
+| `throughput_images_per_sec`         | Secondary — higher is better   |
+| `total_training_ms`                 | Tertiary — lower is better     |
+| `final_validation_accuracy_pct`     | Overfitting signal             |
+| Per-epoch `validation_accuracy_pct` | Convergence trajectory         |
 
 **Decision rule:**
+
 - If test accuracy improves by ≥ 0.05%: **keep** the change.
 - If test accuracy is within ±0.05%: prefer higher throughput or
   simpler architecture.
@@ -205,6 +208,7 @@ Use this to guide your next experiment — do not repeat failed ideas.
 ### Phase 1: Quick wins
 
 1. **Try Adam optimizer** — often converges faster than SGD on small nets:
+
    ```bash
    ./zig-out/bin/autoresearch config-set optimizer=adam lr=0.001
    ```
@@ -217,6 +221,7 @@ Use this to guide your next experiment — do not repeat failed ideas.
 ### Phase 2: Architecture search
 
 4. **Wider hidden layers**: 784→256→64→10, 784→256→128→10
+
    ```bash
    ./zig-out/bin/autoresearch config-set arch=784:256:relu,256:64:relu,64:10:none
    ```

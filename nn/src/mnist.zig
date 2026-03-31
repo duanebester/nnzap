@@ -9,7 +9,7 @@
 //!   Labels —  8-byte header: magic(0x0801) count             + raw u8
 //!
 //! Usage:
-//!   var mnist = try Mnist.load(allocator, "data/mnist");
+//!   var mnist = try Mnist.load(allocator, "../data/mnist");
 //!   defer mnist.deinit(allocator);
 //!
 //!   const pixel = mnist.train_images[img_idx * 784 + px];  // f32 in [0,1]
@@ -310,10 +310,10 @@ test "load MNIST from disk" {
     const allocator = std.testing.allocator;
 
     // Skip gracefully if the data files haven't been downloaded.
-    var data = Mnist.load(allocator, "data/mnist") catch |err| {
+    var data = Mnist.load(allocator, "../data/mnist") catch |err| {
         if (err == error.FileNotFound) {
             std.debug.print(
-                "  (skipped — data/mnist not found, " ++
+                "  (skipped — ../data/mnist not found, " ++
                     "run: curl + gunzip first)\n",
                 .{},
             );

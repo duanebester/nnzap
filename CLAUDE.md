@@ -1,5 +1,7 @@
 # Engineering Notes
 
+We are using `claude-opus-4-6`!
+
 ### 0. **Simplicity and Elegance**
 
 Simplicity is not a free pass or a first attempt — it is the hardest revision. The goal is to find the "super idea" that solves safety, performance, and developer experience simultaneously. An hour or day of design is worth weeks or months in production. Spend mental energy upfront, proactively rather than reactively, because when the thinking is done, what is spent on the design will be dwarfed by implementation, testing, and maintenance.
@@ -269,7 +271,7 @@ Appreciate **all compiler warnings at the compiler's strictest setting** from da
 
 ### 25. **Tooling**
 
-Our primary tool is Zig. It may not be the best for everything, but it's good enough for most things. When you need a script, write `scripts/*.zig` instead of `scripts/*.sh` — this makes scripts cross-platform, type-safe, and increases the probability they'll work for everyone on the team. Standardizing on Zig for tooling reduces dimensionality as the team and range of personal tastes grows.
+Our primary tool is Zig. It may not be the best for everything, but it's good enough for most things. When you need a script, write it in `zap/src/*.zig` instead of as a shell script — this makes scripts cross-platform, type-safe, and increases the probability they'll work for everyone on the team. Standardizing on Zig for tooling reduces dimensionality as the team and range of personal tastes grows.
 
 > "The right tool for the job is often the tool you are already using — adding new tools has a higher cost than many people appreciate." — John Carmack
 

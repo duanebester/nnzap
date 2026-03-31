@@ -38,23 +38,21 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const tools = @import("tools.zig");
 
 // ============================================================
 // Constants (Rule 4 — hard limits)
 // ============================================================
 
 const ENGINE_FILES = [_][]const u8{
-    "src/metal.zig",
-    "src/network.zig",
-    "src/shaders/compute.metal",
-    "src/layout.zig",
-    "src/main.zig",
+    "nn/src/metal.zig",
+    "nn/src/network.zig",
+    "nn/src/shaders/compute.metal",
+    "nn/src/layout.zig",
+    "nn/examples/mnist.zig",
 };
 
 const SNAPSHOT_DIR = ".engine_snapshots";
-const BENCH_DIR = "benchmarks";
-const MAX_FILE_SIZE: u32 = 2 * 1024 * 1024; // 2 MB.
-const MAX_OUTPUT_BYTES: u32 = 4 * 1024 * 1024; // 4 MB.
 const MAX_SNAPSHOTS: u32 = 128;
 const MAX_DIFF_LINES: u32 = 200_000;
 const MAX_FUNCTION_NAME: u32 = 256;
@@ -65,64 +63,8 @@ const TIMESTAMP_LEN: u32 = 19; // "2025-01-15T14-30-00"
 comptime {
     std.debug.assert(ENGINE_FILES.len > 0);
     std.debug.assert(ENGINE_FILES.len <= 16);
-    std.debug.assert(MAX_FILE_SIZE > 0);
-    std.debug.assert(MAX_OUTPUT_BYTES >= MAX_FILE_SIZE);
     std.debug.assert(TIMESTAMP_LEN == 19);
 }
-
-// ============================================================
-// Benchmark JSON types — mirrors benchmark.zig output
-// (needed for bench-compare)
-// ============================================================
-
-const ArchLayer = struct {
-    input_size: u64 = 0,
-    output_size: u64 = 0,
-    activation: []const u8 = "",
-};
-
-const EpochEntry = struct {
-    epoch: u64 = 0,
-    train_loss: f64 = 0,
-    duration_ms: f64 = 0,
-    validation_loss: ?f64 = null,
-    validation_accuracy_pct: ?f64 = null,
-};
-
-const TestResultJson = struct {
-    correct: u64 = 0,
-    total: u64 = 0,
-    accuracy_pct: f64 = 0,
-    duration_ms: f64 = 0,
-};
-
-const BenchConfig = struct {
-    architecture: []const ArchLayer = &.{},
-    param_count: u64 = 0,
-    batch_size: u64 = 0,
-    learning_rate: f64 = 0,
-    learning_rate_decay: f64 = 0,
-    optimizer: []const u8 = "",
-    loss_function: []const u8 = "",
-    num_epochs: u64 = 0,
-    seed: u64 = 0,
-    train_samples: u64 = 0,
-    validation_samples: u64 = 0,
-    test_samples: u64 = 0,
-};
-
-const BenchResult = struct {
-    timestamp_utc: []const u8 = "",
-    config: BenchConfig = .{},
-    final_train_loss: f64 = 0,
-    final_validation_loss: ?f64 = null,
-    final_validation_accuracy_pct: ?f64 = null,
-    final_test_accuracy_pct: ?f64 = null,
-    epochs: []const EpochEntry = &.{},
-    test_result: ?TestResultJson = null,
-    total_training_ms: f64 = 0,
-    throughput_images_per_sec: f64 = 0,
-};
 
 // ============================================================
 // Internal result types
@@ -165,7 +107,7 @@ pub fn main() !void {
         &.{};
 
     dispatch(arena, cmd, rest) catch |err| {
-        try writeJsonError(err);
+        try tools.writeJsonError(err);
         std.process.exit(1);
     };
 }
@@ -178,26 +120,32 @@ fn dispatch(
     std.debug.assert(cmd.len > 0);
     std.debug.assert(cmd.len < MAX_PATH_LEN);
 
-    if (eql(cmd, "help")) return toolHelp();
-    if (eql(cmd, "snapshot")) return toolSnapshot(arena);
-    if (eql(cmd, "snapshot-list")) {
+    if (tools.eql(cmd, "help")) return toolHelp();
+    if (tools.eql(cmd, "snapshot")) {
+        return toolSnapshot(arena);
+    }
+    if (tools.eql(cmd, "snapshot-list")) {
         return toolSnapshotList(arena);
     }
-    if (eql(cmd, "rollback")) {
+    if (tools.eql(cmd, "rollback")) {
         return toolRollback(arena, args);
     }
-    if (eql(cmd, "rollback-latest")) {
+    if (tools.eql(cmd, "rollback-latest")) {
         return toolRollbackLatest(arena);
     }
-    if (eql(cmd, "diff")) return toolDiff(arena, args);
-    if (eql(cmd, "check")) return toolCheck(arena);
-    if (eql(cmd, "test")) return toolTest(arena);
-    if (eql(cmd, "bench")) return toolBench(arena);
-    if (eql(cmd, "bench-compare")) {
+    if (tools.eql(cmd, "diff")) {
+        return toolDiff(arena, args);
+    }
+    if (tools.eql(cmd, "check")) return toolCheck(arena);
+    if (tools.eql(cmd, "test")) return toolTest(arena);
+    if (tools.eql(cmd, "bench")) return toolBench(arena);
+    if (tools.eql(cmd, "bench-compare")) {
         return toolBenchCompare(arena);
     }
-    if (eql(cmd, "show")) return toolShow(arena, args);
-    if (eql(cmd, "show-function")) {
+    if (tools.eql(cmd, "show")) {
+        return toolShow(arena, args);
+    }
+    if (tools.eql(cmd, "show-function")) {
         return toolShowFunction(arena, args);
     }
 
@@ -210,7 +158,7 @@ fn dispatch(
 // ============================================================
 
 fn toolHelp() !void {
-    try writeStdout(
+    try tools.writeStdout(
         \\{
         \\  "tools": [
         \\    {
@@ -288,11 +236,18 @@ fn toolSnapshot(arena: Allocator) !void {
         "{s}/{s}",
         .{ SNAPSHOT_DIR, timestamp },
     );
+    const snap_dir_fs = try tools.resolveToFs(
+        arena,
+        snap_dir,
+    );
 
     // Create the snapshot root directory.
-    try std.fs.cwd().makePath(snap_dir);
+    try std.fs.cwd().makePath(snap_dir_fs);
 
-    const count = try snapshotCopyFiles(arena, snap_dir);
+    const count = try snapshotCopyFiles(
+        arena,
+        snap_dir_fs,
+    );
     std.debug.assert(count <= ENGINE_FILES.len);
 
     const json = try std.fmt.allocPrint(
@@ -302,16 +257,16 @@ fn toolSnapshot(arena: Allocator) !void {
             "\"files\": {d}}}\n",
         .{ timestamp, count },
     );
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 /// Copy each engine file into the snapshot directory,
 /// preserving the relative path structure.
 fn snapshotCopyFiles(
     arena: Allocator,
-    snap_dir: []const u8,
+    snap_dir_fs: []const u8,
 ) !u32 {
-    std.debug.assert(snap_dir.len > 0);
+    std.debug.assert(snap_dir_fs.len > 0);
     var count: u32 = 0;
 
     for (&ENGINE_FILES) |file| {
@@ -321,13 +276,14 @@ fn snapshotCopyFiles(
         const dest = try std.fmt.allocPrint(
             arena,
             "{s}/{s}",
-            .{ snap_dir, file },
+            .{ snap_dir_fs, file },
         );
         if (std.fs.path.dirname(dest)) |parent| {
             try std.fs.cwd().makePath(parent);
         }
 
-        copyFile(file, dest) catch |err| {
+        const file_fs = try tools.resolveToFs(arena, file);
+        tools.copyFile(file_fs, dest) catch |err| {
             std.debug.print(
                 "engine_research: skip {s}: {s}\n",
                 .{ file, @errorName(err) },
@@ -359,7 +315,7 @@ fn toolSnapshotList(arena: Allocator) !void {
 
     try buf.appendSlice(arena, "]}\n");
     std.debug.assert(buf.items.len > 0);
-    try writeStdout(buf.items);
+    try tools.writeStdout(buf.items);
 }
 
 // ============================================================
@@ -371,7 +327,7 @@ fn toolRollback(
     args: []const []const u8,
 ) !void {
     if (args.len < 1) {
-        try writeStdout(
+        try tools.writeStdout(
             "{\"status\": \"error\", " ++
                 "\"error\": \"usage: rollback " ++
                 "<snapshot_id>\"}\n",
@@ -402,9 +358,13 @@ fn restoreSnapshot(
         "{s}/{s}",
         .{ SNAPSHOT_DIR, snapshot_id },
     );
+    const snap_dir_fs = try tools.resolveToFs(
+        arena,
+        snap_dir,
+    );
 
     // Verify the snapshot directory exists.
-    std.fs.cwd().access(snap_dir, .{}) catch {
+    std.fs.cwd().access(snap_dir_fs, .{}) catch {
         const json = try std.fmt.allocPrint(
             arena,
             "{{\"status\": \"error\", " ++
@@ -412,7 +372,7 @@ fn restoreSnapshot(
                 "{s}\"}}\n",
             .{snapshot_id},
         );
-        try writeStdout(json);
+        try tools.writeStdout(json);
         return;
     };
 
@@ -421,9 +381,10 @@ fn restoreSnapshot(
         const source = try std.fmt.allocPrint(
             arena,
             "{s}/{s}",
-            .{ snap_dir, file },
+            .{ snap_dir_fs, file },
         );
-        copyFile(source, file) catch continue;
+        const file_fs = try tools.resolveToFs(arena, file);
+        tools.copyFile(source, file_fs) catch continue;
         count += 1;
     }
 
@@ -435,7 +396,7 @@ fn restoreSnapshot(
             "\"files_restored\": {d}}}\n",
         .{ snapshot_id, count },
     );
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -447,7 +408,7 @@ fn toolDiff(
     args: []const []const u8,
 ) !void {
     if (args.len < 1) {
-        try writeStdout(
+        try tools.writeStdout(
             "{\"status\": \"error\", " ++
                 "\"error\": \"usage: diff " ++
                 "<snapshot_id>\"}\n",
@@ -478,7 +439,7 @@ fn toolDiff(
     }
 
     try buf.appendSlice(arena, "\n]}\n");
-    try writeStdout(buf.items);
+    try tools.writeStdout(buf.items);
 }
 
 /// Run diff(1) on a single file, return JSON fragment.
@@ -518,7 +479,7 @@ fn diffOneFile(
     snapshot_id: []const u8,
     file: []const u8,
 ) DiffFileResult {
-    const snap_path = std.fmt.allocPrint(
+    const snap_rel = std.fmt.allocPrint(
         arena,
         "{s}/{s}/{s}",
         .{ SNAPSHOT_DIR, snapshot_id, file },
@@ -528,12 +489,30 @@ fn diffOneFile(
         .deletions = 0,
     };
 
+    const snap_path = tools.resolveToFs(
+        arena,
+        snap_rel,
+    ) catch return .{
+        .changed = true,
+        .additions = 0,
+        .deletions = 0,
+    };
+
+    const file_fs = tools.resolveToFs(
+        arena,
+        file,
+    ) catch return .{
+        .changed = true,
+        .additions = 0,
+        .deletions = 0,
+    };
+
     const result = std.process.Child.run(.{
         .allocator = arena,
         .argv = &[_][]const u8{
-            "diff", "-u", snap_path, file,
+            "diff", "-u", snap_path, file_fs,
         },
-        .max_output_bytes = MAX_OUTPUT_BYTES,
+        .max_output_bytes = tools.MAX_OUTPUT_BYTES,
     }) catch return .{
         .changed = true,
         .additions = 0,
@@ -569,7 +548,7 @@ fn diffOneFile(
 /// Count additions (+) and deletions (-) in unified diff
 /// output, skipping the --- and +++ header lines.
 fn countDiffChanges(output: []const u8) [2]u32 {
-    std.debug.assert(output.len <= MAX_OUTPUT_BYTES);
+    std.debug.assert(output.len <= tools.MAX_OUTPUT_BYTES);
     var additions: u32 = 0;
     var deletions: u32 = 0;
 
@@ -577,8 +556,8 @@ fn countDiffChanges(output: []const u8) [2]u32 {
     while (iter.next()) |line| {
         if (line.len == 0) continue;
         // Skip unified diff headers.
-        if (startsWith(line, "---")) continue;
-        if (startsWith(line, "+++")) continue;
+        if (tools.startsWith(line, "---")) continue;
+        if (tools.startsWith(line, "+++")) continue;
         if (line[0] == '+') additions += 1;
         if (line[0] == '-') deletions += 1;
     }
@@ -601,7 +580,8 @@ fn toolCheck(arena: Allocator) !void {
     const result = std.process.Child.run(.{
         .allocator = arena,
         .argv = &[_][]const u8{ "zig", "build" },
-        .max_output_bytes = MAX_OUTPUT_BYTES,
+        .cwd = "../" ++ tools.NN_DIR,
+        .max_output_bytes = tools.MAX_OUTPUT_BYTES,
     }) catch |err| {
         const json = try std.fmt.allocPrint(
             arena,
@@ -610,7 +590,7 @@ fn toolCheck(arena: Allocator) !void {
                 "{s}\"}}\n",
             .{@errorName(err)},
         );
-        try writeStdout(json);
+        try tools.writeStdout(json);
         return;
     };
 
@@ -620,7 +600,7 @@ fn toolCheck(arena: Allocator) !void {
     };
 
     if (success) {
-        try writeStdout(
+        try tools.writeStdout(
             "{\"status\": \"ok\", " ++
                 "\"compiled\": true}\n",
         );
@@ -637,14 +617,16 @@ fn writeCheckFailure(
     arena: Allocator,
     stderr_output: []const u8,
 ) !void {
-    std.debug.assert(stderr_output.len <= MAX_OUTPUT_BYTES);
+    std.debug.assert(
+        stderr_output.len <= tools.MAX_OUTPUT_BYTES,
+    );
     const max_err: u32 = 4000;
     const truncated = if (stderr_output.len > max_err)
         stderr_output[stderr_output.len - max_err ..]
     else
         stderr_output;
 
-    const escaped = try jsonEscape(arena, truncated);
+    const escaped = try tools.jsonEscape(arena, truncated);
     const json = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"ok\", " ++
@@ -653,7 +635,7 @@ fn writeCheckFailure(
         .{escaped},
     );
     std.debug.assert(json.len > 0);
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -671,7 +653,8 @@ fn toolTest(arena: Allocator) !void {
         .argv = &[_][]const u8{
             "zig", "build", "test",
         },
-        .max_output_bytes = MAX_OUTPUT_BYTES,
+        .cwd = "../" ++ tools.NN_DIR,
+        .max_output_bytes = tools.MAX_OUTPUT_BYTES,
     }) catch |err| {
         const json = try std.fmt.allocPrint(
             arena,
@@ -680,7 +663,7 @@ fn toolTest(arena: Allocator) !void {
                 "{s}\"}}\n",
             .{@errorName(err)},
         );
-        try writeStdout(json);
+        try tools.writeStdout(json);
         return;
     };
 
@@ -690,7 +673,7 @@ fn toolTest(arena: Allocator) !void {
     };
 
     if (success) {
-        try writeStdout(
+        try tools.writeStdout(
             "{\"status\": \"ok\", " ++
                 "\"passed\": true}\n",
         );
@@ -705,14 +688,16 @@ fn writeTestFailure(
     arena: Allocator,
     stderr_output: []const u8,
 ) !void {
-    std.debug.assert(stderr_output.len <= MAX_OUTPUT_BYTES);
+    std.debug.assert(
+        stderr_output.len <= tools.MAX_OUTPUT_BYTES,
+    );
     const max_err: u32 = 4000;
     const truncated = if (stderr_output.len > max_err)
         stderr_output[stderr_output.len - max_err ..]
     else
         stderr_output;
 
-    const escaped = try jsonEscape(arena, truncated);
+    const escaped = try tools.jsonEscape(arena, truncated);
     const json = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"ok\", " ++
@@ -721,7 +706,7 @@ fn writeTestFailure(
         .{escaped},
     );
     std.debug.assert(json.len > 0);
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -729,8 +714,13 @@ fn writeTestFailure(
 // ============================================================
 
 fn toolBench(arena: Allocator) !void {
+    const bench_fs = try tools.resolveToFs(
+        arena,
+        tools.NN_DIR ++ "/" ++ tools.BENCH_DIR,
+    );
+
     // Clean old benchmarks so we find exactly the new one.
-    _ = cleanBenchmarkFiles();
+    _ = tools.cleanBenchmarkFiles(bench_fs);
 
     std.debug.print(
         "engine_research: running zig build run...\n",
@@ -740,7 +730,8 @@ fn toolBench(arena: Allocator) !void {
     const result = std.process.Child.run(.{
         .allocator = arena,
         .argv = &[_][]const u8{ "zig", "build", "run" },
-        .max_output_bytes = MAX_OUTPUT_BYTES,
+        .cwd = "../" ++ tools.NN_DIR,
+        .max_output_bytes = tools.MAX_OUTPUT_BYTES,
     }) catch |err| {
         const json = try std.fmt.allocPrint(
             arena,
@@ -749,13 +740,13 @@ fn toolBench(arena: Allocator) !void {
                 "{s}\"}}\n",
             .{@errorName(err)},
         );
-        try writeStdout(json);
+        try tools.writeStdout(json);
         return;
     };
 
     // Forward training output to stderr for diagnostics.
     if (result.stderr.len > 0) {
-        stderr_file.writeAll(result.stderr) catch {};
+        tools.stderr_file.writeAll(result.stderr) catch {};
     }
 
     const success = switch (result.term) {
@@ -769,25 +760,32 @@ fn toolBench(arena: Allocator) !void {
     }
 
     // Find and output the benchmark JSON.
-    try emitBenchmarkResult(arena);
+    try emitBenchmarkResult(arena, bench_fs);
 }
 
 /// Locate the new benchmark file and write it to stdout.
-fn emitBenchmarkResult(arena: Allocator) !void {
-    const bench_name = findOneBenchmark(arena);
-    std.debug.assert(BENCH_DIR.len > 0);
+fn emitBenchmarkResult(
+    arena: Allocator,
+    bench_fs: []const u8,
+) !void {
+    std.debug.assert(bench_fs.len > 0);
+
+    const bench_name = tools.findOneBenchmark(
+        arena,
+        bench_fs,
+    );
 
     if (bench_name) |name| {
         const path = try std.fmt.allocPrint(
             arena,
             "{s}/{s}",
-            .{ BENCH_DIR, name },
+            .{ bench_fs, name },
         );
-        const content = try readFile(arena, path);
+        const content = try tools.readFile(arena, path);
         std.debug.assert(content.len > 0);
-        try writeStdout(content);
+        try tools.writeStdout(content);
     } else {
-        try writeStdout(
+        try tools.writeStdout(
             "{\"status\": \"error\", " ++
                 "\"error\": \"no benchmark " ++
                 "produced\"}\n",
@@ -800,14 +798,16 @@ fn writeBenchError(
     arena: Allocator,
     stderr_output: []const u8,
 ) !void {
-    std.debug.assert(stderr_output.len <= MAX_OUTPUT_BYTES);
+    std.debug.assert(
+        stderr_output.len <= tools.MAX_OUTPUT_BYTES,
+    );
     const max_err: u32 = 2000;
     const truncated = if (stderr_output.len > max_err)
         stderr_output[stderr_output.len - max_err ..]
     else
         stderr_output;
 
-    const escaped = try jsonEscape(arena, truncated);
+    const escaped = try tools.jsonEscape(arena, truncated);
     const json = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"error\", " ++
@@ -816,7 +816,7 @@ fn writeBenchError(
         .{escaped},
     );
     std.debug.assert(json.len > 0);
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -824,117 +824,11 @@ fn writeBenchError(
 // ============================================================
 
 fn toolBenchCompare(arena: Allocator) !void {
-    const names = try listBenchmarkFiles(arena);
-    var buf: std.ArrayList(u8) = .empty;
-
-    try buf.appendSlice(arena, "[\n");
-    for (names, 0..) |name, i| {
-        if (i > 0) try buf.appendSlice(arena, ",\n");
-        const entry = formatCompareEntry(arena, name);
-        if (entry) |json| {
-            try buf.appendSlice(arena, json);
-        } else |_| {
-            const fallback = try std.fmt.allocPrint(
-                arena,
-                "  {{\"file\": \"{s}\", " ++
-                    "\"error\": \"parse_failed\"}}",
-                .{name},
-            );
-            try buf.appendSlice(arena, fallback);
-        }
-    }
-
-    try buf.appendSlice(arena, "\n]\n");
-    std.debug.assert(buf.items.len > 0);
-    try writeStdout(buf.items);
-}
-
-/// Parse one benchmark JSON and format a comparison entry.
-fn formatCompareEntry(
-    arena: Allocator,
-    name: []const u8,
-) ![]const u8 {
-    std.debug.assert(name.len > 0);
-
-    const path = try std.fmt.allocPrint(
+    const bench_fs = try tools.resolveToFs(
         arena,
-        "{s}/{s}",
-        .{ BENCH_DIR, name },
+        tools.NN_DIR ++ "/" ++ tools.BENCH_DIR,
     );
-    const content = try readFile(arena, path);
-    const parsed = try std.json.parseFromSlice(
-        BenchResult,
-        arena,
-        content,
-        .{},
-    );
-    const r = parsed.value;
-    const c = r.config;
-
-    const arch_str = buildArchString(arena, c.architecture);
-    const test_acc = r.final_test_accuracy_pct orelse 0.0;
-    const val_acc =
-        r.final_validation_accuracy_pct orelse 0.0;
-
-    std.debug.assert(BENCH_DIR.len > 0);
-    return std.fmt.allocPrint(
-        arena,
-        "  {{" ++
-            "\"file\": \"{s}\", " ++
-            "\"test_accuracy_pct\": {d:.2}, " ++
-            "\"val_accuracy_pct\": {d:.2}, " ++
-            "\"throughput\": {d:.0}, " ++
-            "\"training_time_ms\": {d:.0}, " ++
-            "\"optimizer\": \"{s}\", " ++
-            "\"learning_rate\": {d}, " ++
-            "\"batch_size\": {d}, " ++
-            "\"num_epochs\": {d}, " ++
-            "\"param_count\": {d}, " ++
-            "\"architecture\": \"{s}\"" ++
-            "}}",
-        .{
-            name,
-            test_acc,
-            val_acc,
-            r.throughput_images_per_sec,
-            r.total_training_ms,
-            c.optimizer,
-            c.learning_rate,
-            c.batch_size,
-            c.num_epochs,
-            c.param_count,
-            arch_str,
-        },
-    );
-}
-
-/// Build a human-readable architecture string like
-/// "784->128->10" from the benchmark config layers.
-fn buildArchString(
-    arena: Allocator,
-    layers: []const ArchLayer,
-) []const u8 {
-    if (layers.len == 0) return "(empty)";
-    std.debug.assert(layers.len < 64);
-    var buf: std.ArrayList(u8) = .empty;
-
-    for (layers) |layer| {
-        if (buf.items.len > 0) {
-            buf.appendSlice(arena, "->") catch {
-                return "?";
-            };
-        }
-        var num_buf: [16]u8 = undefined;
-        const s = std.fmt.bufPrint(
-            &num_buf,
-            "{d}",
-            .{layer.output_size},
-        ) catch return "?";
-        buf.appendSlice(arena, s) catch return "?";
-    }
-
-    std.debug.assert(buf.items.len > 0);
-    return buf.items;
+    try tools.toolBenchCompare(arena, bench_fs);
 }
 
 // ============================================================
@@ -946,7 +840,7 @@ fn toolShow(
     args: []const []const u8,
 ) !void {
     if (args.len < 1) {
-        try writeStdout(
+        try tools.writeStdout(
             "{\"status\": \"error\", " ++
                 "\"error\": \"usage: show <file>\"}\n",
         );
@@ -960,9 +854,10 @@ fn toolShow(
         return;
     }
 
-    const content = try readFile(arena, path.?);
+    const path_fs = try tools.resolveToFs(arena, path.?);
+    const content = try tools.readFile(arena, path_fs);
     const lines = countLines(content);
-    const escaped = try jsonEscape(arena, content);
+    const escaped = try tools.jsonEscape(arena, content);
 
     const json = try std.fmt.allocPrint(
         arena,
@@ -973,7 +868,7 @@ fn toolShow(
         .{ short_name, lines, escaped },
     );
     std.debug.assert(json.len > 0);
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 /// Emit a "file not found" JSON error with the list of
@@ -1000,7 +895,7 @@ fn writeFileNotFound(
             "Valid: {s}\"}}\n",
         .{ short_name, names_buf.items },
     );
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -1012,7 +907,7 @@ fn toolShowFunction(
     args: []const []const u8,
 ) !void {
     if (args.len < 2) {
-        try writeStdout(
+        try tools.writeStdout(
             "{\"status\": \"error\", " ++
                 "\"error\": \"usage: show-function " ++
                 "<file> <function_name>\"}\n",
@@ -1030,7 +925,8 @@ fn toolShowFunction(
         return;
     }
 
-    const content = try readFile(arena, path.?);
+    const path_fs = try tools.resolveToFs(arena, path.?);
+    const content = try tools.readFile(arena, path_fs);
     const bounds = findFunctionBounds(
         content,
         function_name,
@@ -1075,7 +971,7 @@ fn writeFunctionNotFound(
             "found in {s}\"}}\n",
         .{ function_name, file },
     );
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 /// Emit the show-function success JSON.
@@ -1089,7 +985,7 @@ fn emitFunctionJson(
     std.debug.assert(file.len > 0);
     std.debug.assert(function_name.len > 0);
 
-    const escaped = try jsonEscape(arena, body);
+    const escaped = try tools.jsonEscape(arena, body);
     const json = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"ok\", " ++
@@ -1106,7 +1002,7 @@ fn emitFunctionJson(
             escaped,
         },
     );
-    try writeStdout(json);
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -1170,7 +1066,7 @@ fn scanForFunction(
     pattern: []const u8,
 ) ?FunctionBounds {
     std.debug.assert(pattern.len > 0);
-    std.debug.assert(content.len <= MAX_FILE_SIZE);
+    std.debug.assert(content.len <= tools.MAX_FILE_SIZE);
 
     var line_number: u32 = 0;
     var start_line: u32 = 0;
@@ -1224,7 +1120,7 @@ fn scanForFunction(
 /// Ignores braces inside string literals (basic handling
 /// for double-quoted strings and single-quoted chars).
 fn countBracesOnLine(line: []const u8, depth: i32) i32 {
-    std.debug.assert(line.len <= MAX_FILE_SIZE);
+    std.debug.assert(line.len <= tools.MAX_FILE_SIZE);
     var current_depth = depth;
     var in_string = false;
     var prev_char: u8 = 0;
@@ -1314,8 +1210,12 @@ fn formatTimestamp(buf: *[32]u8) []const u8 {
 fn listSnapshotDirs(
     arena: Allocator,
 ) ![]const []const u8 {
-    var dir = std.fs.cwd().openDir(
+    const snap_fs = try tools.resolveToFs(
+        arena,
         SNAPSHOT_DIR,
+    );
+    var dir = std.fs.cwd().openDir(
+        snap_fs,
         .{ .iterate = true },
     ) catch return &.{};
     defer dir.close();
@@ -1332,7 +1232,7 @@ fn listSnapshotDirs(
         count += 1;
     }
 
-    sortStrings(names.items);
+    tools.sortStrings(names.items);
     std.debug.assert(names.items.len <= MAX_SNAPSHOTS);
     return names.items;
 }
@@ -1353,9 +1253,9 @@ fn findLatestSnapshot(
 // ============================================================
 
 /// Map a short filename ("metal.zig", "compute.metal", etc.)
-/// to its full relative path ("src/metal.zig",
-/// "src/shaders/compute.metal", etc.).
-/// Also accepts full paths like "src/metal.zig".
+/// to its full relative path ("nn/src/metal.zig",
+/// "nn/src/shaders/compute.metal", etc.).
+/// Also accepts full paths like "nn/src/metal.zig".
 fn resolveEnginePath(
     short_name: []const u8,
 ) ?[]const u8 {
@@ -1363,7 +1263,7 @@ fn resolveEnginePath(
 
     // First, check for exact match against full paths.
     for (&ENGINE_FILES) |path| {
-        if (eql(path, short_name)) return path;
+        if (tools.eql(path, short_name)) return path;
     }
 
     // Then, check if any path ends with the short name.
@@ -1383,7 +1283,7 @@ fn resolveEnginePath(
 
 /// Count the number of lines in a text buffer.
 fn countLines(content: []const u8) u32 {
-    std.debug.assert(content.len <= MAX_FILE_SIZE);
+    std.debug.assert(content.len <= tools.MAX_FILE_SIZE);
     if (content.len == 0) return 0;
 
     var count: u32 = 0;
@@ -1397,197 +1297,4 @@ fn countLines(content: []const u8) u32 {
     }
     std.debug.assert(count > 0);
     return count;
-}
-
-// ============================================================
-// Benchmark file helpers
-// ============================================================
-
-fn listBenchmarkFiles(
-    arena: Allocator,
-) ![]const []const u8 {
-    var dir = std.fs.cwd().openDir(
-        BENCH_DIR,
-        .{ .iterate = true },
-    ) catch return &.{};
-    defer dir.close();
-
-    var names: std.ArrayList([]const u8) = .empty;
-    var iter = dir.iterate();
-
-    while (try iter.next()) |entry| {
-        if (isBenchmarkFile(entry.name)) {
-            const dupe = try arena.dupe(u8, entry.name);
-            try names.append(arena, dupe);
-        }
-    }
-
-    // Selection sort — correct for small N.
-    sortStrings(names.items);
-    std.debug.assert(BENCH_DIR.len > 0);
-    return names.items;
-}
-
-fn findOneBenchmark(arena: Allocator) ?[]const u8 {
-    var dir = std.fs.cwd().openDir(
-        BENCH_DIR,
-        .{ .iterate = true },
-    ) catch return null;
-    defer dir.close();
-
-    var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
-        if (isBenchmarkFile(entry.name)) {
-            return arena.dupe(u8, entry.name) catch null;
-        }
-    }
-    return null;
-}
-
-fn cleanBenchmarkFiles() u32 {
-    var dir = std.fs.cwd().openDir(
-        BENCH_DIR,
-        .{ .iterate = true },
-    ) catch return 0;
-    defer dir.close();
-
-    var count: u32 = 0;
-    var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
-        if (isBenchmarkFile(entry.name)) {
-            dir.deleteFile(entry.name) catch {};
-            count += 1;
-        }
-    }
-    std.debug.assert(BENCH_DIR.len > 0);
-    return count;
-}
-
-fn isBenchmarkFile(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "mnist_") and
-        std.mem.endsWith(u8, name, ".json");
-}
-
-// ============================================================
-// Sorting
-// ============================================================
-
-/// Selection sort for small string arrays.
-fn sortStrings(items: [][]const u8) void {
-    if (items.len < 2) return;
-    for (0..items.len - 1) |i| {
-        var min_idx = i;
-        for (i + 1..items.len) |j| {
-            if (std.mem.order(
-                u8,
-                items[j],
-                items[min_idx],
-            ) == .lt) {
-                min_idx = j;
-            }
-        }
-        if (min_idx != i) {
-            const tmp = items[i];
-            items[i] = items[min_idx];
-            items[min_idx] = tmp;
-        }
-    }
-}
-
-// ============================================================
-// File I/O
-// ============================================================
-
-fn readFile(
-    arena: Allocator,
-    path: []const u8,
-) ![]const u8 {
-    std.debug.assert(path.len > 0);
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(
-        arena,
-        MAX_FILE_SIZE,
-    );
-}
-
-fn copyFile(source: []const u8, dest: []const u8) !void {
-    std.debug.assert(source.len > 0);
-    std.debug.assert(dest.len > 0);
-    try std.fs.cwd().copyFile(
-        source,
-        std.fs.cwd(),
-        dest,
-        .{},
-    );
-}
-
-// ============================================================
-// Stdout / stderr I/O
-// ============================================================
-
-const stdout_file = std.fs.File{
-    .handle = std.posix.STDOUT_FILENO,
-};
-const stderr_file = std.fs.File{
-    .handle = std.posix.STDERR_FILENO,
-};
-
-fn writeStdout(bytes: []const u8) !void {
-    std.debug.assert(bytes.len > 0);
-    try stdout_file.writeAll(bytes);
-}
-
-// ============================================================
-// JSON output helpers
-// ============================================================
-
-fn writeJsonError(err: anyerror) !void {
-    var buf: [256]u8 = undefined;
-    const json = std.fmt.bufPrint(
-        &buf,
-        "{{\"status\": \"error\", " ++
-            "\"error\": \"{s}\"}}\n",
-        .{@errorName(err)},
-    ) catch
-        "{\"status\": \"error\", " ++
-            "\"error\": \"unknown\"}\n";
-    try writeStdout(json);
-}
-
-fn jsonEscape(
-    arena: Allocator,
-    input: []const u8,
-) ![]const u8 {
-    std.debug.assert(input.len <= MAX_OUTPUT_BYTES);
-    var buf: std.ArrayList(u8) = .empty;
-
-    for (input) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(arena, "\\\""),
-            '\\' => try buf.appendSlice(arena, "\\\\"),
-            '\n' => try buf.appendSlice(arena, "\\n"),
-            '\r' => try buf.appendSlice(arena, "\\r"),
-            '\t' => try buf.appendSlice(arena, "\\t"),
-            else => try buf.append(arena, c),
-        }
-    }
-
-    std.debug.assert(buf.items.len >= input.len);
-    return buf.items;
-}
-
-// ============================================================
-// String helpers
-// ============================================================
-
-fn eql(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
-
-fn startsWith(
-    haystack: []const u8,
-    prefix: []const u8,
-) bool {
-    return std.mem.startsWith(u8, haystack, prefix);
 }

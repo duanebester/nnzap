@@ -7,6 +7,11 @@
 const std = @import("std");
 const objc = @import("objc");
 
+/// Re-export objc.Object so callers (e.g. main.zig) can
+/// name the type for command buffers and encoders without
+/// importing the objc module directly.
+pub const Object = objc.Object;
+
 const log = std.log.scoped(.metal);
 
 // ============================================================================
@@ -192,6 +197,10 @@ pub fn MultiBuffered(comptime T: type, comptime N: u32) type {
 
 pub const ComputePipeline = struct {
     state: objc.Object, // MTLComputePipelineState
+    /// Cached from MTLComputePipelineState at init time.
+    /// Avoids repeated Obj-C message sends on every
+    /// dispatch1D call (~15 dispatches per batch).
+    max_threads_per_group: c_ulong,
 
     pub fn init(
         device: objc.Object,
@@ -249,7 +258,21 @@ pub const ComputePipeline = struct {
             return error.MetalPipelineCreationFailed;
         };
 
-        return .{ .state = objc.Object.fromId(state_raw) };
+        const state = objc.Object.fromId(state_raw);
+
+        // Cache the hardware thread limit once at init
+        // to avoid Obj-C message send overhead per dispatch.
+        const max_threads = state.msgSend(
+            c_ulong,
+            "maxTotalThreadsPerThreadgroup",
+            .{},
+        );
+        std.debug.assert(max_threads > 0);
+
+        return .{
+            .state = state,
+            .max_threads_per_group = max_threads,
+        };
     }
 };
 
@@ -267,6 +290,7 @@ const PipelineSpec = struct {
 const pipeline_specs = [_]PipelineSpec{
     .{ .field_name = "vector_add", .shader_name = "vector_add" },
     .{ .field_name = "matmul", .shader_name = "matmul" },
+    .{ .field_name = "matmul_tiled", .shader_name = "matmul_tiled" },
     .{
         .field_name = "matmul_bias",
         .shader_name = "matmul_bias",
@@ -274,6 +298,14 @@ const pipeline_specs = [_]PipelineSpec{
     .{
         .field_name = "matmul_bias_relu",
         .shader_name = "matmul_bias_relu",
+    },
+    .{
+        .field_name = "matmul_bias_v2",
+        .shader_name = "matmul_bias_v2",
+    },
+    .{
+        .field_name = "matmul_bias_relu_v2",
+        .shader_name = "matmul_bias_relu_v2",
     },
     .{
         .field_name = "matmul_transA",
@@ -337,10 +369,14 @@ pub const Device = struct {
     // Pre-compiled compute pipelines for all our kernels.
     vector_add: ComputePipeline,
     matmul: ComputePipeline,
+    matmul_tiled: ComputePipeline,
     matmul_bias: ComputePipeline,
     matmul_bias_relu: ComputePipeline,
+    matmul_bias_v2: ComputePipeline,
+    matmul_bias_relu_v2: ComputePipeline,
     matmul_transA: ComputePipeline,
     matmul_transB: ComputePipeline,
+
     relu_forward: ComputePipeline,
     tanh_forward: ComputePipeline,
     sigmoid_forward: ComputePipeline,
@@ -505,21 +541,21 @@ pub const Device = struct {
             .{pipeline.state.value},
         );
 
-        // Query the pipeline for its hardware limit so we never
-        // exceed Metal's per-threadgroup maximum on this device.
-        const max_threads = pipeline.state.msgSend(
-            c_ulong,
-            "maxTotalThreadsPerThreadgroup",
-            .{},
-        );
+        // Use cached hardware limit to avoid Obj-C message
+        // send overhead on every dispatch (Rule 7 — amortise).
         const threads_per_group = @min(
-            max_threads,
+            pipeline.max_threads_per_group,
             @as(c_ulong, count),
         );
         std.debug.assert(threads_per_group > 0);
 
+        // Switch to dispatchThreadgroups for better efficiency.
+        // Round up thread count to full threadgroups.
+        const thread_count = @as(c_ulong, count);
+        const groups_needed = (thread_count + threads_per_group - 1) / threads_per_group;
+
         const grid_size = MTLSize{
-            .width = @as(c_ulong, count),
+            .width = groups_needed,
             .height = 1,
             .depth = 1,
         };
@@ -531,12 +567,17 @@ pub const Device = struct {
 
         encoder.msgSend(
             void,
-            "dispatchThreads:threadsPerThreadgroup:",
+            "dispatchThreadgroups:threadsPerThreadgroup:",
             .{ grid_size, group_size },
         );
     }
 
     /// Dispatch a 2D compute kernel (e.g. matmul).
+    /// Uses dispatchThreadgroups to guarantee full 16×16
+    /// threadgroups, which is required for tiled matmul
+    /// kernels where every thread cooperatively loads
+    /// shared memory tiles. Over-dispatched threads are
+    /// bounds-checked inside each kernel.
     pub fn dispatch2D(
         self: *const Device,
         encoder: objc.Object,
@@ -555,33 +596,31 @@ pub const Device = struct {
             .{pipeline.state.value},
         );
 
+        // 16×16 = 256 threads per threadgroup matches the
+        // TS=16 tile size in the Metal shaders.
+        const tile: c_ulong = 16;
+        const w: c_ulong = @as(c_ulong, width);
+        const h: c_ulong = @as(c_ulong, height);
+
+        // Round up to full threadgroups so every thread
+        // in a tile participates in shared memory loads.
+        const groups_x = (w + tile - 1) / tile;
+        const groups_y = (h + tile - 1) / tile;
+
         const grid_size = MTLSize{
-            .width = @as(c_ulong, width),
-            .height = @as(c_ulong, height),
+            .width = groups_x,
+            .height = groups_y,
             .depth = 1,
         };
-
-        // 16×16 = 256 threads per threadgroup is a good default
-        // for 2D kernels: it balances occupancy with register
-        // pressure on Apple Silicon, and 256 evenly divides
-        // most common matrix dimensions.
-        const w = @min(
-            @as(c_ulong, 16),
-            @as(c_ulong, width),
-        );
-        const h = @min(
-            @as(c_ulong, 16),
-            @as(c_ulong, height),
-        );
         const group_size = MTLSize{
-            .width = w,
-            .height = h,
+            .width = tile,
+            .height = tile,
             .depth = 1,
         };
 
         encoder.msgSend(
             void,
-            "dispatchThreads:threadsPerThreadgroup:",
+            "dispatchThreadgroups:threadsPerThreadgroup:",
             .{ grid_size, group_size },
         );
     }
