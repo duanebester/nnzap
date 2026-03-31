@@ -159,12 +159,18 @@ pub fn main() !void {
     );
     defer mega_out.deinit();
 
+    // Small flag buffer for GPU completion signaling.
+    // The v3 kernel writes 1 here when done; the CPU
+    // spin-reads it to avoid waitUntilCompleted trap.
+    var flag_buf = try device.createBuffer(1);
+    defer flag_buf.deinit();
+
     // Warm the GPU pipeline before measuring.
     std.debug.print(
         "Warming up ({d} iterations)... ",
         .{WARMUP_ITERS},
     );
-    warmup(&device, &net, input_buf);
+    warmup(&device, &net, input_buf, flag_buf);
     std.debug.print("done.\n\n", .{});
 
     const gpu_batched = benchGpuBatched(
@@ -179,6 +185,7 @@ pub fn main() !void {
         &device,
         &net,
         input_buf,
+        flag_buf,
     );
     printLatency(
         "Phase 2 \xe2\x80\x94 GPU single-sample",
@@ -214,19 +221,29 @@ fn warmup(
     device: *const Device,
     net: *const Net,
     input: Buffer,
+    flag_buf: Buffer,
 ) void {
     std.debug.assert(input.len >= Layout.input_size);
     std.debug.assert(WARMUP_ITERS > 0);
+    std.debug.assert(flag_buf.len >= 1);
 
-    // Warm fused single-sample path (unretained + spin
-    // wait to match the measurement path).
+    // Warm v3 fused path (with spin-wait flag) to
+    // match the measurement path exactly.
+    const flag_slice = flag_buf.asSlice();
+    const flag_ptr: *volatile u32 = @ptrCast(
+        &flag_slice[0],
+    );
+    flag_ptr.* = 0;
+
     var i: u32 = 0;
     while (i < WARMUP_ITERS) : (i += 1) {
         const cmd = device.beginCommandBufferUnretained();
         const enc = device.beginCompute(cmd);
-        net.forwardInferFused(device, enc, input);
+        net.forwardInferFusedV3(
+            device, enc, input, flag_buf,
+        );
         enc.msgSend(void, "endEncoding", .{});
-        device.commitAndWait(cmd);
+        device.commitAndSpinOnFlag(cmd, flag_ptr);
     }
 
     // Warm batched path (fused batched kernel).
@@ -318,20 +335,30 @@ fn benchGpuBatched(
 /// batch=1 — includes command buffer creation, encoder
 /// setup, dispatch, and GPU-to-CPU synchronisation.
 ///
-/// Uses commitAndSpinWait to avoid the Mach kernel
-/// trap in waitUntilCompleted (~50-100 us overhead).
-/// The CPU busy-polls command buffer status, which is
-/// faster for very short GPU work (< 50 us compute).
-///
-/// Uses the fused 3-layer kernel to minimise dispatch
-/// overhead: 1 dispatch instead of 3 per forward pass.
+/// Uses the v3 fused kernel with a GPU completion flag:
+/// the kernel writes to a shared memory flag when done,
+/// and the CPU spin-reads it — avoiding the Mach kernel
+/// trap in waitUntilCompleted (~100-150 us overhead for
+/// sub-10 us GPU work).
 fn benchGpuSingle(
     device: *const Device,
     net: *const Net,
     input: Buffer,
+    flag_buf: Buffer,
 ) LatencyResult {
     std.debug.assert(input.len >= Layout.input_size);
     std.debug.assert(GPU_LATENCY_ITERS > 0);
+    std.debug.assert(flag_buf.len >= 1);
+
+    // Get a volatile pointer to the flag in shared
+    // memory.  The GPU writes 1 here on completion;
+    // the CPU spin-reads it.
+    const flag_slice = flag_buf.asSlice();
+    const flag_ptr: *volatile u32 = @ptrCast(
+        &flag_slice[0],
+    );
+    // Ensure flag starts at 0.
+    flag_ptr.* = 0;
 
     var latencies: [GPU_LATENCY_ITERS]f64 = undefined;
 
@@ -344,9 +371,13 @@ fn benchGpuSingle(
         // buffers outlive every command buffer.
         const cmd = device.beginCommandBufferUnretained();
         const enc = device.beginCompute(cmd);
-        net.forwardInferFused(device, enc, input);
+        net.forwardInferFusedV3(
+            device, enc, input, flag_buf,
+        );
         enc.msgSend(void, "endEncoding", .{});
-        device.commitAndWait(cmd);
+        // Spin-wait on GPU completion flag instead of
+        // waitUntilCompleted — avoids Mach kernel trap.
+        device.commitAndSpinOnFlag(cmd, flag_ptr);
 
         latencies[i] = nanosToUs(
             std.time.nanoTimestamp() - start,

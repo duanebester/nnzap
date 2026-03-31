@@ -1230,6 +1230,93 @@ kernel void forward_fused_infer_3layer_v2(
 }
 
 // ============================================================================
+// Fused single-sample inference v3: writes completion flag
+// ============================================================================
+
+/// Same as forward_fused_infer_3layer_v2 but writes a
+/// completion flag to buffer(3) when done.  The CPU can
+/// spin-read this flag in shared memory instead of calling
+/// waitUntilCompleted, avoiding the Mach kernel trap
+/// (~100-150 us overhead for sub-10 us GPU work).
+///
+/// The flag is a single uint32 at buffer(3)[0].  Thread 0
+/// writes 1 after all layers complete and a device memory
+/// fence ensures visibility to the CPU on unified memory.
+kernel void forward_fused_infer_3layer_v3(
+    device const float* input    [[buffer(0)]],
+    device const float* params   [[buffer(1)]],
+    device float*       output   [[buffer(2)]],
+    device atomic_uint* flag     [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    // Layer dimensions (comptime-known architecture).
+    constexpr uint IN0  = 784;
+    constexpr uint OUT0 = 128;
+    constexpr uint OUT1 = 64;
+    constexpr uint OUT2 = 10;
+
+    // Hardcoded offsets into the flat param buffer.
+    constexpr uint W0_OFF = 0;
+    constexpr uint B0_OFF = 100352;   // 784 * 128
+    constexpr uint W1_OFF = 100480;   // 100352 + 128
+    constexpr uint B1_OFF = 108672;   // 100480 + 128*64
+    constexpr uint W2_OFF = 108736;   // 108672 + 64
+    constexpr uint B2_OFF = 109376;   // 108736 + 64*10
+
+    threadgroup float act0[OUT0];
+    threadgroup float act1[OUT1];
+
+    // ---- Layer 0: 784 → 128, ReLU ----
+    {
+        device const float* W0 = params + W0_OFF;
+        device const float* B0 = params + B0_OFF;
+
+        float sum = B0[tid];
+        for (uint k = 0; k < IN0; k++) {
+            sum += input[k] * W0[k * OUT0 + tid];
+        }
+        act0[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 1: 128 → 64, ReLU ----
+    if (tid < OUT1) {
+        device const float* W1 = params + W1_OFF;
+        device const float* B1 = params + B1_OFF;
+
+        float sum = B1[tid];
+        for (uint k = 0; k < OUT0; k++) {
+            sum += act0[k] * W1[k * OUT1 + tid];
+        }
+        act1[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 2: 64 → 10, none ----
+    if (tid < OUT2) {
+        device const float* W2 = params + W2_OFF;
+        device const float* B2 = params + B2_OFF;
+
+        float sum = B2[tid];
+        for (uint k = 0; k < OUT1; k++) {
+            sum += act1[k] * W2[k * OUT2 + tid];
+        }
+        output[tid] = sum;
+    }
+
+    // Thread 0 signals completion after all work.
+    // The mem_device barrier ensures all output writes
+    // to device memory are visible before the flag.
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {
+        atomic_store_explicit(
+            flag, 1u, memory_order_relaxed);
+    }
+}
+
+// ============================================================================
 // Fused batched inference: 3-layer forward (784→128→64→10)
 // ============================================================================
 

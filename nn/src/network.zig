@@ -587,6 +587,60 @@ pub fn Network(
             );
         }
 
+        /// Fused v3: same as v2 but writes a completion
+        /// flag to buffer(3) so CPU can spin-wait on
+        /// shared memory instead of waitUntilCompleted.
+        /// Saves the Mach kernel trap (~100-150 us).
+        pub fn forwardInferFusedV3(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+            flag_buf: Buffer,
+        ) void {
+            assertFusedV2Offsets();
+            std.debug.assert(
+                input.len >= Layout.input_size,
+            );
+            // Flag buffer: at least 1 u32 element.
+            std.debug.assert(flag_buf.len >= 1);
+
+            const last = Layout.num_layers - 1;
+            const out_buf = self.post_activations[last];
+
+            // Batch 4 buffers in 1 Obj-C call.
+            const bufs = [_]Buffer{
+                input, self.params, out_buf, flag_buf,
+            };
+            metal.setBuffersBatch(encoder, &bufs, 0);
+
+            const pipeline =
+                device.forward_fused_infer_3layer_v3;
+            encoder.msgSend(
+                void,
+                "setComputePipelineState:",
+                .{pipeline.state.value},
+            );
+
+            encoder.msgSend(
+                void,
+                "dispatchThreadgroups:" ++
+                    "threadsPerThreadgroup:",
+                .{
+                    metal.MTLSize{
+                        .width = 1,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                    metal.MTLSize{
+                        .width = 128,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                },
+            );
+        }
+
         /// Fused 3-layer batched inference: one dispatch
         /// per forward pass instead of 3 (one per layer).
         /// Each threadgroup processes one sample from the

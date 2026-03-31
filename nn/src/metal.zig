@@ -463,6 +463,10 @@ const pipeline_specs = [_]PipelineSpec{
         .shader_name = "forward_fused_infer_3layer_v2",
     },
     .{
+        .field_name = "forward_fused_infer_3layer_v3",
+        .shader_name = "forward_fused_infer_3layer_v3",
+    },
+    .{
         .field_name = "forward_fused_infer_batched",
         .shader_name = "forward_fused_infer_batched",
     },
@@ -530,6 +534,7 @@ pub const Device = struct {
     weight_grad_sgd: ComputePipeline,
     forward_fused_infer_3layer: ComputePipeline,
     forward_fused_infer_3layer_v2: ComputePipeline,
+    forward_fused_infer_3layer_v3: ComputePipeline,
     forward_fused_infer_batched: ComputePipeline,
     matmul_bias_packed: ComputePipeline,
     matmul_bias_relu_infer_packed: ComputePipeline,
@@ -813,6 +818,42 @@ pub const Device = struct {
         std.debug.assert(cmd_buf.value != null);
 
         cmd_buf.msgSend(void, "commit", .{});
+    }
+
+    /// Commit a command buffer and spin-wait on a completion
+    /// flag in shared memory.  The GPU kernel writes 1 to
+    /// flag_ptr[0] when done (via atomic_store_explicit with
+    /// memory_order_release).  The CPU spin-reads the same
+    /// unified memory location, avoiding the Mach kernel
+    /// trap in waitUntilCompleted (~100-150 us overhead).
+    /// Resets the flag to 0 after completion for reuse.
+    pub fn commitAndSpinOnFlag(
+        self: *const Device,
+        cmd_buf: objc.Object,
+        flag_ptr: *volatile u32,
+    ) void {
+        std.debug.assert(
+            self.command_queue.value != null,
+        );
+        std.debug.assert(cmd_buf.value != null);
+        // Flag must be 0 (reset) before commit.
+        std.debug.assert(flag_ptr.* == 0);
+
+        cmd_buf.msgSend(void, "commit", .{});
+
+        // Spin until GPU sets flag to 1.
+        // On Apple Silicon unified memory, GPU writes
+        // are visible to CPU after cache coherency
+        // propagation (~10-50 ns typical).
+        while (flag_ptr.* == 0) {
+            // Busy-wait — appropriate for sub-10 us
+            // GPU work where kernel trap overhead
+            // exceeds the wait time.
+            std.atomic.spinLoopHint();
+        }
+
+        // Reset for next use.
+        flag_ptr.* = 0;
     }
 
     /// Insert a buffer-scope memory barrier on the compute
