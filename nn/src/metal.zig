@@ -354,6 +354,10 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "adam_update",
         .shader_name = "adam_update",
     },
+    .{
+        .field_name = "argmax_predictions",
+        .shader_name = "argmax_predictions",
+    },
 };
 
 // ============================================================================
@@ -392,6 +396,7 @@ pub const Device = struct {
     softmax_forward: ComputePipeline,
     ce_forward: ComputePipeline,
     softmax_ce_backward: ComputePipeline,
+    argmax_predictions: ComputePipeline,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(

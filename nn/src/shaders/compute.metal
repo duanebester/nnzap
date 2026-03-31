@@ -739,6 +739,46 @@ kernel void softmax_ce_backward(
 }
 
 // ============================================================================
+// Argmax — per-sample class prediction for batched evaluation
+// ============================================================================
+
+/// Per-sample argmax: finds the index of the largest logit for
+/// each sample and writes it as a float to the output buffer.
+/// One thread per sample.  Used to batch evaluation forward
+/// passes by extracting predictions between forward dispatches
+/// within the same command encoder, avoiding per-batch
+/// commitAndWait overhead.
+///
+///   logits: [batch_size x num_classes], row-major.
+///   predictions: output buffer, writes at [offset + gid].
+///   num_classes: number of classes per sample.
+///   offset: write offset in the predictions buffer (in
+///           float elements) for this batch group.
+kernel void argmax_predictions(
+    device const float* logits        [[buffer(0)]],
+    device float*       predictions   [[buffer(1)]],
+    constant uint& num_classes        [[buffer(2)]],
+    constant uint& offset             [[buffer(3)]],
+    uint                gid           [[thread_position_in_grid]])
+{
+    // Each thread processes one sample.
+    const uint base = gid * num_classes;
+
+    float best_val = logits[base];
+    uint best_idx = 0;
+    for (uint c = 1; c < num_classes; c++) {
+        float val = logits[base + c];
+        if (val > best_val) {
+            best_val = val;
+            best_idx = c;
+        }
+    }
+
+    // Store predicted class as float at the offset position.
+    predictions[offset + gid] = float(best_idx);
+}
+
+// ============================================================================
 // Adam parameter update
 // ============================================================================
 

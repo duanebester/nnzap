@@ -5,11 +5,12 @@ Architecture: 784 → 128 (ReLU) → 64 (ReLU) → 10 (none / raw logits)
 Loss:         softmax + cross-entropy (PyTorch fuses these)
 Optimiser:    mini-batch SGD (no momentum, no weight decay)
 
-Hyperparameters and dataset split match nnzap/src/main.zig exactly:
+Hyperparameters and dataset split match nn/examples/mnist.zig exactly:
   - seed:          42
   - batch_size:    64
   - learning_rate: 0.2
   - epochs:        20
+  - val_interval:  5 (validate every 5th epoch + last)
   - train split:   50,000 (first 50k of shuffled 60k)
   - val split:     10,000 (last 10k of shuffled 60k)
   - test split:    10,000
@@ -356,6 +357,7 @@ def main() -> None:
     val_count = 10_000
     train_count = total_train - val_count  # 50,000
     test_count = 10_000
+    val_interval = 5  # Validate every N epochs (matches nnzap).
 
     # ── Device ──
 
@@ -469,7 +471,19 @@ def main() -> None:
             model, train_loader, optimizer, device,
         )
 
-        val = evaluate(model, val_set, batch_size, device)
+        # Validate every val_interval epochs and on the
+        # last epoch — matches nnzap's val_interval logic.
+        is_val_epoch = (
+            epoch % val_interval == 0 or epoch == num_epochs
+        )
+
+        val_loss = 0.0
+        val_acc = 0.0
+
+        if is_val_epoch:
+            val = evaluate(model, val_set, batch_size, device)
+            val_loss = val["mean_loss"]
+            val_acc = val["accuracy_pct"]
 
         epoch_ms = (
             (time.perf_counter() - epoch_start) * 1000.0
@@ -479,17 +493,24 @@ def main() -> None:
             "epoch": epoch,
             "train_loss": train_loss,
             "duration_ms": epoch_ms,
-            "validation_loss": val["mean_loss"],
-            "validation_accuracy_pct": val["accuracy_pct"],
+            "validation_loss": val_loss,
+            "validation_accuracy_pct": val_acc,
         })
 
-        print(
-            f"  Epoch {epoch:>2}: "
-            f"loss={train_loss:.4f}  "
-            f"val_loss={val['mean_loss']:.4f}  "
-            f"val_acc={val['accuracy_pct']:.2f}%  "
-            f"({epoch_ms:.0f} ms)"
-        )
+        if is_val_epoch:
+            print(
+                f"  Epoch {epoch:>2}: "
+                f"loss={train_loss:.4f}  "
+                f"val_loss={val_loss:.4f}  "
+                f"val_acc={val_acc:.2f}%  "
+                f"({epoch_ms:.0f} ms)"
+            )
+        else:
+            print(
+                f"  Epoch {epoch:>2}: "
+                f"loss={train_loss:.4f}  "
+                f"({epoch_ms:.0f} ms)"
+            )
 
     total_training_ms = (
         (time.perf_counter() - train_start) * 1000.0

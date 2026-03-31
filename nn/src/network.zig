@@ -844,6 +844,55 @@ pub fn Network(
         }
 
         // ====================================================
+        // Argmax predictions (batched evaluation)
+        // ====================================================
+
+        /// Encode per-sample argmax of the network output
+        /// into a predictions buffer at the given offset.
+        /// Used to batch evaluation: forward + argmax are
+        /// encoded sequentially so the argmax reads the
+        /// output before the next forward overwrites it.
+        pub fn encodeArgmax(
+            device: *const Device,
+            encoder: objc.Object,
+            logits: Buffer,
+            predictions: Buffer,
+            num_classes_val: u32,
+            batch_size: u32,
+            offset: u32,
+        ) void {
+            std.debug.assert(num_classes_val > 0);
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(
+                logits.len >= batch_size * num_classes_val,
+            );
+            std.debug.assert(
+                predictions.len >= offset + batch_size,
+            );
+
+            metal.setBuffer(encoder, logits, 0);
+            metal.setBuffer(encoder, predictions, 1);
+            metal.setBytes(
+                encoder,
+                u32,
+                &num_classes_val,
+                2,
+            );
+            metal.setBytes(
+                encoder,
+                u32,
+                &offset,
+                3,
+            );
+
+            device.dispatch1D(
+                encoder,
+                device.argmax_predictions,
+                batch_size,
+            );
+        }
+
+        // ====================================================
         // Private dispatch helpers (Rule 20)
         // ====================================================
 

@@ -80,13 +80,22 @@ const EvalResult = struct {
 const BATCHES_PER_CMD: u32 = 64;
 const BUFFER_COUNT: u32 = BATCHES_PER_CMD;
 
+/// Number of eval forward passes to batch into one command
+/// buffer.  Reduces per-batch commitAndWait overhead from
+/// 156 round-trips to ~3 during validation.
+const EVAL_BATCHES_PER_CMD: u32 = 64;
+
 const Buffers = struct {
-    /// Double-buffered input/target for pipelining.
+    /// Multi-slot input/target buffers for batched encoding.
     inputs: [BUFFER_COUNT]Buffer,
     targets: [BUFFER_COUNT]Buffer,
     loss_grad: Buffer,
     probs: Buffer,
     loss: Buffer,
+    /// GPU argmax predictions for batched evaluation.
+    /// Sized to hold EVAL_BATCHES_PER_CMD * max_batch
+    /// predictions (one float per sample).
+    predictions: Buffer,
 
     fn init(device: *const Device) !Buffers {
         var self: Buffers = undefined;
@@ -134,10 +143,16 @@ const Buffers = struct {
         self.loss = try device.createBuffer(max_batch);
         errdefer self.loss.deinit();
 
+        self.predictions = try device.createBuffer(
+            EVAL_BATCHES_PER_CMD * max_batch,
+        );
+        errdefer self.predictions.deinit();
+
         return self;
     }
 
     fn deinit(self: *Buffers) void {
+        self.predictions.deinit();
         self.loss.deinit();
         self.probs.deinit();
         self.loss_grad.deinit();
@@ -653,11 +668,12 @@ fn evaluate(
     );
 }
 
-/// Core evaluation loop.  When compute_loss is false, only
-/// forward passes are dispatched (no softmax or CE loss),
-/// saving 2 dispatches per batch.  Accuracy uses argmax on
-/// raw logits, which is monotonically equivalent to
-/// softmax argmax.
+/// Core evaluation loop.  When compute_loss is false, batches
+/// multiple forward passes into one command buffer using GPU
+/// argmax to extract predictions before the output buffer is
+/// overwritten.  When compute_loss is true, falls back to
+/// one batch per command buffer (loss depends on shared
+/// buffers that can't overlap).
 fn evaluateInner(
     device: *const Device,
     net: *const MnistNet,
@@ -667,6 +683,179 @@ fn evaluateInner(
     labels_raw: []const u8,
     indices: []const u32,
     compute_loss: bool,
+) EvalResult {
+    const count: u32 = @intCast(indices.len);
+    std.debug.assert(count > 0);
+    std.debug.assert(images.len > 0);
+    std.debug.assert(labels_raw.len > 0);
+
+    if (compute_loss) {
+        return evalWithLoss(
+            device, net, bufs, images,
+            labels_onehot, labels_raw, indices,
+        );
+    }
+
+    return evalBatched(
+        device, net, bufs, images,
+        labels_raw, indices,
+    );
+}
+
+/// Batched evaluation (no loss).  Groups multiple forward
+/// passes into one command buffer using GPU argmax to
+/// capture predictions before the next forward overwrites
+/// the output.  Reduces ~156 commitAndWait calls to ~3.
+fn evalBatched(
+    device: *const Device,
+    net: *const MnistNet,
+    bufs: *const Buffers,
+    images: []const f32,
+    labels_raw: []const u8,
+    indices: []const u32,
+) EvalResult {
+    const count: u32 = @intCast(indices.len);
+    std.debug.assert(count > 0);
+    std.debug.assert(images.len > 0);
+
+    var correct: u32 = 0;
+    var offset: u32 = 0;
+
+    while (offset < count) {
+        // Determine how many batches fit in this group.
+        const remaining = count - offset;
+        const remaining_batches =
+            (remaining + max_batch - 1) / max_batch;
+        const group_size: u32 = @min(
+            EVAL_BATCHES_PER_CMD,
+            remaining_batches,
+        );
+
+        // Phase 1: CPU fills input buffers for the group.
+        var batch_sizes: [EVAL_BATCHES_PER_CMD]u32 = undefined;
+        fillEvalGroup(
+            images,
+            indices,
+            bufs,
+            offset,
+            count,
+            group_size,
+            &batch_sizes,
+        );
+
+        // Phase 2: encode all forward + argmax in one cmd.
+        const cmd = device.beginCommandBuffer();
+        const enc = device.beginCompute(cmd);
+
+        var pred_offset: u32 = 0;
+        var g: u32 = 0;
+        while (g < group_size) : (g += 1) {
+            net.forward(
+                device,
+                enc,
+                bufs.inputs[g],
+                batch_sizes[g],
+            );
+            MnistNet.encodeArgmax(
+                device,
+                enc,
+                net.getOutput().*,
+                bufs.predictions,
+                num_classes,
+                batch_sizes[g],
+                pred_offset,
+            );
+            pred_offset += batch_sizes[g];
+        }
+
+        enc.msgSend(void, "endEncoding", .{});
+        device.commitAndWait(cmd);
+
+        // Phase 3: compare GPU predictions with labels.
+        correct += countPredictions(
+            bufs.predictions.asSlice(),
+            labels_raw,
+            indices[offset..],
+            pred_offset,
+        );
+
+        offset += pred_offset;
+    }
+
+    const n: f64 = @floatFromInt(count);
+    const c: f64 = @floatFromInt(correct);
+    return .{
+        .correct = correct,
+        .total = count,
+        .mean_loss = 0.0,
+        .accuracy_pct = c / n * 100.0,
+    };
+}
+
+/// Fill input buffers for an evaluation group.  Computes
+/// the batch size for each slot (last batch may be partial).
+fn fillEvalGroup(
+    images: []const f32,
+    indices: []const u32,
+    bufs: *const Buffers,
+    offset: u32,
+    count: u32,
+    group_size: u32,
+    batch_sizes: *[EVAL_BATCHES_PER_CMD]u32,
+) void {
+    std.debug.assert(group_size > 0);
+    std.debug.assert(group_size <= EVAL_BATCHES_PER_CMD);
+
+    var g: u32 = 0;
+    var batch_offset = offset;
+    while (g < group_size) : (g += 1) {
+        const remaining = count - batch_offset;
+        const current: u32 = @min(max_batch, remaining);
+        batch_sizes[g] = current;
+
+        const idx = indices[batch_offset..][0..current];
+        Mnist.fillImageBatch(
+            images,
+            idx,
+            bufs.inputs[g].asSlice(),
+        );
+
+        batch_offset += current;
+    }
+}
+
+/// Count correct predictions from GPU argmax results.
+/// Predictions are stored as floats (class indices 0-9).
+fn countPredictions(
+    predictions: []const f32,
+    labels_raw: []const u8,
+    indices: []const u32,
+    count: u32,
+) u32 {
+    std.debug.assert(count > 0);
+    std.debug.assert(predictions.len >= count);
+
+    var correct: u32 = 0;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const pred: u8 = @intFromFloat(predictions[i]);
+        if (pred == labels_raw[indices[i]]) {
+            correct += 1;
+        }
+    }
+    return correct;
+}
+
+/// Evaluation with loss computation (one batch per command
+/// buffer).  Used for test evaluation where loss is needed.
+fn evalWithLoss(
+    device: *const Device,
+    net: *const MnistNet,
+    bufs: *const Buffers,
+    images: []const f32,
+    labels_onehot: []const f32,
+    labels_raw: []const u8,
+    indices: []const u32,
 ) EvalResult {
     const count: u32 = @intCast(indices.len);
     std.debug.assert(count > 0);
@@ -688,37 +877,26 @@ fn evaluateInner(
             bufs.inputs[0].asSlice(),
         );
 
+        Mnist.fillLabelBatch(
+            labels_onehot,
+            idx,
+            bufs.targets[0].asSlice(),
+        );
+
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
         net.forward(device, enc, bufs.inputs[0], current);
-
-        if (compute_loss) {
-            Mnist.fillLabelBatch(
-                labels_onehot,
-                idx,
-                bufs.targets[0].asSlice(),
-            );
-            encodeLoss(
-                device,
-                net,
-                bufs,
-                bufs.targets[0],
-                current,
-                enc,
-            );
-        }
-
+        encodeLoss(
+            device, net, bufs,
+            bufs.targets[0], current, enc,
+        );
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndWait(cmd);
 
-        if (compute_loss) {
-            for (bufs.loss.asSlice()[0..current]) |v| {
-                loss_sum += @as(f64, v);
-            }
+        for (bufs.loss.asSlice()[0..current]) |v| {
+            loss_sum += @as(f64, v);
         }
 
-        // CPU argmax over raw logits (monotonically
-        // equivalent to softmax argmax).
         correct += countCorrect(
             net.getOutput().asSlice(),
             labels_raw,
@@ -731,15 +909,10 @@ fn evaluateInner(
 
     const n: f64 = @floatFromInt(count);
     const c: f64 = @floatFromInt(correct);
-    const mean_loss: f32 = if (compute_loss)
-        @floatCast(loss_sum / n)
-    else
-        0.0;
-
     return .{
         .correct = correct,
         .total = count,
-        .mean_loss = mean_loss,
+        .mean_loss = @floatCast(loss_sum / n),
         .accuracy_pct = c / n * 100.0,
     };
 }
