@@ -1027,6 +1027,86 @@ kernel void forward_fused_infer_3layer(
     }
 }
 
+/// Hardcoded-offset variant: eliminates the setBytes call for
+/// FusedOffsets, saving 1 Obj-C message send (~15 us) per
+/// inference.  Offsets are baked in as constexpr because the
+/// kernel is already architecture-specific (fixed dimensions).
+///
+/// Buffer layout (only 3 bindings, no buffer(3)):
+///   buffer(0): input [784]
+///   buffer(1): params [109386] — full param buffer
+///   buffer(2): output [10] — final logits
+///
+/// Offsets derived from MNIST layout: each layer's weights are
+/// followed immediately by its biases in the flat param buffer.
+///   Layer 0: W0[784×128] at 0, B0[128] at 100352
+///   Layer 1: W1[128×64]  at 100480, B1[64] at 108672
+///   Layer 2: W2[64×10]   at 108736, B2[10] at 109376
+kernel void forward_fused_infer_3layer_v2(
+    device const float* input    [[buffer(0)]],
+    device const float* params   [[buffer(1)]],
+    device float*       output   [[buffer(2)]],
+    uint tid                     [[thread_index_in_threadgroup]])
+{
+    // Layer dimensions (comptime-known architecture).
+    constexpr uint IN0  = 784;
+    constexpr uint OUT0 = 128;
+    constexpr uint OUT1 = 64;
+    constexpr uint OUT2 = 10;
+
+    // Hardcoded offsets into the flat param buffer.
+    // Matches NetworkLayout for 784→128→64→10.
+    constexpr uint W0_OFF = 0;
+    constexpr uint B0_OFF = 100352;   // 784 * 128
+    constexpr uint W1_OFF = 100480;   // 100352 + 128
+    constexpr uint B1_OFF = 108672;   // 100480 + 128*64
+    constexpr uint W2_OFF = 108736;   // 108672 + 64
+    constexpr uint B2_OFF = 109376;   // 108736 + 64*10
+
+    threadgroup float act0[OUT0];
+    threadgroup float act1[OUT1];
+
+    // ---- Layer 0: 784 → 128, ReLU ----
+    {
+        device const float* W0 = params + W0_OFF;
+        device const float* B0 = params + B0_OFF;
+
+        float sum = B0[tid];
+        for (uint k = 0; k < IN0; k++) {
+            sum += input[k] * W0[k * OUT0 + tid];
+        }
+        act0[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 1: 128 → 64, ReLU ----
+    if (tid < OUT1) {
+        device const float* W1 = params + W1_OFF;
+        device const float* B1 = params + B1_OFF;
+
+        float sum = B1[tid];
+        for (uint k = 0; k < OUT0; k++) {
+            sum += act0[k] * W1[k * OUT1 + tid];
+        }
+        act1[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 2: 64 → 10, none ----
+    if (tid < OUT2) {
+        device const float* W2 = params + W2_OFF;
+        device const float* B2 = params + B2_OFF;
+
+        float sum = B2[tid];
+        for (uint k = 0; k < OUT1; k++) {
+            sum += act1[k] * W2[k * OUT2 + tid];
+        }
+        output[tid] = sum;
+    }
+}
+
 // ============================================================================
 // Adam parameter update
 // ============================================================================

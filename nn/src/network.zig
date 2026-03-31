@@ -450,15 +450,11 @@ pub fn Network(
         ///
         /// Writes final output to post_activations[last],
         /// readable via getOutput().asSlice().
-        pub fn forwardInferFused(
-            self: *const Self,
-            device: *const Device,
-            encoder: objc.Object,
-            input: Buffer,
-        ) void {
+        /// Comptime validation that the v2 fused kernel's
+        /// hardcoded offsets match the layout.  Fires at
+        /// compile time if the architecture changes.
+        fn assertFusedV2Offsets() void {
             comptime {
-                // This kernel is architecture-specific:
-                // exactly 3 layers, ReLU/ReLU/none.
                 std.debug.assert(Layout.num_layers == 3);
                 std.debug.assert(
                     Layout.layers[0].act == .relu,
@@ -469,7 +465,38 @@ pub fn Network(
                 std.debug.assert(
                     Layout.layers[2].act == .none,
                 );
+                std.debug.assert(
+                    Layout.weight_offsets[0] == 0,
+                );
+                std.debug.assert(
+                    Layout.bias_offsets[0] == 100352,
+                );
+                std.debug.assert(
+                    Layout.weight_offsets[1] == 100480,
+                );
+                std.debug.assert(
+                    Layout.bias_offsets[1] == 108672,
+                );
+                std.debug.assert(
+                    Layout.weight_offsets[2] == 108736,
+                );
+                std.debug.assert(
+                    Layout.bias_offsets[2] == 109376,
+                );
             }
+        }
+
+        /// Single-dispatch fused 3-layer GPU inference.
+        /// Uses v2 kernel with hardcoded offsets and
+        /// batched buffer binding for minimal Obj-C
+        /// overhead (8 msgSend total vs 16 original).
+        pub fn forwardInferFused(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+        ) void {
+            assertFusedV2Offsets();
             std.debug.assert(
                 input.len >= Layout.input_size,
             );
@@ -477,53 +504,39 @@ pub fn Network(
             const last = Layout.num_layers - 1;
             const out_buf = self.post_activations[last];
 
-            metal.setBuffer(encoder, input, 0);
-            metal.setBuffer(encoder, self.params, 1);
-            metal.setBuffer(encoder, out_buf, 2);
-
-            // Pack all 6 offsets into a single struct to
-            // reduce setBytes calls from 6 to 1, cutting
-            // ~30% of Obj-C message send overhead.
-            const offsets = FusedOffsets{
-                .w0 = Layout.weight_offsets[0],
-                .b0 = Layout.bias_offsets[0],
-                .w1 = Layout.weight_offsets[1],
-                .b1 = Layout.bias_offsets[1],
-                .w2 = Layout.weight_offsets[2],
-                .b2 = Layout.bias_offsets[2],
+            // Batch 3 setBuffer calls into 1 Obj-C msg.
+            const bufs = [_]Buffer{
+                input, self.params, out_buf,
             };
-            metal.setBytes(
-                encoder,
-                FusedOffsets,
-                &offsets,
-                3,
-            );
+            metal.setBuffersBatch(encoder, &bufs, 0);
 
-            // Single dispatch: 1 threadgroup of 128 threads.
-            // 128 matches the largest hidden layer (layer 0).
+            // v2 kernel: hardcoded offsets, no setBytes.
             const pipeline =
-                device.forward_fused_infer_3layer;
+                device.forward_fused_infer_3layer_v2;
             encoder.msgSend(
                 void,
                 "setComputePipelineState:",
                 .{pipeline.state.value},
             );
 
-            const grid = metal.MTLSize{
-                .width = 1,
-                .height = 1,
-                .depth = 1,
-            };
-            const group = metal.MTLSize{
-                .width = 128,
-                .height = 1,
-                .depth = 1,
-            };
+            // 1 threadgroup of 128 threads — matches the
+            // largest hidden layer (layer 0 output).
             encoder.msgSend(
                 void,
                 "dispatchThreadgroups:" ++
                     "threadsPerThreadgroup:",
-                .{ grid, group },
+                .{
+                    metal.MTLSize{
+                        .width = 1,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                    metal.MTLSize{
+                        .width = 128,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                },
             );
         }
 
@@ -2066,69 +2079,28 @@ pub fn Network(
                 std.debug.assert(out_size > 0);
             }
 
-            const k_main = (in_size / 4) * 4;
+            // Unroll by 8: halves k-loop iterations vs
+            // unroll-by-4, amortising v-loop overhead.
+            // All MNIST layers divide by 8: 784/8=98,
+            // 128/8=16, 64/8=8.
+            const k_main8 = (in_size / 8) * 8;
             var k: u32 = 0;
 
-            // Unrolled-by-4 main loop.  Runtime v-loop
-            // reduces code bloat (19KB→<4KB for layer 0)
-            // while keeping SIMD accumulators in registers.
-            while (k < k_main) : (k += 4) {
-                const x0: @Vector(VEC, f32) =
-                    @splat(in_row[k]);
-                const x1: @Vector(VEC, f32) =
-                    @splat(in_row[k + 1]);
-                const x2: @Vector(VEC, f32) =
-                    @splat(in_row[k + 2]);
-                const x3: @Vector(VEC, f32) =
-                    @splat(in_row[k + 3]);
-
-                // Runtime loop over vector accumulators.
-                // Zig still uses SIMD for @Vector ops;
-                // the loop just means one copy of the body
-                // instead of vc copies.
-                var v: u32 = 0;
-                while (v < vc) : (v += 1) {
-                    const o = v * VEC;
-                    const base0 = @as(usize, k) *
-                        out_size + o;
-                    const base1 = @as(usize, k + 1) *
-                        out_size + o;
-                    const base2 = @as(usize, k + 2) *
-                        out_size + o;
-                    const base3 = @as(usize, k + 3) *
-                        out_size + o;
-                    const w0: @Vector(VEC, f32) =
-                        weights[base0..][0..VEC].*;
-                    const w1: @Vector(VEC, f32) =
-                        weights[base1..][0..VEC].*;
-                    const w2: @Vector(VEC, f32) =
-                        weights[base2..][0..VEC].*;
-                    const w3: @Vector(VEC, f32) =
-                        weights[base3..][0..VEC].*;
-                    accum[v] += x0 * w0 + x1 * w1 +
-                        x2 * w2 + x3 * w3;
-                }
-
-                if (vt > 0) {
-                    const o = vc * VEC;
-                    inline for (0..vt) |t| {
-                        tail_accum[t] +=
-                            in_row[k] *
-                            weights[k * out_size + o + t] +
-                            in_row[k + 1] *
-                            weights[(k + 1) * out_size +
-                                o + t] +
-                            in_row[k + 2] *
-                            weights[(k + 2) * out_size +
-                                o + t] +
-                            in_row[k + 3] *
-                            weights[(k + 3) * out_size +
-                                o + t];
-                    }
-                }
+            while (k < k_main8) : (k += 8) {
+                cpuMknInner8(
+                    VEC,
+                    out_size,
+                    vc,
+                    vt,
+                    in_row,
+                    weights,
+                    accum,
+                    tail_accum,
+                    k,
+                );
             }
 
-            // Remainder (0-3 elements).
+            // Remainder (0-7 elements, one at a time).
             while (k < in_size) : (k += 1) {
                 const x_k: @Vector(VEC, f32) =
                     @splat(in_row[k]);
@@ -2151,6 +2123,120 @@ pub fn Network(
                             w_row[o + t];
                     }
                 }
+            }
+        }
+
+        /// Inner body for 8-element k-unroll.  Extracted
+        /// per Rule 20 (hot loop with primitive args) to
+        /// help the compiler keep accumulators in regs.
+        fn cpuMknInner8(
+            comptime VEC: u32,
+            comptime out_size: u32,
+            comptime vc: u32,
+            comptime vt: u32,
+            in_row: anytype,
+            weights: []const f32,
+            accum: *[vc]@Vector(VEC, f32),
+            tail_accum: *[vt]f32,
+            k: u32,
+        ) void {
+            comptime {
+                std.debug.assert(VEC > 0);
+                std.debug.assert(out_size > 0);
+            }
+
+            // Broadcast 8 input scalars to SIMD vectors.
+            const x0: @Vector(VEC, f32) =
+                @splat(in_row[k]);
+            const x1: @Vector(VEC, f32) =
+                @splat(in_row[k + 1]);
+            const x2: @Vector(VEC, f32) =
+                @splat(in_row[k + 2]);
+            const x3: @Vector(VEC, f32) =
+                @splat(in_row[k + 3]);
+            const x4: @Vector(VEC, f32) =
+                @splat(in_row[k + 4]);
+            const x5: @Vector(VEC, f32) =
+                @splat(in_row[k + 5]);
+            const x6: @Vector(VEC, f32) =
+                @splat(in_row[k + 6]);
+            const x7: @Vector(VEC, f32) =
+                @splat(in_row[k + 7]);
+
+            // Runtime v-loop: one copy of the body,
+            // compiler uses SIMD for @Vector operations.
+            var v: u32 = 0;
+            while (v < vc) : (v += 1) {
+                const o = v * VEC;
+                const b = @as(usize, k) * out_size + o;
+                const s = out_size;
+                const w0: @Vector(VEC, f32) =
+                    weights[b ..][0..VEC].*;
+                const w1: @Vector(VEC, f32) =
+                    weights[b + s ..][0..VEC].*;
+                const w2: @Vector(VEC, f32) =
+                    weights[b + 2 * s ..][0..VEC].*;
+                const w3: @Vector(VEC, f32) =
+                    weights[b + 3 * s ..][0..VEC].*;
+                const w4: @Vector(VEC, f32) =
+                    weights[b + 4 * s ..][0..VEC].*;
+                const w5: @Vector(VEC, f32) =
+                    weights[b + 5 * s ..][0..VEC].*;
+                const w6: @Vector(VEC, f32) =
+                    weights[b + 6 * s ..][0..VEC].*;
+                const w7: @Vector(VEC, f32) =
+                    weights[b + 7 * s ..][0..VEC].*;
+                accum[v] += x0 * w0 + x1 * w1 +
+                    x2 * w2 + x3 * w3 +
+                    x4 * w4 + x5 * w5 +
+                    x6 * w6 + x7 * w7;
+            }
+
+            if (vt > 0) {
+                cpuMknTail8(
+                    out_size, vc, VEC, vt,
+                    in_row, weights, tail_accum, k,
+                );
+            }
+        }
+
+        /// Scalar tail for the 8-element k-unroll.
+        /// Handles out_size % VEC remaining elements.
+        fn cpuMknTail8(
+            comptime out_size: u32,
+            comptime vc: u32,
+            comptime VEC: u32,
+            comptime vt: u32,
+            in_row: anytype,
+            weights: []const f32,
+            tail_accum: *[vt]f32,
+            k: u32,
+        ) void {
+            comptime {
+                std.debug.assert(vt > 0);
+                std.debug.assert(out_size > 0);
+            }
+
+            const o = vc * VEC;
+            inline for (0..vt) |t| {
+                const b = @as(usize, k) *
+                    out_size + o + t;
+                const s = out_size;
+                tail_accum[t] +=
+                    in_row[k] * weights[b] +
+                    in_row[k + 1] * weights[b + s] +
+                    in_row[k + 2] *
+                    weights[b + 2 * s] +
+                    in_row[k + 3] *
+                    weights[b + 3 * s] +
+                    in_row[k + 4] *
+                    weights[b + 4 * s] +
+                    in_row[k + 5] *
+                    weights[b + 5 * s] +
+                    in_row[k + 6] *
+                    weights[b + 6 * s] +
+                    in_row[k + 7] *
+                    weights[b + 7 * s];
             }
         }
 

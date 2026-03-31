@@ -417,6 +417,10 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "forward_fused_infer_3layer",
         .shader_name = "forward_fused_infer_3layer",
     },
+    .{
+        .field_name = "forward_fused_infer_3layer_v2",
+        .shader_name = "forward_fused_infer_3layer_v2",
+    },
 };
 
 // ============================================================================
@@ -460,6 +464,7 @@ pub const Device = struct {
     bias_grad_sgd: ComputePipeline,
     weight_grad_sgd: ComputePipeline,
     forward_fused_infer_3layer: ComputePipeline,
+    forward_fused_infer_3layer_v2: ComputePipeline,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(
@@ -572,6 +577,25 @@ pub const Device = struct {
         return self.command_queue.msgSend(
             objc.Object,
             "commandBuffer",
+            .{},
+        );
+    }
+
+    /// Begin a command buffer that skips retain/release on
+    /// bound resources.  The caller MUST ensure all buffers
+    /// and pipeline states outlive the command buffer.  Saves
+    /// ~6 retain/release Obj-C calls per inference dispatch,
+    /// which matters for single-sample latency where Metal
+    /// API overhead dominates GPU compute time.
+    pub fn beginCommandBufferUnretained(
+        self: *const Device,
+    ) objc.Object {
+        std.debug.assert(
+            self.command_queue.value != null,
+        );
+        return self.command_queue.msgSend(
+            objc.Object,
+            "commandBufferWithUnretainedReferences",
             .{},
         );
     }
@@ -780,6 +804,50 @@ pub fn setBufferWithOffset(
         offset_bytes,
         @as(c_ulong, index),
     });
+}
+
+/// Bind up to 4 Metal buffers in one Obj-C message send using
+/// setBuffers:offsets:withRange:.  Saves N-1 message sends
+/// compared to N individual setBuffer calls (~15 us each).
+/// All buffers are bound at consecutive indices starting from
+/// `start_index` with zero byte offset.
+pub fn setBuffersBatch(
+    encoder: objc.Object,
+    buffers: []const Buffer,
+    start_index: u32,
+) void {
+    std.debug.assert(buffers.len > 0);
+    std.debug.assert(buffers.len <= 4);
+    std.debug.assert(
+        start_index + buffers.len - 1 <= MAX_BUFFER_INDEX,
+    );
+
+    // Build C arrays for the batch call.
+    var raw_ptrs: [4]?*anyopaque = .{
+        null, null, null, null,
+    };
+    var offsets: [4]c_ulong = .{ 0, 0, 0, 0 };
+    for (buffers, 0..) |buf, i| {
+        std.debug.assert(buf.len > 0);
+        raw_ptrs[i] = buf.obj.value;
+        offsets[i] = 0;
+    }
+
+    // NSRange { location, length }.
+    const range: [2]c_ulong = .{
+        @as(c_ulong, start_index),
+        @as(c_ulong, buffers.len),
+    };
+
+    encoder.msgSend(
+        void,
+        "setBuffers:offsets:withRange:",
+        .{
+            @as(*const anyopaque, @ptrCast(&raw_ptrs)),
+            @as(*const anyopaque, @ptrCast(&offsets)),
+            @as([2]c_ulong, range),
+        },
+    );
 }
 
 /// Bind raw bytes (e.g. a uint or float constant) to a compute

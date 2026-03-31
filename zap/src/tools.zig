@@ -402,7 +402,8 @@ pub fn sortStrings(items: [][]const u8) void {
 // ============================================================
 
 pub fn isBenchmarkFile(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "mnist_") and
+    return (std.mem.startsWith(u8, name, "mnist_") or
+        std.mem.startsWith(u8, name, "inference_")) and
         std.mem.endsWith(u8, name, ".json");
 }
 

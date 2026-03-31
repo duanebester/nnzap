@@ -199,10 +199,11 @@ fn warmup(
     std.debug.assert(input.len >= Layout.input_size);
     std.debug.assert(WARMUP_ITERS > 0);
 
-    // Warm fused single-sample path.
+    // Warm fused single-sample path (unretained to match
+    // the measurement path).
     var i: u32 = 0;
     while (i < WARMUP_ITERS) : (i += 1) {
-        const cmd = device.beginCommandBuffer();
+        const cmd = device.beginCommandBufferUnretained();
         const enc = device.beginCompute(cmd);
         net.forwardInferFused(device, enc, input);
         enc.msgSend(void, "endEncoding", .{});
@@ -305,7 +306,10 @@ fn benchGpuSingle(
     while (i < GPU_LATENCY_ITERS) : (i += 1) {
         const start = std.time.nanoTimestamp();
 
-        const cmd = device.beginCommandBuffer();
+        // Use unretained references to skip retain/release
+        // on bound buffers — safe because all network
+        // buffers outlive every command buffer.
+        const cmd = device.beginCommandBufferUnretained();
         const enc = device.beginCompute(cmd);
         net.forwardInferFused(device, enc, input);
         enc.msgSend(void, "endEncoding", .{});
