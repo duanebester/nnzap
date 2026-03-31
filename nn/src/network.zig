@@ -13,6 +13,53 @@ const layout = @import("layout.zig");
 const Buffer = metal.Buffer;
 const Device = metal.Device;
 
+// CBLAS constants for cblas_sgemm (Apple Accelerate).
+const CBLAS_ROW_MAJOR: c_int = 101;
+const CBLAS_NO_TRANS: c_int = 111;
+
+/// Function pointer type matching cblas_sgemm signature.
+const CblasSgemmFn = *const fn (
+    order: c_int,
+    transa: c_int,
+    transb: c_int,
+    m: c_int,
+    n: c_int,
+    k: c_int,
+    alpha: f32,
+    a: [*]const f32,
+    lda: c_int,
+    b: [*]const f32,
+    ldb: c_int,
+    beta: f32,
+    c: [*]f32,
+    ldc: c_int,
+) callconv(.c) void;
+
+/// Lazily-loaded cblas_sgemm from Apple's Accelerate
+/// framework.  Uses dlopen/dlsym via std.DynLib so we
+/// don't need Accelerate linked at build time.
+var cblas_sgemm_fn: ?CblasSgemmFn = null;
+var accelerate_lib: ?std.DynLib = null;
+
+/// Load cblas_sgemm from Accelerate.framework once.
+/// Returns null if Accelerate is unavailable (fallback
+/// to SIMD path).
+fn getCblasSgemm() ?CblasSgemmFn {
+    // Fast path: already resolved.
+    if (cblas_sgemm_fn) |f| return f;
+
+    const path = "/System/Library/Frameworks/" ++
+        "Accelerate.framework/Accelerate";
+    accelerate_lib = std.DynLib.open(path) catch
+        return null;
+    const sym = accelerate_lib.?.lookup(
+        CblasSgemmFn,
+        "cblas_sgemm",
+    );
+    cblas_sgemm_fn = sym;
+    return sym;
+}
+
 /// Absolute upper bound on batch size across all networks.
 const MAX_BATCH_SIZE: u32 = 4096;
 
@@ -2391,13 +2438,29 @@ pub fn Network(
                     @as(usize, batch_size) * out_size,
             );
 
+            // Try AMX path via Apple Accelerate.
+            if (getCblasSgemm()) |sgemm| {
+                cpuAccelMatmulBiasAct(
+                    in_size,
+                    out_size,
+                    act,
+                    sgemm,
+                    input,
+                    weights,
+                    biases,
+                    output,
+                    batch_size,
+                );
+                return;
+            }
+
+            // Fallback: hand-rolled SIMD path.
             for (0..batch_size) |m| {
                 const in_row =
                     input[m * in_size ..][0..in_size];
                 const out_row =
                     output[m * out_size ..][0..out_size];
 
-                // Delegate to the SIMD inner kernel.
                 cpuMatmulRow(
                     in_size,
                     out_size,
@@ -2410,6 +2473,55 @@ pub fn Network(
             }
         }
 
+        /// Accelerate/AMX path: cblas_sgemm for matmul,
+        /// then fused bias+activation in Zig.  The AMX
+        /// coprocessor is ~3x faster than NEON SIMD for
+        /// these matrix sizes.
+        fn cpuAccelMatmulBiasAct(
+            comptime in_size: u32,
+            comptime out_size: u32,
+            comptime act: layout.Activation,
+            sgemm: CblasSgemmFn,
+            input: []const f32,
+            weights: []const f32,
+            biases: []const f32,
+            output: []f32,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(biases.len >= out_size);
+
+            // output = input * weights
+            // input:  [batch_size, in_size]  row-major
+            // weights: [in_size, out_size]   row-major
+            // output: [batch_size, out_size] row-major
+            sgemm(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                @intCast(batch_size),
+                @intCast(out_size),
+                @intCast(in_size),
+                1.0,
+                input.ptr,
+                @intCast(in_size),
+                weights.ptr,
+                @intCast(out_size),
+                0.0,
+                output.ptr,
+                @intCast(out_size),
+            );
+
+            // Fuse bias + activation in Zig.
+            cpuBiasAct(
+                out_size,
+                act,
+                biases,
+                output,
+                batch_size,
+            );
+        }
+
         /// SIMD inner kernel: one output row.
         /// Extracted per Rule 20 (hot loop extraction)
         /// so the compiler sees only primitive/slice args.
@@ -2418,6 +2530,53 @@ pub fn Network(
         /// W[k*N..][0..N]) using @Vector, then applies
         /// the activation function.
         /// SIMD-vectorised single-row matmul with k-loop
+        /// Apply bias + activation to output buffer that
+        /// already contains matmul results (from sgemm).
+        /// Uses SIMD vectors for the vectorisable part.
+        fn cpuBiasAct(
+            comptime out_size: u32,
+            comptime act: layout.Activation,
+            biases: []const f32,
+            output: []f32,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(biases.len >= out_size);
+            std.debug.assert(
+                output.len >=
+                    @as(usize, batch_size) * out_size,
+            );
+
+            const VEC = comptime if (out_size % 16 == 0)
+                16
+            else if (out_size % 8 == 0)
+                8
+            else if (out_size % 4 == 0)
+                4
+            else if (out_size % 2 == 0)
+                2
+            else
+                1;
+            const vc = out_size / VEC;
+
+            for (0..batch_size) |m| {
+                const row = output[m * out_size ..];
+                inline for (0..vc) |v| {
+                    const off = v * VEC;
+                    var val: @Vector(VEC, f32) =
+                        row[off..][0..VEC].*;
+                    const bias: @Vector(VEC, f32) =
+                        biases[off..][0..VEC].*;
+                    val += bias;
+                    if (act == .relu) {
+                        const zero: @Vector(VEC, f32) =
+                            @splat(0.0);
+                        val = @max(val, zero);
+                    }
+                    row[off..][0..VEC].* = val;
+                }
+            }
+        }
+
         /// unrolled by 4 for better ILP.  Accumulates bias
         /// + W*x using @Vector(VEC, f32) chunks, then
         /// applies activation on write.  Extracted as a

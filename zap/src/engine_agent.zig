@@ -295,45 +295,49 @@ const SYSTEM_PROMPT =
     \\Architecture: 784 -> 128 (relu) -> 64 (relu) -> 10.
     \\109,386 parameters.
     \\
-    \\GPU path (forwardInfer in network.zig):
-    \\  Uses matmul_bias_relu_infer kernel (tiled 16x16,
-    \\  no pre_act write) for ReLU layers, matmul_bias
-    \\  for the output layer.  One command buffer + one
-    \\  encoder + commitAndWait per single-sample call.
-    \\  Baseline: ~280 us p50 single-sample, ~850k img/s
+    \\GPU path:
+    \\  Fused 3-layer single-dispatch kernel for batch=1,
+    \\  mega-dispatch (4096 threadgroups) for batched.
+    \\  Current: ~260 us p50 single-sample, ~1.6M img/s
     \\  batched.
     \\
     \\CPU path (forwardCPU in network.zig):
-    \\  Pure Zig cpuMatmulBiasAct — naive triple loop
-    \\  (m, n, k order), no SIMD, no blocking, no cache
-    \\  optimisation.  Reads weights from unified memory.
-    \\  Baseline: ~830 us p50 single-sample.
+    \\  SIMD-vectorized mkn loop order with @Vector,
+    \\  comptime-adaptive VEC width (16 for large layers,
+    \\  2 for small), k-unroll-by-8, chained @mulAdd.
+    \\  Current: ~21 us p50 single-sample.
+    \\
+    \\Reference comparison (same hardware):
+    \\  MLX (numpy/Accelerate): 7 us CPU single-sample.
+    \\  The 3x gap is because MLX uses Apple's Accelerate
+    \\  framework which dispatches to the AMX coprocessor
+    \\  — dedicated matrix multiply hardware on Apple
+    \\  Silicon that is much faster than NEON SIMD.
     \\
     \\## Optimisation phases (priority order)
     \\
-    \\Phase 1 — CPU forward pass (highest headroom):
-    \\  Loop reordering (ikj for row-major cache hits).
-    \\  @Vector SIMD for the inner dot product.
-    \\  Blocking/tiling for L1 cache (e.g. 64x64 tiles).
-    \\  Fuse bias+relu into the matmul write loop.
-    \\  Comptime-unroll for the specific layer dimensions
-    \\  (784x128, 128x64, 64x10 — all known at comptime).
-    \\  Prefetch with @prefetch hints.
+    \\Phase 1 — CPU forward pass via Accelerate/AMX:
+    \\  The biggest remaining win. Apple's Accelerate
+    \\  framework provides cblas_sgemm which dispatches
+    \\  to the AMX coprocessor — dedicated matrix multiply
+    \\  hardware ~3x faster than NEON SIMD for these sizes.
+    \\  Accelerate is a macOS system framework (same as
+    \\  Metal, Foundation) — not an external dependency.
+    \\  Link Accelerate in build.zig, extern-declare
+    \\  cblas_sgemm, call it from cpuMatmulBiasAct for
+    \\  the matmul, then fuse bias+activation in Zig.
+    \\  Target: ~7 us CPU single-sample (matching MLX).
     \\
     \\Phase 2 — GPU single-sample latency:
-    \\  Reduce Metal dispatch overhead for batch=1.
-    \\  Smaller threadgroup sizes (8x8) for tiny matrices.
-    \\  commandBufferWithUnretainedReferences (less
-    \\  retain/release overhead).
-    \\  Pre-encoded command buffers (encode once, replay).
-    \\  Fused all-layers kernel (one dispatch for entire
-    \\  forward pass — risky but high ceiling).
+    \\  Metal API overhead dominates (~200+ us of the
+    \\  ~260 us total). Indirect command buffers,
+    \\  MTLEvent-based signalling, or reducing Obj-C
+    \\  message sends are the remaining levers.
     \\
     \\Phase 3 — GPU batched throughput:
-    \\  Encode multiple inferences per command buffer.
-    \\  Tune batch size and threadgroup dimensions.
-    \\  Register-tiled matmul (1x2, 2x2 output per thread).
-    \\  Async commit with completion handlers.
+    \\  Already at 1.6M img/s via mega-dispatch.
+    \\  Further gains from register-tiled matmul in the
+    \\  fused kernel, async commit, or half-precision.
     \\
     \\Phase 4 — Cross-cutting:
     \\  Find the GPU/CPU crossover batch size.
