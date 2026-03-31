@@ -2107,8 +2107,7 @@ pub fn Network(
                 const w_row =
                     weights[k * out_size ..];
 
-                var v: u32 = 0;
-                while (v < vc) : (v += 1) {
+                inline for (0..vc) |v| {
                     const o = v * VEC;
                     const wv: @Vector(VEC, f32) =
                         w_row[o..][0..VEC].*;
@@ -2145,51 +2144,32 @@ pub fn Network(
                 std.debug.assert(out_size > 0);
             }
 
-            // Broadcast 8 input scalars to SIMD vectors.
-            const x0: @Vector(VEC, f32) =
-                @splat(in_row[k]);
-            const x1: @Vector(VEC, f32) =
-                @splat(in_row[k + 1]);
-            const x2: @Vector(VEC, f32) =
-                @splat(in_row[k + 2]);
-            const x3: @Vector(VEC, f32) =
-                @splat(in_row[k + 3]);
-            const x4: @Vector(VEC, f32) =
-                @splat(in_row[k + 4]);
-            const x5: @Vector(VEC, f32) =
-                @splat(in_row[k + 5]);
-            const x6: @Vector(VEC, f32) =
-                @splat(in_row[k + 6]);
-            const x7: @Vector(VEC, f32) =
-                @splat(in_row[k + 7]);
+            const V = @Vector(VEC, f32);
+            // Broadcast 8 input scalars.
+            const x0: V = @splat(in_row[k]);
+            const x1: V = @splat(in_row[k + 1]);
+            const x2: V = @splat(in_row[k + 2]);
+            const x3: V = @splat(in_row[k + 3]);
+            const x4: V = @splat(in_row[k + 4]);
+            const x5: V = @splat(in_row[k + 5]);
+            const x6: V = @splat(in_row[k + 6]);
+            const x7: V = @splat(in_row[k + 7]);
 
-            // Runtime v-loop: one copy of the body,
-            // compiler uses SIMD for @Vector operations.
-            var v: u32 = 0;
-            while (v < vc) : (v += 1) {
-                const o = v * VEC;
-                const b = @as(usize, k) * out_size + o;
-                const s = out_size;
-                const w0: @Vector(VEC, f32) =
-                    weights[b ..][0..VEC].*;
-                const w1: @Vector(VEC, f32) =
-                    weights[b + s ..][0..VEC].*;
-                const w2: @Vector(VEC, f32) =
-                    weights[b + 2 * s ..][0..VEC].*;
-                const w3: @Vector(VEC, f32) =
-                    weights[b + 3 * s ..][0..VEC].*;
-                const w4: @Vector(VEC, f32) =
-                    weights[b + 4 * s ..][0..VEC].*;
-                const w5: @Vector(VEC, f32) =
-                    weights[b + 5 * s ..][0..VEC].*;
-                const w6: @Vector(VEC, f32) =
-                    weights[b + 6 * s ..][0..VEC].*;
-                const w7: @Vector(VEC, f32) =
-                    weights[b + 7 * s ..][0..VEC].*;
-                accum[v] += x0 * w0 + x1 * w1 +
-                    x2 * w2 + x3 * w3 +
-                    x4 * w4 + x5 * w5 +
-                    x6 * w6 + x7 * w7;
+            // Comptime-unrolled v-loop: each iteration
+            // uses a comptime index for zero loop overhead.
+            // Chained @mulAdd emits FMLA on Apple Silicon.
+            const b0 = @as(usize, k) * out_size;
+            const s = out_size;
+            inline for (0..vc) |v| {
+                const b = b0 + v * VEC;
+                var a = @mulAdd(V, x0, weights[b ..][0..VEC].*, accum[v]);
+                a = @mulAdd(V, x1, weights[b + s ..][0..VEC].*, a);
+                a = @mulAdd(V, x2, weights[b + 2 * s ..][0..VEC].*, a);
+                a = @mulAdd(V, x3, weights[b + 3 * s ..][0..VEC].*, a);
+                a = @mulAdd(V, x4, weights[b + 4 * s ..][0..VEC].*, a);
+                a = @mulAdd(V, x5, weights[b + 5 * s ..][0..VEC].*, a);
+                a = @mulAdd(V, x6, weights[b + 6 * s ..][0..VEC].*, a);
+                accum[v] = @mulAdd(V, x7, weights[b + 7 * s ..][0..VEC].*, a);
             }
 
             if (vt > 0) {
