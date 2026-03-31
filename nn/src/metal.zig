@@ -421,6 +421,18 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "forward_fused_infer_3layer_v2",
         .shader_name = "forward_fused_infer_3layer_v2",
     },
+    .{
+        .field_name = "forward_fused_infer_batched",
+        .shader_name = "forward_fused_infer_batched",
+    },
+    .{
+        .field_name = "matmul_bias_packed",
+        .shader_name = "matmul_bias_packed",
+    },
+    .{
+        .field_name = "matmul_bias_relu_infer_packed",
+        .shader_name = "matmul_bias_relu_infer_packed",
+    },
 };
 
 // ============================================================================
@@ -465,6 +477,9 @@ pub const Device = struct {
     weight_grad_sgd: ComputePipeline,
     forward_fused_infer_3layer: ComputePipeline,
     forward_fused_infer_3layer_v2: ComputePipeline,
+    forward_fused_infer_batched: ComputePipeline,
+    matmul_bias_packed: ComputePipeline,
+    matmul_bias_relu_infer_packed: ComputePipeline,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(
@@ -811,6 +826,55 @@ pub fn setBufferWithOffset(
 /// compared to N individual setBuffer calls (~15 us each).
 /// All buffers are bound at consecutive indices starting from
 /// `start_index` with zero byte offset.
+/// Batch-set buffers with per-buffer byte offsets.
+/// Uses a single setBuffers:offsets:withRange: Obj-C
+/// call instead of N separate setBuffer calls, saving
+/// (N-1) message sends at ~10 us each.
+pub fn setBuffersBatchOffsets(
+    encoder: objc.Object,
+    buffers: []const Buffer,
+    byte_offsets: []const c_ulong,
+    start_index: u32,
+) void {
+    std.debug.assert(buffers.len > 0);
+    std.debug.assert(buffers.len <= 4);
+    std.debug.assert(byte_offsets.len == buffers.len);
+    std.debug.assert(
+        start_index + buffers.len - 1 <= MAX_BUFFER_INDEX,
+    );
+
+    var raw_ptrs: [4]?*anyopaque = .{
+        null, null, null, null,
+    };
+    var offsets: [4]c_ulong = .{ 0, 0, 0, 0 };
+    for (buffers, 0..) |buf, i| {
+        std.debug.assert(buf.len > 0);
+        raw_ptrs[i] = buf.obj.value;
+        offsets[i] = byte_offsets[i];
+    }
+
+    const range: [2]c_ulong = .{
+        @as(c_ulong, start_index),
+        @as(c_ulong, buffers.len),
+    };
+
+    encoder.msgSend(
+        void,
+        "setBuffers:offsets:withRange:",
+        .{
+            @as(
+                *const anyopaque,
+                @ptrCast(&raw_ptrs),
+            ),
+            @as(
+                *const anyopaque,
+                @ptrCast(&offsets),
+            ),
+            @as([2]c_ulong, range),
+        },
+    );
+}
+
 pub fn setBuffersBatch(
     encoder: objc.Object,
     buffers: []const Buffer,

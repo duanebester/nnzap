@@ -359,6 +359,10 @@ pub fn Network(
         /// and one fewer global memory store per ReLU layer.
         /// The result is in post_activations[last], readable
         /// via getOutput().
+        /// Forward pass for inference (GPU batched path).
+        /// Uses packed-dims kernels: 5 Obj-C calls per
+        /// layer instead of 9, reducing Metal API overhead
+        /// by ~44% per dispatch (saves ~4 msgSend × ~10 us).
         pub fn forwardInfer(
             self: *const Self,
             device: *const Device,
@@ -381,9 +385,7 @@ pub fn Network(
                         self.post_activations[i - 1];
 
                 if (Layout.layers[i].act == .relu) {
-                    // Inference-only fused kernel: skips
-                    // pre_act write, one fewer buffer bind.
-                    encodeMatmulBiasReluInfer(
+                    encodePackedReluInfer(
                         Layout.layers[i].in,
                         Layout.layers[i].out,
                         Layout.weight_offsets[i],
@@ -396,9 +398,7 @@ pub fn Network(
                         batch_size,
                     );
                 } else if (Layout.layers[i].act == .none) {
-                    // matmul_bias already skips pre_act —
-                    // no inference variant needed.
-                    encodeMatmulBias(
+                    encodePackedBias(
                         Layout.layers[i].in,
                         Layout.layers[i].out,
                         Layout.weight_offsets[i],
@@ -411,8 +411,8 @@ pub fn Network(
                         batch_size,
                     );
                 } else {
-                    // Tanh/sigmoid: separate dispatches.
-                    // pre_activations used as scratch only.
+                    // Tanh/sigmoid: use unpacked path
+                    // (packed variant not needed here).
                     encodeMatmulBias(
                         Layout.layers[i].in,
                         Layout.layers[i].out,
@@ -528,6 +528,67 @@ pub fn Network(
                 .{
                     metal.MTLSize{
                         .width = 1,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                    metal.MTLSize{
+                        .width = 128,
+                        .height = 1,
+                        .depth = 1,
+                    },
+                },
+            );
+        }
+
+        /// Fused 3-layer batched inference: one dispatch
+        /// per forward pass instead of 3 (one per layer).
+        /// Each threadgroup processes one sample from the
+        /// batch independently, using threadgroup memory
+        /// for intermediate activations.
+        ///
+        /// Reduces Obj-C dispatch overhead from ~15 calls
+        /// per forward (3 layers × 5 calls) to ~3 calls.
+        pub fn forwardInferFusedBatched(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+            batch_size: u32,
+        ) void {
+            assertFusedV2Offsets();
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(batch_size <= max_batch_size);
+            std.debug.assert(
+                input.len >=
+                    @as(usize, batch_size) *
+                        Layout.input_size,
+            );
+
+            const last = Layout.num_layers - 1;
+            const out_buf = self.post_activations[last];
+
+            // Batch 3 setBuffer calls into 1 Obj-C msg.
+            const bufs = [_]Buffer{
+                input, self.params, out_buf,
+            };
+            metal.setBuffersBatch(encoder, &bufs, 0);
+
+            const pipeline =
+                device.forward_fused_infer_batched;
+            encoder.msgSend(
+                void,
+                "setComputePipelineState:",
+                .{pipeline.state.value},
+            );
+
+            // 1 threadgroup per sample, 128 threads each.
+            encoder.msgSend(
+                void,
+                "dispatchThreadgroups:" ++
+                    "threadsPerThreadgroup:",
+                .{
+                    metal.MTLSize{
+                        .width = batch_size,
                         .height = 1,
                         .depth = 1,
                     },
@@ -1619,6 +1680,120 @@ pub fn Network(
             );
             // Barrier managed by caller (forward/backward)
             // to allow batching independent dispatches.
+        }
+
+        // ====================================================
+        // Packed-dims inference encode (fewer Obj-C calls)
+        // ====================================================
+
+        /// Packed M, K, N struct matching Metal's MatmulDims.
+        /// One setBytes call replaces three, saving ~20 us
+        /// of Obj-C msgSend overhead per dispatch.
+        const MatmulDims = extern struct {
+            M: u32,
+            K: u32,
+            N: u32,
+        };
+
+        /// Encode matmul+bias+relu for inference with packed
+        /// dims. Uses setBuffersBatchOffsets to bind 3 buffers
+        /// in 1 call, and MatmulDims struct for 1 setBytes
+        /// instead of 3.  Total: 5 Obj-C calls vs 9.
+        fn encodePackedReluInfer(
+            comptime in_size: u32,
+            comptime out_size: u32,
+            comptime weight_offset: u32,
+            comptime bias_offset: u32,
+            device: *const Device,
+            encoder: objc.Object,
+            layer_input: Buffer,
+            params: Buffer,
+            post_act: Buffer,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(params.len > weight_offset);
+
+            // Batch 3 buffer bindings into 1 Obj-C call.
+            const bufs = [_]Buffer{
+                layer_input, params, post_act,
+            };
+            const w_bytes: c_ulong =
+                @as(c_ulong, weight_offset) * @sizeOf(f32);
+            const offsets = [_]c_ulong{ 0, w_bytes, 0 };
+            metal.setBuffersBatchOffsets(
+                encoder, &bufs, &offsets, 0,
+            );
+
+            // Pack M, K, N into 1 setBytes call.
+            const dims = MatmulDims{
+                .M = batch_size,
+                .K = in_size,
+                .N = out_size,
+            };
+            metal.setBytes(
+                encoder, MatmulDims, &dims, 3,
+            );
+
+            // Bias at buffer(4) for packed variant.
+            metal.setBufferWithOffset(
+                encoder, params, bias_offset, 4,
+            );
+
+            device.dispatch2D(
+                encoder,
+                device.matmul_bias_relu_infer_packed,
+                out_size,
+                batch_size,
+            );
+        }
+
+        /// Encode matmul+bias (no activation) with packed
+        /// dims. Same call reduction as encodePackedReluInfer.
+        fn encodePackedBias(
+            comptime in_size: u32,
+            comptime out_size: u32,
+            comptime weight_offset: u32,
+            comptime bias_offset: u32,
+            device: *const Device,
+            encoder: objc.Object,
+            layer_input: Buffer,
+            params: Buffer,
+            output: Buffer,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(params.len > weight_offset);
+
+            const bufs = [_]Buffer{
+                layer_input, params, output,
+            };
+            const w_bytes: c_ulong =
+                @as(c_ulong, weight_offset) * @sizeOf(f32);
+            const offsets = [_]c_ulong{ 0, w_bytes, 0 };
+            metal.setBuffersBatchOffsets(
+                encoder, &bufs, &offsets, 0,
+            );
+
+            const dims = MatmulDims{
+                .M = batch_size,
+                .K = in_size,
+                .N = out_size,
+            };
+            metal.setBytes(
+                encoder, MatmulDims, &dims, 3,
+            );
+
+            metal.setBufferWithOffset(
+                encoder, params, bias_offset, 4,
+            );
+
+            device.dispatch2D(
+                encoder,
+                device.matmul_bias_packed,
+                out_size,
+                batch_size,
+            );
         }
 
         // ====================================================

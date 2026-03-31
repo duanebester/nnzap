@@ -210,12 +210,14 @@ fn warmup(
         device.commitAndWait(cmd);
     }
 
-    // Warm batched path (separate dispatches).
+    // Warm batched path (fused batched kernel).
     i = 0;
     while (i < WARMUP_ITERS / 10) : (i += 1) {
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
-        net.forwardInfer(device, enc, input, 1);
+        net.forwardInferFusedBatched(
+            device, enc, input, BATCH_SIZE,
+        );
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndWait(cmd);
     }
@@ -252,7 +254,7 @@ fn benchGpuBatched(
 
         var g: u32 = 0;
         while (g < group) : (g += 1) {
-            net.forwardInfer(
+            net.forwardInferFusedBatched(
                 device,
                 enc,
                 input,

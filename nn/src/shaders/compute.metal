@@ -286,6 +286,128 @@ kernel void matmul_bias_relu_infer(
 }
 
 // ============================================================================
+// Packed-dims matmul variants (fewer setBytes calls)
+// ============================================================================
+
+/// Packed matrix dimensions for batched inference.
+/// One setBytes call at buffer(3) replaces three separate
+/// calls for M, K, N — saving 2 Obj-C message sends per
+/// dispatch (~20 us at ~10 us each).
+struct MatmulDims {
+    uint M;
+    uint K;
+    uint N;
+};
+
+/// matmul_bias with packed MatmulDims struct.
+/// Buffer layout matches matmul_bias except buffer(3)
+/// is a MatmulDims struct instead of separate M at (3),
+/// K at (4), N at (5).  Bias moved to buffer(4).
+kernel void matmul_bias_packed(
+    device const float* W       [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant MatmulDims& dims   [[buffer(3)]],
+    device const float* bias    [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    threadgroup float tileW[TS * TS];
+    threadgroup float tileX[TS * TS];
+
+    const uint row = gid.y;
+    const uint col = gid.x;
+    const uint M = dims.M;
+    const uint K = dims.K;
+    const uint N = dims.N;
+
+    float sum = 0.0f;
+
+    const uint num_tiles = (K + TS - 1) / TS;
+    for (uint t = 0; t < num_tiles; t++) {
+        const uint w_col = t * TS + lid.x;
+        if (row < M && w_col < K) {
+            tileW[lid.y * TS + lid.x] = W[row * K + w_col];
+        } else {
+            tileW[lid.y * TS + lid.x] = 0.0f;
+        }
+
+        const uint x_row = t * TS + lid.y;
+        if (x_row < K && col < N) {
+            tileX[lid.y * TS + lid.x] = x[x_row * N + col];
+        } else {
+            tileX[lid.y * TS + lid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < TS; i++) {
+            sum += tileW[lid.y * TS + i]
+                 * tileX[i * TS + lid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        out[row * N + col] = sum + bias[col];
+    }
+}
+
+/// matmul_bias_relu_infer with packed MatmulDims struct.
+/// Inference-only: no pre_act write.  Fused ReLU.
+kernel void matmul_bias_relu_infer_packed(
+    device const float* W       [[buffer(0)]],
+    device const float* x       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant MatmulDims& dims   [[buffer(3)]],
+    device const float* bias    [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    threadgroup float tileW[TS * TS];
+    threadgroup float tileX[TS * TS];
+
+    const uint row = gid.y;
+    const uint col = gid.x;
+    const uint M = dims.M;
+    const uint K = dims.K;
+    const uint N = dims.N;
+
+    float sum = 0.0f;
+
+    const uint num_tiles = (K + TS - 1) / TS;
+    for (uint t = 0; t < num_tiles; t++) {
+        const uint w_col = t * TS + lid.x;
+        if (row < M && w_col < K) {
+            tileW[lid.y * TS + lid.x] = W[row * K + w_col];
+        } else {
+            tileW[lid.y * TS + lid.x] = 0.0f;
+        }
+
+        const uint x_row = t * TS + lid.y;
+        if (x_row < K && col < N) {
+            tileX[lid.y * TS + lid.x] = x[x_row * N + col];
+        } else {
+            tileX[lid.y * TS + lid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < TS; i++) {
+            sum += tileW[lid.y * TS + i]
+                 * tileX[i * TS + lid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        out[row * N + col] = max(0.0f, sum + bias[col]);
+    }
+}
+
+// ============================================================================
 // Register-tiled matmul + bias (1×2 output per thread)
 // ============================================================================
 
@@ -1104,6 +1226,89 @@ kernel void forward_fused_infer_3layer_v2(
             sum += act1[k] * W2[k * OUT2 + tid];
         }
         output[tid] = sum;
+    }
+}
+
+// ============================================================================
+// Fused batched inference: 3-layer forward (784→128→64→10)
+// ============================================================================
+
+/// Batched variant of the fused 3-layer inference kernel.
+/// Each threadgroup independently processes one sample from
+/// the batch.  Dispatch with threadgroups = batch_size,
+/// threadsPerThreadgroup = 128.
+///
+/// This reduces per-forward-pass dispatches from 3 (one per
+/// layer) to 1, cutting Obj-C dispatch overhead by ~66%.
+/// Input layout:  input[sample * 784 .. (sample+1) * 784]
+/// Output layout: output[sample * 10 .. (sample+1) * 10]
+kernel void forward_fused_infer_batched(
+    device const float* input    [[buffer(0)]],
+    device const float* params   [[buffer(1)]],
+    device float*       output   [[buffer(2)]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint tgid   [[threadgroup_position_in_grid]])
+{
+    // Layer dimensions (comptime-known architecture).
+    constexpr uint IN0  = 784;
+    constexpr uint OUT0 = 128;
+    constexpr uint OUT1 = 64;
+    constexpr uint OUT2 = 10;
+
+    // Hardcoded offsets into the flat param buffer.
+    constexpr uint W0_OFF = 0;
+    constexpr uint B0_OFF = 100352;
+    constexpr uint W1_OFF = 100480;
+    constexpr uint B1_OFF = 108672;
+    constexpr uint W2_OFF = 108736;
+    constexpr uint B2_OFF = 109376;
+
+    // Per-threadgroup intermediates.
+    threadgroup float act0[OUT0];
+    threadgroup float act1[OUT1];
+
+    // Offset input/output by sample index.
+    device const float* sample_in = input + tgid * IN0;
+    device float* sample_out = output + tgid * OUT2;
+
+    // ---- Layer 0: 784 → 128, ReLU ----
+    {
+        device const float* W0 = params + W0_OFF;
+        device const float* B0 = params + B0_OFF;
+
+        float sum = B0[tid];
+        for (uint k = 0; k < IN0; k++) {
+            sum += sample_in[k] * W0[k * OUT0 + tid];
+        }
+        act0[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 1: 128 → 64, ReLU ----
+    if (tid < OUT1) {
+        device const float* W1 = params + W1_OFF;
+        device const float* B1 = params + B1_OFF;
+
+        float sum = B1[tid];
+        for (uint k = 0; k < OUT0; k++) {
+            sum += act0[k] * W1[k * OUT1 + tid];
+        }
+        act1[tid] = max(0.0f, sum);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer 2: 64 → 10, none ----
+    if (tid < OUT2) {
+        device const float* W2 = params + W2_OFF;
+        device const float* B2 = params + B2_OFF;
+
+        float sum = B2[tid];
+        for (uint k = 0; k < OUT1; k++) {
+            sum += act1[k] * W2[k * OUT2 + tid];
+        }
+        sample_out[tid] = sum;
     }
 }
 
