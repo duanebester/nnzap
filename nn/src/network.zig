@@ -1958,7 +1958,21 @@ pub fn Network(
             biases: *const [out_size]f32,
             out_row: *[out_size]f32,
         ) void {
-            const VEC_LEN = 8;
+            // Pick the widest SIMD width that divides
+            // out_size evenly, capped at 16.  Wider
+            // vectors halve v-loop iterations (128/16=8
+            // vs 128/8=16), reducing loop overhead.
+            // VEC=2 handles out_size=10 with no tail.
+            const VEC_LEN = comptime if (out_size % 16 == 0)
+                16
+            else if (out_size % 8 == 0)
+                8
+            else if (out_size % 4 == 0)
+                4
+            else if (out_size % 2 == 0)
+                2
+            else
+                1;
             const vec_count = out_size / VEC_LEN;
             const vec_tail = out_size % VEC_LEN;
 
@@ -2036,7 +2050,9 @@ pub fn Network(
             const k_main = (in_size / 4) * 4;
             var k: u32 = 0;
 
-            // Unrolled-by-4 main loop.
+            // Unrolled-by-4 main loop.  Runtime v-loop
+            // reduces code bloat (19KB→<4KB for layer 0)
+            // while keeping SIMD accumulators in registers.
             while (k < k_main) : (k += 4) {
                 const x0: @Vector(VEC, f32) =
                     @splat(in_row[k]);
@@ -2047,20 +2063,29 @@ pub fn Network(
                 const x3: @Vector(VEC, f32) =
                     @splat(in_row[k + 3]);
 
-                inline for (0..vc) |v| {
+                // Runtime loop over vector accumulators.
+                // Zig still uses SIMD for @Vector ops;
+                // the loop just means one copy of the body
+                // instead of vc copies.
+                var v: u32 = 0;
+                while (v < vc) : (v += 1) {
                     const o = v * VEC;
+                    const base0 = @as(usize, k) *
+                        out_size + o;
+                    const base1 = @as(usize, k + 1) *
+                        out_size + o;
+                    const base2 = @as(usize, k + 2) *
+                        out_size + o;
+                    const base3 = @as(usize, k + 3) *
+                        out_size + o;
                     const w0: @Vector(VEC, f32) =
-                        weights[(k) * out_size + o ..]
-                            [0..VEC].*;
+                        weights[base0..][0..VEC].*;
                     const w1: @Vector(VEC, f32) =
-                        weights[(k + 1) * out_size + o ..]
-                            [0..VEC].*;
+                        weights[base1..][0..VEC].*;
                     const w2: @Vector(VEC, f32) =
-                        weights[(k + 2) * out_size + o ..]
-                            [0..VEC].*;
+                        weights[base2..][0..VEC].*;
                     const w3: @Vector(VEC, f32) =
-                        weights[(k + 3) * out_size + o ..]
-                            [0..VEC].*;
+                        weights[base3..][0..VEC].*;
                     accum[v] += x0 * w0 + x1 * w1 +
                         x2 * w2 + x3 * w3;
                 }
@@ -2091,7 +2116,8 @@ pub fn Network(
                 const w_row =
                     weights[k * out_size ..];
 
-                inline for (0..vc) |v| {
+                var v: u32 = 0;
+                while (v < vc) : (v += 1) {
                     const o = v * VEC;
                     const wv: @Vector(VEC, f32) =
                         w_row[o..][0..VEC].*;
