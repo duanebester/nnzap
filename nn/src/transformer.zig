@@ -634,6 +634,67 @@ pub fn dispatchResidualAdd(
     device.dispatch1D(encoder, pipeline, count);
 }
 
+/// Dispatch fused pair of 1-bit matrix-vector multiplies.
+/// Computes output_a = W_a × input AND output_b = W_b × input
+/// in a single kernel dispatch, sharing the input vector in
+/// threadgroup memory.  Both weight matrices must have the
+/// same M, K, and group_size.  Saves one full dispatch
+/// overhead (~7 Obj-C msgSend) per call vs two dispatchQMV.
+fn dispatchQMVFusedPair(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.PackedBuffer,
+    packed_b: metal.PackedBuffer,
+    input_buffer: objc.Object,
+    output_a: objc.Object,
+    output_b: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(dims.K % dims.group_size == 0);
+    std.debug.assert(dims.K <= 6144);
+    std.debug.assert(dims.K >= 256);
+    // Single-group requirement: same as qmv_fast.
+    std.debug.assert(dims.K / 32 <= dims.group_size);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+
+    // buffer(0,1): packed A (bits + scales).
+    metal.setPackedBuffer(encoder, packed_a, 0);
+    // buffer(2): shared input vector [K] f32.
+    setRawBuffer(encoder, input_buffer, 0, 2);
+    // buffer(3): output A [M] f32.
+    setRawBuffer(encoder, output_a, 0, 3);
+    // buffer(4,5): packed B (bits + scales).
+    metal.setPackedBuffer(encoder, packed_b, 4);
+    // buffer(6): output B [M] f32.
+    setRawBuffer(encoder, output_b, 0, 6);
+    // buffer(7): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 7);
+
+    // 16 rows per threadgroup, 512 threads (same as qmv_fast).
+    const threadgroups = (dims.M + 15) / 16;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 512,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(
+        encoder,
+        device.qmv_fused_pair,
+        grid,
+        group,
+    );
+}
+
 /// Dispatch 1-bit matrix-vector multiply (qmv): output = W_1bit × input.
 /// W is [M × K] in Q1_0_g128 packed format.  Input is [K] f32,
 /// output is [M] f32.  Uses the qmv pipeline from compute.metal
@@ -682,10 +743,10 @@ pub fn dispatchQMV(
     // buffer(4): QMVDims.
     metal.setBytes(encoder, QMVDims, &dims, 4);
 
-    // qmv_fast variants: 8 rows/tg (8 simdgroups of 32).
+    // qmv_fast variants: 16 rows/tg (16 simdgroups of 32).
     // qmv fallback: 2 rows/tg (2 simdgroups of 32).
-    const rows_per_tg: u32 = if (aligned) 8 else 2;
-    const threads_per_tg: u32 = if (aligned) 256 else 64;
+    const rows_per_tg: u32 = if (aligned) 16 else 2;
+    const threads_per_tg: u32 = if (aligned) 512 else 64;
     const threadgroups = (dims.M + rows_per_tg - 1) / rows_per_tg;
     const grid = metal.MTLSize{
         .width = @as(c_ulong, threadgroups),
@@ -1299,8 +1360,28 @@ fn encodeMLPHalf(
         },
     );
     bufferBarrier(encoder);
-    dispatchQMV(device, encoder, device.qmv, a.gate_proj, a.norm_out, a.gate, mlp_qmv);
-    dispatchQMV(device, encoder, device.qmv, a.up_proj, a.norm_out, a.up, mlp_qmv);
+    // Gate and up projections share the same input and dims.
+    // Use the fused pair kernel when K meets qmv_fast
+    // requirements — saves one full dispatch overhead.
+    const can_fuse = comptime (Config.hidden_size % Config.group_size == 0) and
+        (Config.hidden_size <= 6144) and
+        (Config.hidden_size >= 256) and
+        (Config.hidden_size / 32 <= Config.group_size);
+    if (can_fuse) {
+        dispatchQMVFusedPair(
+            device,
+            encoder,
+            a.gate_proj,
+            a.up_proj,
+            a.norm_out,
+            a.gate,
+            a.up,
+            mlp_qmv,
+        );
+    } else {
+        dispatchQMV(device, encoder, device.qmv, a.gate_proj, a.norm_out, a.gate, mlp_qmv);
+        dispatchQMV(device, encoder, device.qmv, a.up_proj, a.norm_out, a.up, mlp_qmv);
+    }
     bufferBarrier(encoder);
     dispatchSiLUElementwiseMul(
         device,

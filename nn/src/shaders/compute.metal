@@ -1823,18 +1823,18 @@ kernel void qmv_fast(
     const uint M = dims.M;
     const uint group_size = dims.group_size;
 
-    // 8 simdgroups of 32 lanes → 8 rows per threadgroup.
+    // 16 simdgroups of 32 lanes → 16 rows per threadgroup.
     // More rows per threadgroup shares the input vector
-    // load across more output rows and increases GPU
-    // occupancy (256 vs 128 threads per threadgroup).
+    // load across more output rows and halves threadgroup
+    // count, reducing GPU scheduler overhead.
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
-    const uint row = tgid * 8 + simdgroup_idx;
+    const uint row = tgid * 16 + simdgroup_idx;
 
     // Cooperatively load input vector into shared memory.
-    // 256 threads load up to K floats (ceil(K/256) iters).
+    // 512 threads load up to K floats (ceil(K/512) iters).
     threadgroup float shared_input[6144];
-    for (uint i = tid; i < K; i += 256) {
+    for (uint i = tid; i < K; i += 512) {
         shared_input[i] = input[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1896,6 +1896,123 @@ kernel void qmv_fast(
     // Lane 0 writes the final result.
     if (lane == 0) {
         output[row] = accum;
+    }
+}
+
+// ============================================================================
+// qmv_fused_pair — two parallel qmv dispatches in one kernel
+// ============================================================================
+
+/// Fused kernel that computes two 1-bit matvecs sharing the
+/// same input vector.  Processes row R from weight matrix A
+/// AND row R from weight matrix B in each simdgroup.  This
+/// halves the number of kernel dispatches for paired
+/// projections (gate+up in MLP, or Q+K in attention) and
+/// shares the shared memory input vector load across both.
+///
+/// The kernel reads two packed buffers at different device
+/// memory regions but uses the same threadgroup-cached input.
+/// Each simdgroup does 2× the packed_bits reads but saves
+/// one full dispatch overhead (~7 Obj-C msgSend).
+///
+/// Buffer layout:
+///   buffer(0): packed_bits_a (gate/Q weights)
+///   buffer(1): scales_a (f16 scales for A)
+///   buffer(2): input [K] f32 (shared between both)
+///   buffer(3): output_a [M] f32
+///   buffer(4): packed_bits_b (up/K weights)
+///   buffer(5): scales_b (f16 scales for B)
+///   buffer(6): output_b [M] f32
+///   buffer(7): QMVDims (same M, K, group_size for both)
+///
+/// Dispatch: threadgroups = ceil(M/16), threads = 512.
+kernel void qmv_fused_pair(
+    device const uint8_t* packed_a  [[buffer(0)]],
+    device const half*    scales_a  [[buffer(1)]],
+    device const float*   input     [[buffer(2)]],
+    device float*         output_a  [[buffer(3)]],
+    device const uint8_t* packed_b  [[buffer(4)]],
+    device const half*    scales_b  [[buffer(5)]],
+    device float*         output_b  [[buffer(6)]],
+    constant QMVDims&     dims      [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    const uint row = tgid * 16 + simdgroup_idx;
+
+    // Load input into shared memory once for both matrices.
+    threadgroup float shared_input[6144];
+    for (uint i = tid; i < K; i += 512) {
+        shared_input[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= M) return;
+
+    const uint groups_per_row = K / group_size;
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    const uint bytes_per_lane = cols_per_lane / 8;
+    const uint byte_offset = row * (K / 8) + col_start / 8;
+    const uint scale_offset = row * groups_per_row;
+    const uint grp = col_start / group_size;
+
+    // Two accumulators: one per weight matrix.
+    float set_a = 0.0f, set_b = 0.0f;
+    float gsum = 0.0f;
+
+    for (uint b = 0; b < bytes_per_lane; b++) {
+        const uint bval_a = packed_a[byte_offset + b];
+        const uint bval_b = packed_b[byte_offset + b];
+        const uint base = col_start + b * 8;
+
+        float x0 = shared_input[base + 0];
+        float x1 = shared_input[base + 1];
+        float x2 = shared_input[base + 2];
+        float x3 = shared_input[base + 3];
+        float x4 = shared_input[base + 4];
+        float x5 = shared_input[base + 5];
+        float x6 = shared_input[base + 6];
+        float x7 = shared_input[base + 7];
+
+        gsum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+
+        set_a += select(0.0f, x0, bool(bval_a & 1));
+        set_a += select(0.0f, x1, bool(bval_a & 2));
+        set_a += select(0.0f, x2, bool(bval_a & 4));
+        set_a += select(0.0f, x3, bool(bval_a & 8));
+        set_a += select(0.0f, x4, bool(bval_a & 16));
+        set_a += select(0.0f, x5, bool(bval_a & 32));
+        set_a += select(0.0f, x6, bool(bval_a & 64));
+        set_a += select(0.0f, x7, bool(bval_a & 128));
+
+        set_b += select(0.0f, x0, bool(bval_b & 1));
+        set_b += select(0.0f, x1, bool(bval_b & 2));
+        set_b += select(0.0f, x2, bool(bval_b & 4));
+        set_b += select(0.0f, x3, bool(bval_b & 8));
+        set_b += select(0.0f, x4, bool(bval_b & 16));
+        set_b += select(0.0f, x5, bool(bval_b & 32));
+        set_b += select(0.0f, x6, bool(bval_b & 64));
+        set_b += select(0.0f, x7, bool(bval_b & 128));
+    }
+
+    const float sc_a = float(scales_a[scale_offset + grp]);
+    const float sc_b = float(scales_b[scale_offset + grp]);
+    float acc_a = sc_a * (2.0f * set_a - gsum);
+    float acc_b = sc_b * (2.0f * set_b - gsum);
+
+    acc_a = simd_sum(acc_a);
+    acc_b = simd_sum(acc_b);
+
+    if (lane == 0) {
+        output_a[row] = acc_a;
+        output_b[row] = acc_b;
     }
 }
 
@@ -2019,16 +2136,16 @@ kernel void qmv_fast_multigroup(
     const uint M = dims.M;
     const uint group_size = dims.group_size;
 
-    // 8 simdgroups of 32 lanes → 8 rows per threadgroup.
+    // 16 simdgroups of 32 lanes → 16 rows per threadgroup.
     // Matches qmv_fast: more rows per threadgroup shares
-    // the input vector load and improves occupancy.
+    // the input vector load and halves threadgroup count.
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
-    const uint row = tgid * 8 + simdgroup_idx;
+    const uint row = tgid * 16 + simdgroup_idx;
 
     // Cooperatively load input vector into shared memory.
     threadgroup float shared_input[6144];
-    for (uint i = tid; i < K; i += 256) {
+    for (uint i = tid; i < K; i += 512) {
         shared_input[i] = input[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
