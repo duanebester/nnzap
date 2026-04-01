@@ -734,14 +734,20 @@ pub fn dispatchQMV(
     const aligned = (dims.K % dims.group_size == 0) and
         (dims.K <= 6144) and (dims.K >= 256);
     const single_group = dims.K / 32 <= dims.group_size;
-    // For K <= 2048, use qmv_const which reads the input
-    // through Metal's constant cache instead of threadgroup
-    // shared memory.  Zero shared memory allows higher
-    // occupancy (more threadgroups per execution unit).
-    const use_const = aligned and single_group and
-        dims.K <= 2048;
-    const actual_pipeline = if (use_const)
+    // Use constant-cache variants when the input vector fits
+    // in Metal's 64 KB constant address space (K*4 <= 64 KB).
+    // Zero shared memory allows maximum GPU occupancy.
+    // Single-group: qmv_const (2 rows/sg, 32 rows/tg).
+    // Multi-group:  qmv_const_multigroup (same layout).
+    const fits_const = dims.K * 4 <= 65536;
+    const use_const_sg = aligned and single_group and
+        fits_const;
+    const use_const_mg = aligned and !single_group and
+        fits_const;
+    const actual_pipeline = if (use_const_sg)
         device.qmv_const
+    else if (use_const_mg)
+        device.qmv_const_multigroup
     else if (aligned and single_group)
         device.qmv_fast
     else if (aligned)
@@ -759,9 +765,10 @@ pub fn dispatchQMV(
     // buffer(4): QMVDims.
     metal.setBytes(encoder, QMVDims, &dims, 4);
 
-    // qmv_const: 32 rows/tg (16 simdgroups × 2 rows).
-    // qmv_fast variants: 16 rows/tg (16 simdgroups of 32).
-    // qmv fallback: 2 rows/tg (2 simdgroups of 32).
+    // Constant-cache variants: 32 rows/tg (16 sgs × 2 rows).
+    // Shared-memory fast: 16 rows/tg (16 simdgroups of 32).
+    // Fallback qmv: 2 rows/tg (2 simdgroups of 32).
+    const use_const = use_const_sg or use_const_mg;
     const rows_per_tg: u32 = if (use_const)
         32
     else if (aligned)

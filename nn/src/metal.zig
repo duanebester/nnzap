@@ -633,6 +633,10 @@ const pipeline_specs = [_]PipelineSpec{
         .shader_name = "qmv_fast_multigroup",
     },
     .{
+        .field_name = "qmv_const_multigroup",
+        .shader_name = "qmv_const_multigroup",
+    },
+    .{
         .field_name = "qmv_fused_pair",
         .shader_name = "qmv_fused_pair",
     },
@@ -712,6 +716,7 @@ pub const Device = struct {
     qmv_fast_sm2: ComputePipeline,
     qmv_const: ComputePipeline,
     qmv_fast_multigroup: ComputePipeline,
+    qmv_const_multigroup: ComputePipeline,
     qmv_fused_pair: ComputePipeline,
     qmv_fused_pair_sm: ComputePipeline,
     qmv_fused_pair_const: ComputePipeline,

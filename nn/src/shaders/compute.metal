@@ -2698,6 +2698,142 @@ kernel void qmv_fast_multigroup(
 }
 
 // ============================================================================
+// qmv_const_multigroup — constant-cache input, multi-group lanes
+// ============================================================================
+
+/// Multi-group variant using Metal's constant address space for
+/// the input vector.  Eliminates 24 KB threadgroup shared memory
+/// and the cooperative-load barrier, allowing maximum occupancy.
+/// Each simdgroup processes 2 rows (32 rows/tg with 16 sgs).
+/// Handles K > 2048 where lanes span multiple scale groups.
+/// Input accessed via constant cache (64 KB limit → K <= 16384).
+///
+/// Dispatch: threadgroups = ceil(M / 32), threads = 512.
+kernel void qmv_const_multigroup(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    constant float*       input        [[buffer(2)]],
+    device float*         output       [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    // Each simdgroup handles 2 adjacent rows.
+    const uint row0 = tgid * 32 + simdgroup_idx * 2;
+    const uint row1 = row0 + 1;
+
+    const bool row0_valid = row0 < M;
+    const bool row1_valid = row1 < M;
+
+    const uint groups_per_row = K / group_size;
+
+    // Byte-aligned lane assignment (same as multigroup).
+    const uint total_row_bytes = K / 8;
+    const uint base_bytes = total_row_bytes / 32;
+    const uint extra_lanes = total_row_bytes % 32;
+    const uint my_bytes = base_bytes +
+        ((lane < extra_lanes) ? 1u : 0u);
+    const uint byte_start = lane * base_bytes +
+        min(lane, extra_lanes);
+    const uint col_start = byte_start * 8;
+
+    const uint row_byte_base0 =
+        row0 * total_row_bytes + byte_start;
+    const uint row_byte_base1 =
+        row1 * total_row_bytes + byte_start;
+    const uint row_scale_off0 = row0 * groups_per_row;
+    const uint row_scale_off1 = row1 * groups_per_row;
+
+    // Bytes per group (group_size always multiple of 8).
+    const uint bytes_per_group = group_size / 8;
+
+    // Dual-row signed accumulation with group tracking.
+    float accum0 = 0.0f, signed0 = 0.0f;
+    float accum1 = 0.0f, signed1 = 0.0f;
+    uint cur_group = col_start / group_size;
+    uint byte_in_group = (col_start % group_size) / 8;
+
+    for (uint b = 0; b < my_bytes; b++) {
+        const uint base_col = col_start + b * 8;
+
+        // Read input from constant cache.
+        float x0 = input[base_col + 0];
+        float x1 = input[base_col + 1];
+        float x2 = input[base_col + 2];
+        float x3 = input[base_col + 3];
+        float x4 = input[base_col + 4];
+        float x5 = input[base_col + 5];
+        float x6 = input[base_col + 6];
+        float x7 = input[base_col + 7];
+
+        if (row0_valid) {
+            const uint bv0 = packed_bits[row_byte_base0 + b];
+            signed0 += select(-x0, x0, bool(bv0 & 1));
+            signed0 += select(-x1, x1, bool(bv0 & 2));
+            signed0 += select(-x2, x2, bool(bv0 & 4));
+            signed0 += select(-x3, x3, bool(bv0 & 8));
+            signed0 += select(-x4, x4, bool(bv0 & 16));
+            signed0 += select(-x5, x5, bool(bv0 & 32));
+            signed0 += select(-x6, x6, bool(bv0 & 64));
+            signed0 += select(-x7, x7, bool(bv0 & 128));
+        }
+
+        if (row1_valid) {
+            const uint bv1 = packed_bits[row_byte_base1 + b];
+            signed1 += select(-x0, x0, bool(bv1 & 1));
+            signed1 += select(-x1, x1, bool(bv1 & 2));
+            signed1 += select(-x2, x2, bool(bv1 & 4));
+            signed1 += select(-x3, x3, bool(bv1 & 8));
+            signed1 += select(-x4, x4, bool(bv1 & 16));
+            signed1 += select(-x5, x5, bool(bv1 & 32));
+            signed1 += select(-x6, x6, bool(bv1 & 64));
+            signed1 += select(-x7, x7, bool(bv1 & 128));
+        }
+
+        // Flush at group boundary.
+        byte_in_group++;
+        if (byte_in_group == bytes_per_group) {
+            const float s = float(
+                scales[row_scale_off0 + cur_group]
+            );
+            accum0 += s * signed0;
+            signed0 = 0.0f;
+            const float t = float(
+                scales[row_scale_off1 + cur_group]
+            );
+            accum1 += t * signed1;
+            signed1 = 0.0f;
+            cur_group++;
+            byte_in_group = 0;
+        }
+    }
+
+    // Flush remaining partial group.
+    if (byte_in_group > 0) {
+        accum0 += float(
+            scales[row_scale_off0 + cur_group]
+        ) * signed0;
+        accum1 += float(
+            scales[row_scale_off1 + cur_group]
+        ) * signed1;
+    }
+
+    accum0 = simd_sum(accum0);
+    accum1 = simd_sum(accum1);
+
+    if (lane == 0) {
+        if (row0_valid) output[row0] = accum0;
+        if (row1_valid) output[row1] = accum1;
+    }
+}
+
+// ============================================================================
 // 1-bit matrix-matrix multiply (qmm) — Q1_0_g128 format
 // ============================================================================
 
