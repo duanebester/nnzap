@@ -2361,23 +2361,41 @@ kernel void qmv_fast_multigroup(
     if (row >= M) return;
 
     const uint groups_per_row = K / group_size;
-    const uint cols_per_lane = K / 32;
-    const uint col_start = lane * cols_per_lane;
-    const uint bytes_per_lane = cols_per_lane / 8;
+
+    // Byte-aligned lane assignment: distribute K/8 packed
+    // bytes evenly across 32 SIMD lanes so every lane
+    // starts at a byte boundary.  The old scheme used
+    // cols_per_lane = K/32, which falls mid-byte when
+    // K % 256 != 0 (e.g. K=5504 → cols_per_lane=172,
+    // bit offset 4 for odd lanes, wrong bit-to-column
+    // mapping).  This scheme gives each lane floor or
+    // ceil(K/8/32) bytes — the max difference is one
+    // iteration, negligible SIMD divergence.
+    const uint total_row_bytes = K / 8;
+    const uint base_bytes = total_row_bytes / 32;
+    const uint extra_lanes = total_row_bytes % 32;
+    const uint my_bytes = base_bytes +
+        ((lane < extra_lanes) ? 1u : 0u);
+    const uint byte_start = lane * base_bytes +
+        min(lane, extra_lanes);
+    const uint col_start = byte_start * 8;
     const uint row_byte_base =
-        row * (K / 8) + col_start / 8;
+        row * total_row_bytes + byte_start;
     const uint row_scale_offset = row * groups_per_row;
 
     // Bytes per group (group_size always multiple of 8).
     const uint bytes_per_group = group_size / 8;
 
     // Signed accumulation with multi-group tracking.
+    // col_start is always a multiple of 8 (byte-aligned),
+    // and group_size is always a multiple of 8, so
+    // byte_in_group is always an integer.
     float accum = 0.0f;
     float signed_accum = 0.0f;
     uint cur_group = col_start / group_size;
     uint byte_in_group = (col_start % group_size) / 8;
 
-    for (uint b = 0; b < bytes_per_lane; b++) {
+    for (uint b = 0; b < my_bytes; b++) {
         const uint byte_val = packed_bits[row_byte_base + b];
         const uint base_col = col_start + b * 8;
 
@@ -2412,7 +2430,10 @@ kernel void qmv_fast_multigroup(
         }
     }
 
-    // Flush remaining partial group.
+    // Flush remaining partial group.  No tail-column
+    // handling needed: byte-aligned lanes always process
+    // an exact number of bytes (my_bytes), so every
+    // column is covered by the byte loop above.
     if (byte_in_group > 0) {
         const float scale = float(
             scales[row_scale_offset + cur_group]

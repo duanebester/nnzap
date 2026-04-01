@@ -102,6 +102,8 @@ const SUMMARIES_PATH: []const u8 =
 
 const ALLOWED_WRITE_FILES = [_][]const u8{
     "nn/src/transformer.zig",
+    "nn/src/network.zig",
+    "nn/src/layout.zig",
     "nn/src/model.zig",
     "nn/src/metal.zig",
     "nn/src/safetensors.zig",
@@ -2720,6 +2722,7 @@ fn executeWriteFile(
             arena,
             "Error: write not allowed to '{s}'. " ++
                 "Allowed: nn/src/transformer.zig, " ++
+                "nn/src/network.zig, nn/src/layout.zig, " ++
                 "nn/src/model.zig, nn/src/metal.zig, " ++
                 "nn/src/shaders/*.metal, " ++
                 "nn/examples/bonsai*.zig",

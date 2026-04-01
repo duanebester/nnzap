@@ -46,6 +46,8 @@ const tools = @import("tools.zig");
 
 const ENGINE_FILES = [_][]const u8{
     "nn/src/transformer.zig",
+    "nn/src/network.zig",
+    "nn/src/layout.zig",
     "nn/src/model.zig",
     "nn/src/metal.zig",
     "nn/src/safetensors.zig",
@@ -68,9 +70,10 @@ comptime {
     std.debug.assert(ENGINE_FILES.len > 0);
     std.debug.assert(ENGINE_FILES.len <= 16);
     std.debug.assert(TIMESTAMP_LEN == 19);
-    // Bonsai files: 9 source files covering the
-    // transformer inference stack.
-    std.debug.assert(ENGINE_FILES.len == 9);
+    // Bonsai files + MLP training files: 11 source files
+    // covering the transformer inference stack, the dense
+    // network training path, and the comptime layout.
+    std.debug.assert(ENGINE_FILES.len == 11);
 }
 
 // ============================================================

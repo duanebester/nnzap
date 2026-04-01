@@ -724,6 +724,10 @@ pub fn dispatchQMV(
     // and K/32 >= 8 (each lane processes at least one byte).
     // For K/32 > group_size, lanes span multiple groups —
     // use qmv_fast_multigroup which tracks group boundaries.
+    // The multigroup kernel uses byte-aligned lane assignment
+    // (distributing K/8 bytes evenly across 32 lanes) so it
+    // handles any K that is group-aligned, even when K % 256
+    // != 0 (e.g. K=5504 for the Bonsai down projection).
     const aligned = (dims.K % dims.group_size == 0) and
         (dims.K <= 6144) and (dims.K >= 256);
     const single_group = dims.K / 32 <= dims.group_size;
@@ -3491,6 +3495,97 @@ test "residual_add matches CPU reference" {
         &expected,
         1e-6,
         "residual_add",
+    );
+}
+
+test "qmv_fast_multigroup handles non-byte-aligned cols" {
+    // Goal: Verify qmv_fast_multigroup correctly processes
+    // all columns when cols_per_lane (K/32) is not a multiple
+    // of 8.  For K=5504, cols_per_lane=172, bytes_per_lane=21,
+    // leaving 4 tail columns per lane that must be accumulated
+    // separately.  Without the tail loop fix, 128 of 5504
+    // columns (2.3%) are silently dropped per row.
+    //
+    // Method: Packed weight matrix [M × K] with K=5504,
+    // dispatch via dispatchQMV (selects qmv_fast_multigroup),
+    // compare against column-by-column CPU reference.
+
+    const M: u32 = 64;
+    const K: u32 = 5504;
+    const GS: u32 = 128;
+
+    // Verify this exercises the multigroup path.
+    comptime {
+        std.debug.assert(K % 32 == 0);
+        std.debug.assert(K % GS == 0);
+        std.debug.assert(K / 32 > GS); // multigroup
+        std.debug.assert((K / 32) % 8 != 0); // tail cols
+    }
+
+    var device: metal.Device = undefined;
+    try device.init();
+
+    // ── Packed weight buffer [M × K] ─────────────────
+    var packed_buf = try createTestPackedBuffer(
+        device.obj,
+        M * K,
+        0x5A,
+    );
+    defer packed_buf.deinit();
+
+    // ── f32 input vector [K] with varied values ──────
+    var input_buf = try device.createBuffer(K);
+    defer input_buf.deinit();
+    {
+        const s = input_buf.asSlice();
+        for (s, 0..) |*v, i| {
+            const fi: f32 = @floatFromInt(i);
+            v.* = 0.1 * @sin(fi * 0.037) + 0.05;
+        }
+    }
+
+    // ── f32 output buffer [M] ────────────────────────
+    var output_buf = try device.createBuffer(M);
+    defer output_buf.deinit();
+    @memset(output_buf.asSlice(), 0.0);
+
+    // ── GPU dispatch ─────────────────────────────────
+    const cmd = device.beginCommandBuffer();
+    const enc = device.beginCompute(cmd);
+    dispatchQMV(
+        &device,
+        enc,
+        device.qmv,
+        packed_buf,
+        input_buf.metalBuffer(),
+        output_buf.metalBuffer(),
+        .{ .M = M, .K = K, .group_size = GS },
+    );
+    enc.msgSend(void, "endEncoding", .{});
+    device.commitAndWait(cmd);
+
+    // ── CPU reference ────────────────────────────────
+    const bits = packedBufBits(packed_buf);
+    const scales = packedBufScales(packed_buf);
+    var cpu_output: [M]f32 = undefined;
+    cpuQMV(
+        bits,
+        scales,
+        input_buf.asSlice(),
+        &cpu_output,
+        M,
+        K,
+        GS,
+    );
+
+    // Tolerance 2e-3: the multigroup kernel accumulates
+    // more f16 scale multiplications over larger K,
+    // amplifying rounding vs the f32 CPU reference.
+    try expectClose(
+        output_buf.asSlice()[0..M],
+        &cpu_output,
+        2e-3,
+        "qmv_multigroup_K5504",
     );
 }
 
