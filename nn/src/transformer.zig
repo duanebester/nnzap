@@ -657,13 +657,18 @@ pub fn dispatchQMV(
     std.debug.assert(dims.group_size > 0);
     std.debug.assert(packed_buffer.packed_count > 0);
 
-    // Use qmv_fast when K is aligned to group_size, K fits
+    // Use qmv_fast variants when K is group-aligned, fits
     // in shared memory (6144 floats = 24 KB < 32 KB limit),
     // and K/32 >= 8 (each lane processes at least one byte).
-    const use_fast = (dims.K % dims.group_size == 0) and
+    // For K/32 > group_size, lanes span multiple groups —
+    // use qmv_fast_multigroup which tracks group boundaries.
+    const aligned = (dims.K % dims.group_size == 0) and
         (dims.K <= 6144) and (dims.K >= 256);
-    const actual_pipeline = if (use_fast)
+    const single_group = dims.K / 32 <= dims.group_size;
+    const actual_pipeline = if (aligned and single_group)
         device.qmv_fast
+    else if (aligned)
+        device.qmv_fast_multigroup
     else
         pipeline;
 
@@ -677,10 +682,10 @@ pub fn dispatchQMV(
     // buffer(4): QMVDims.
     metal.setBytes(encoder, QMVDims, &dims, 4);
 
-    // qmv_fast: 4 rows/threadgroup (4 simdgroups of 32).
-    // qmv:      2 rows/threadgroup (2 simdgroups of 32).
-    const rows_per_tg: u32 = if (use_fast) 4 else 2;
-    const threads_per_tg: u32 = if (use_fast) 128 else 64;
+    // qmv_fast variants: 4 rows/tg (4 simdgroups of 32).
+    // qmv fallback: 2 rows/tg (2 simdgroups of 32).
+    const rows_per_tg: u32 = if (aligned) 4 else 2;
+    const threads_per_tg: u32 = if (aligned) 128 else 64;
     const threadgroups = (dims.M + rows_per_tg - 1) / rows_per_tg;
     const grid = metal.MTLSize{
         .width = @as(c_ulong, threadgroups),

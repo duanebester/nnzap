@@ -1897,6 +1897,121 @@ kernel void qmv_fast(
 }
 
 // ============================================================================
+// qmv_fast_multigroup — handles lanes spanning multiple groups
+// ============================================================================
+
+/// Multi-group variant of qmv_fast for K > 32*group_size where
+/// each lane's columns span more than one scale group (e.g.
+/// K=6144, group_size=128: cols_per_lane=192 > 128).
+///
+/// Same structure as qmv_fast but flushes the accumulator at
+/// group boundaries within the byte loop.  Group transitions
+/// occur every group_size/8 bytes, checked by a counter.
+///
+/// Dispatch: threadgroups = ceil(M / 4), threads = 128.
+kernel void qmv_fast_multigroup(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    device const float*   input        [[buffer(2)]],
+    device float*         output       [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    // 4 simdgroups of 32 lanes → 4 rows per threadgroup.
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    const uint row = tgid * 4 + simdgroup_idx;
+
+    // Cooperatively load input vector into shared memory.
+    threadgroup float shared_input[6144];
+    for (uint i = tid; i < K; i += 128) {
+        shared_input[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= M) return;
+
+    const uint groups_per_row = K / group_size;
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    const uint bytes_per_lane = cols_per_lane / 8;
+    const uint row_byte_base =
+        row * (K / 8) + col_start / 8;
+    const uint row_scale_offset = row * groups_per_row;
+
+    // Bytes per group (group_size always multiple of 8).
+    const uint bytes_per_group = group_size / 8;
+
+    float accum = 0.0f;
+    float set_accum = 0.0f;
+    float group_sum = 0.0f;
+    uint cur_group = col_start / group_size;
+    uint byte_in_group = (col_start % group_size) / 8;
+
+    for (uint b = 0; b < bytes_per_lane; b++) {
+        const uint byte_val = packed_bits[row_byte_base + b];
+        const uint base_col = col_start + b * 8;
+
+        float x0 = shared_input[base_col + 0];
+        float x1 = shared_input[base_col + 1];
+        float x2 = shared_input[base_col + 2];
+        float x3 = shared_input[base_col + 3];
+        float x4 = shared_input[base_col + 4];
+        float x5 = shared_input[base_col + 5];
+        float x6 = shared_input[base_col + 6];
+        float x7 = shared_input[base_col + 7];
+
+        group_sum += x0 + x1 + x2 + x3
+                   + x4 + x5 + x6 + x7;
+
+        set_accum += select(0.0f, x0, bool(byte_val & 1));
+        set_accum += select(0.0f, x1, bool(byte_val & 2));
+        set_accum += select(0.0f, x2, bool(byte_val & 4));
+        set_accum += select(0.0f, x3, bool(byte_val & 8));
+        set_accum += select(0.0f, x4, bool(byte_val & 16));
+        set_accum += select(0.0f, x5, bool(byte_val & 32));
+        set_accum += select(0.0f, x6, bool(byte_val & 64));
+        set_accum += select(0.0f, x7, bool(byte_val & 128));
+
+        // Check group boundary (every group_size/8 bytes).
+        byte_in_group++;
+        if (byte_in_group == bytes_per_group) {
+            const float scale = float(
+                scales[row_scale_offset + cur_group]
+            );
+            accum += scale * (
+                2.0f * set_accum - group_sum
+            );
+            set_accum = 0.0f;
+            group_sum = 0.0f;
+            cur_group++;
+            byte_in_group = 0;
+        }
+    }
+
+    // Flush remaining partial group.
+    if (byte_in_group > 0) {
+        const float scale = float(
+            scales[row_scale_offset + cur_group]
+        );
+        accum += scale * (
+            2.0f * set_accum - group_sum
+        );
+    }
+
+    accum = simd_sum(accum);
+
+    if (lane == 0) {
+        output[row] = accum;
+    }
+}
+
+// ============================================================================
 // 1-bit matrix-matrix multiply (qmm) — Q1_0_g128 format
 // ============================================================================
 
