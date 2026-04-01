@@ -1823,15 +1823,18 @@ kernel void qmv_fast(
     const uint M = dims.M;
     const uint group_size = dims.group_size;
 
-    // 4 simdgroups of 32 lanes → 4 rows per threadgroup.
+    // 8 simdgroups of 32 lanes → 8 rows per threadgroup.
+    // More rows per threadgroup shares the input vector
+    // load across more output rows and increases GPU
+    // occupancy (256 vs 128 threads per threadgroup).
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
-    const uint row = tgid * 4 + simdgroup_idx;
+    const uint row = tgid * 8 + simdgroup_idx;
 
     // Cooperatively load input vector into shared memory.
-    // 128 threads load up to K floats (ceil(K/128) iters).
+    // 256 threads load up to K floats (ceil(K/256) iters).
     threadgroup float shared_input[6144];
-    for (uint i = tid; i < K; i += 128) {
+    for (uint i = tid; i < K; i += 256) {
         shared_input[i] = input[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1897,6 +1900,100 @@ kernel void qmv_fast(
 }
 
 // ============================================================================
+// qmv_fast_sm — smaller shared memory for better occupancy
+// ============================================================================
+
+/// qmv_fast variant with 2048-float shared memory (8 KB) for
+/// K <= 2048.  The 3× smaller footprint (vs 24 KB in qmv_fast)
+/// lets more threadgroups co-execute on one execution unit,
+/// hiding memory latency through higher occupancy.  Otherwise
+/// identical logic to qmv_fast.
+///
+/// Dispatch: threadgroups = ceil(M / 4), threads = 128.
+kernel void qmv_fast_sm(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    device const float*   input        [[buffer(2)]],
+    device float*         output       [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    const uint row = tgid * 4 + simdgroup_idx;
+
+    // 8 KB shared memory — 3× smaller than qmv_fast's 24 KB.
+    threadgroup float shared_input[2048];
+    for (uint i = tid; i < K; i += 128) {
+        shared_input[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= M) return;
+
+    const uint groups_per_row = K / group_size;
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    const uint bytes_per_lane = cols_per_lane / 8;
+    const uint row_byte_base =
+        row * (K / 8) + col_start / 8;
+    const uint row_scale_offset = row * groups_per_row;
+    const uint grp = col_start / group_size;
+
+    float set_accum = 0.0f;
+    float group_sum = 0.0f;
+
+    for (uint b = 0; b < bytes_per_lane; b++) {
+        const uint byte_val = packed_bits[row_byte_base + b];
+        const uint base_col = col_start + b * 8;
+
+        float x0 = shared_input[base_col + 0];
+        float x1 = shared_input[base_col + 1];
+        float x2 = shared_input[base_col + 2];
+        float x3 = shared_input[base_col + 3];
+        float x4 = shared_input[base_col + 4];
+        float x5 = shared_input[base_col + 5];
+        float x6 = shared_input[base_col + 6];
+        float x7 = shared_input[base_col + 7];
+
+        group_sum += x0 + x1 + x2 + x3
+                   + x4 + x5 + x6 + x7;
+
+        set_accum += select(0.0f, x0, bool(byte_val & 1));
+        set_accum += select(0.0f, x1, bool(byte_val & 2));
+        set_accum += select(0.0f, x2, bool(byte_val & 4));
+        set_accum += select(0.0f, x3, bool(byte_val & 8));
+        set_accum += select(
+            0.0f, x4, bool(byte_val & 16)
+        );
+        set_accum += select(
+            0.0f, x5, bool(byte_val & 32)
+        );
+        set_accum += select(
+            0.0f, x6, bool(byte_val & 64)
+        );
+        set_accum += select(
+            0.0f, x7, bool(byte_val & 128)
+        );
+    }
+
+    const float scale = float(
+        scales[row_scale_offset + grp]
+    );
+    float accum = scale * (2.0f * set_accum - group_sum);
+    accum = simd_sum(accum);
+
+    if (lane == 0) {
+        output[row] = accum;
+    }
+}
+
+// ============================================================================
 // qmv_fast_multigroup — handles lanes spanning multiple groups
 // ============================================================================
 
@@ -1922,14 +2019,16 @@ kernel void qmv_fast_multigroup(
     const uint M = dims.M;
     const uint group_size = dims.group_size;
 
-    // 4 simdgroups of 32 lanes → 4 rows per threadgroup.
+    // 8 simdgroups of 32 lanes → 8 rows per threadgroup.
+    // Matches qmv_fast: more rows per threadgroup shares
+    // the input vector load and improves occupancy.
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
-    const uint row = tgid * 4 + simdgroup_idx;
+    const uint row = tgid * 8 + simdgroup_idx;
 
     // Cooperatively load input vector into shared memory.
     threadgroup float shared_input[6144];
-    for (uint i = tid; i < K; i += 128) {
+    for (uint i = tid; i < K; i += 256) {
         shared_input[i] = input[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

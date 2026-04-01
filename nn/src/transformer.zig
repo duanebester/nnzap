@@ -682,10 +682,10 @@ pub fn dispatchQMV(
     // buffer(4): QMVDims.
     metal.setBytes(encoder, QMVDims, &dims, 4);
 
-    // qmv_fast variants: 4 rows/tg (4 simdgroups of 32).
+    // qmv_fast variants: 8 rows/tg (8 simdgroups of 32).
     // qmv fallback: 2 rows/tg (2 simdgroups of 32).
-    const rows_per_tg: u32 = if (aligned) 4 else 2;
-    const threads_per_tg: u32 = if (aligned) 128 else 64;
+    const rows_per_tg: u32 = if (aligned) 8 else 2;
+    const threads_per_tg: u32 = if (aligned) 256 else 64;
     const threadgroups = (dims.M + rows_per_tg - 1) / rows_per_tg;
     const grid = metal.MTLSize{
         .width = @as(c_ulong, threadgroups),
