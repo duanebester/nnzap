@@ -2319,6 +2319,119 @@ kernel void qmv_fast_sm2(
 }
 
 // ============================================================================
+// qmv_const — constant-cache input, no shared memory
+// ============================================================================
+
+/// qmv variant that reads the input vector through Metal's
+/// constant address space instead of loading it into threadgroup
+/// shared memory.  This eliminates:
+///   (1) 8 KB of threadgroup memory per threadgroup,
+///   (2) the cooperative load loop (K/512 iterations), and
+///   (3) the threadgroup_barrier before computation.
+///
+/// The constant cache on Apple Silicon is 64 KB per shader core,
+/// so the 8 KB input vector (K <= 2048) fits entirely.  All
+/// threadgroups reading the same input get hardware-level
+/// broadcast — no redundant loads.
+///
+/// Zero threadgroup memory means the GPU can schedule many more
+/// threadgroups per execution unit (occupancy limited only by
+/// registers, not shared memory).
+///
+/// Processes 2 rows per simdgroup (32 rows/tg, same as sm2).
+/// Only valid for K <= 2048, single scale group per lane.
+///
+/// Dispatch: threadgroups = ceil(M / 32), threads = 512.
+kernel void qmv_const(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    constant float*       input        [[buffer(2)]],
+    device float*         output       [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    // Each simdgroup handles 2 adjacent rows.
+    const uint row0 = tgid * 32 + simdgroup_idx * 2;
+    const uint row1 = row0 + 1;
+
+    // Precompute column layout — identical for both rows.
+    const uint groups_per_row = K / group_size;
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    const uint bytes_per_lane = cols_per_lane / 8;
+    const uint col_byte_off = col_start / 8;
+    const uint grp = col_start / group_size;
+    const uint bytes_per_row = K / 8;
+
+    float sig0 = 0.0f;
+    float sig1 = 0.0f;
+    const bool row0_valid = row0 < M;
+    const bool row1_valid = row1 < M;
+    const uint base0 = row0 * bytes_per_row + col_byte_off;
+    const uint base1 = row1 * bytes_per_row + col_byte_off;
+
+    for (uint b = 0; b < bytes_per_lane; b++) {
+        const uint base_col = col_start + b * 8;
+
+        // Read input from constant cache — no shared memory.
+        float x0 = input[base_col + 0];
+        float x1 = input[base_col + 1];
+        float x2 = input[base_col + 2];
+        float x3 = input[base_col + 3];
+        float x4 = input[base_col + 4];
+        float x5 = input[base_col + 5];
+        float x6 = input[base_col + 6];
+        float x7 = input[base_col + 7];
+
+        if (row0_valid) {
+            const uint bv0 = packed_bits[base0 + b];
+            sig0 += select(-x0, x0, bool(bv0 & 1));
+            sig0 += select(-x1, x1, bool(bv0 & 2));
+            sig0 += select(-x2, x2, bool(bv0 & 4));
+            sig0 += select(-x3, x3, bool(bv0 & 8));
+            sig0 += select(-x4, x4, bool(bv0 & 16));
+            sig0 += select(-x5, x5, bool(bv0 & 32));
+            sig0 += select(-x6, x6, bool(bv0 & 64));
+            sig0 += select(-x7, x7, bool(bv0 & 128));
+        }
+
+        if (row1_valid) {
+            const uint bv1 = packed_bits[base1 + b];
+            sig1 += select(-x0, x0, bool(bv1 & 1));
+            sig1 += select(-x1, x1, bool(bv1 & 2));
+            sig1 += select(-x2, x2, bool(bv1 & 4));
+            sig1 += select(-x3, x3, bool(bv1 & 8));
+            sig1 += select(-x4, x4, bool(bv1 & 16));
+            sig1 += select(-x5, x5, bool(bv1 & 32));
+            sig1 += select(-x6, x6, bool(bv1 & 64));
+            sig1 += select(-x7, x7, bool(bv1 & 128));
+        }
+    }
+
+    const uint scale_off0 = row0 * groups_per_row + grp;
+    const uint scale_off1 = row1 * groups_per_row + grp;
+
+    if (row0_valid) {
+        float acc0 = float(scales[scale_off0]) * sig0;
+        acc0 = simd_sum(acc0);
+        if (lane == 0) output[row0] = acc0;
+    }
+
+    if (row1_valid) {
+        float acc1 = float(scales[scale_off1]) * sig1;
+        acc1 = simd_sum(acc1);
+        if (lane == 0) output[row1] = acc1;
+    }
+}
+
+// ============================================================================
 // qmv_fast_multigroup — handles lanes spanning multiple groups
 // ============================================================================
 

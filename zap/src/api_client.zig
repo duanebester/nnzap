@@ -426,6 +426,10 @@ pub fn buildRequestJson(
     try buf.appendSlice(arena, model);
     try buf.appendSlice(arena, "\",\"max_tokens\":");
     try buf.appendSlice(arena, max_tokens_str);
+    try buf.appendSlice(
+        arena,
+        ",\"cache_control\":{\"type\":\"ephemeral\"}",
+    );
     try buf.appendSlice(arena, ",\"system\":");
     try appendJsonString(arena, &buf, system_prompt);
     try buf.appendSlice(arena, ",\"tools\":");

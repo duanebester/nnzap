@@ -2,6 +2,42 @@
 
 We are using `claude-opus-4-6`!
 
+## Project Map
+
+```
+nn/
+├── build.zig                    152 lines   Build config
+├── build.zig.zon                             Package manifest
+├── examples/
+│   ├── bonsai.zig               544 lines   Bonsai tree classifier
+│   ├── bonsai_bench.zig         752 lines   Bonsai benchmarking
+│   ├── inference_bench.zig      681 lines   Inference benchmarking
+│   ├── mnist.zig              1,042 lines   MNIST training
+│   └── mnist_1bit.zig          803 lines   1-bit MNIST variant
+├── src/
+│   ├── benchmark.zig            706 lines   Benchmarking infra
+│   ├── layout.zig               636 lines   Comptime network layout
+│   ├── metal.zig              1,424 lines   Metal GPU bindings
+│   ├── mnist.zig                407 lines   MNIST data loading
+│   ├── model.zig              1,254 lines   Model (safetensors/loading)
+│   ├── network.zig            3,308 lines   Core network (forward/backward/train)
+│   ├── root.zig                  48 lines   Public re-exports
+│   ├── safetensors.zig          736 lines   Safetensors format parser
+│   ├── shaders/
+│   │   ├── compute.metal      2,587 lines   GPU compute kernels
+│   │   └── transformer.metal    610 lines   Transformer-specific kernels
+│   ├── tokenizer.zig          1,574 lines   Tokenizer
+│   └── transformer.zig       5,278 lines   Transformer implementation
+├── benchmarks/                               JSON benchmark results
+└── data/mnist/                               MNIST raw dataset
+                              ──────
+                              22,542 lines total
+```
+
+Heavy hitters: `transformer.zig`, `network.zig`, `compute.metal` (~11k lines, half the codebase).
+Comptime spine: `layout.zig` resolves all buffer shapes at compile time.
+Two shader files: `compute.metal` (general NN kernels) and `transformer.metal` (attention-specific).
+
 ### 0. **Simplicity and Elegance**
 
 Simplicity is not a free pass or a first attempt — it is the hardest revision. The goal is to find the "super idea" that solves safety, performance, and developer experience simultaneously. An hour or day of design is worth weeks or months in production. Spend mental energy upfront, proactively rather than reactively, because when the thinking is done, what is spent on the design will be dwarfed by implementation, testing, and maintenance.
