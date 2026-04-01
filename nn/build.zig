@@ -44,6 +44,28 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // ── 1-bit MNIST integration test ──────────────────────────────────
+    const mnist_1bit = b.addExecutable(.{
+        .name = "mnist_1bit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/mnist_1bit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nn", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(mnist_1bit);
+
+    const run_1bit_step = b.step("run-1bit", "Run the 1-bit MNIST integration test");
+    const run_1bit_cmd = b.addRunArtifact(mnist_1bit);
+    run_1bit_step.dependOn(&run_1bit_cmd.step);
+    run_1bit_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_1bit_cmd.addArgs(args);
+    }
+
     // ── Inference benchmark ───────────────────────────────────────────
     const infer_bench = b.addExecutable(.{
         .name = "inference_bench",
@@ -64,6 +86,53 @@ pub fn build(b: *std.Build) void {
     run_infer_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_infer_cmd.addArgs(args);
+    }
+
+    // ── Bonsai 1.7B CLI ───────────────────────────────────────────────
+    const bonsai = b.addExecutable(.{
+        .name = "bonsai",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/bonsai.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nn", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(bonsai);
+
+    const run_bonsai_step = b.step("run-bonsai", "Run the Bonsai 1.7B inference CLI");
+    const run_bonsai_cmd = b.addRunArtifact(bonsai);
+    run_bonsai_step.dependOn(&run_bonsai_cmd.step);
+    run_bonsai_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_bonsai_cmd.addArgs(args);
+    }
+
+    // ── Bonsai 1.7B benchmark ─────────────────────────────────────────
+    const bonsai_bench = b.addExecutable(.{
+        .name = "bonsai_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/bonsai_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nn", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(bonsai_bench);
+
+    const run_bonsai_bench_step = b.step(
+        "run-bonsai-bench",
+        "Run the Bonsai 1.7B inference benchmark",
+    );
+    const run_bonsai_bench_cmd = b.addRunArtifact(bonsai_bench);
+    run_bonsai_bench_step.dependOn(&run_bonsai_bench_cmd.step);
+    run_bonsai_bench_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_bonsai_bench_cmd.addArgs(args);
     }
 
     // ── Tests ─────────────────────────────────────────────────────────

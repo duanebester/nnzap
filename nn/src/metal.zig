@@ -221,6 +221,120 @@ pub const HalfBuffer = struct {
 };
 
 // ============================================================================
+// PackedBuffer — 1-bit packed weights with per-group f16 scales
+// ============================================================================
+
+/// A Metal shared buffer storing 1-bit packed weights in Q1_0_g128
+/// format. The buffer contains two regions in a single allocation:
+///
+///   [packed_bits (uint8_t)] [scales (f16)]
+///
+/// The packed bits and scales live in the same MTLBuffer. The
+/// encoder binds the same buffer twice with different offsets to
+/// present both regions to the kernel without an extra allocation.
+pub const PackedBuffer = struct {
+    obj: objc.Object,
+    packed_count: u32, // number of 1-bit weight elements
+    group_size: u32, // weights per scale group (128)
+    byte_len: u32, // total allocation in bytes
+
+    /// Number of packed bytes: ceil(packed_count / 8).
+    pub fn packedBytes(self: PackedBuffer) u32 {
+        std.debug.assert(self.packed_count > 0);
+        std.debug.assert(self.group_size > 0);
+        return @as(u32, @intCast(
+            std.math.divCeil(u32, self.packed_count, 8) catch
+                unreachable,
+        ));
+    }
+
+    /// Number of scale groups: ceil(packed_count / group_size).
+    pub fn numGroups(self: PackedBuffer) u32 {
+        std.debug.assert(self.packed_count > 0);
+        std.debug.assert(self.group_size > 0);
+        return @as(u32, @intCast(
+            std.math.divCeil(
+                u32,
+                self.packed_count,
+                self.group_size,
+            ) catch unreachable,
+        ));
+    }
+
+    /// Byte offset where the f16 scale array begins
+    /// (= packedBytes, since scales follow packed bits).
+    pub fn scaleOffset(self: PackedBuffer) u32 {
+        const offset = self.packedBytes();
+        std.debug.assert(offset > 0);
+        std.debug.assert(offset < self.byte_len);
+        return offset;
+    }
+
+    /// Allocate a new PackedBuffer for `num_weights` 1-bit
+    /// elements with the given group size.
+    pub fn init(
+        device: objc.Object,
+        num_weights: u32,
+        group_size_val: u32,
+    ) !PackedBuffer {
+        std.debug.assert(num_weights > 0);
+        std.debug.assert(group_size_val > 0);
+
+        const packed_bytes: u32 = @intCast(
+            std.math.divCeil(u32, num_weights, 8) catch
+                unreachable,
+        );
+        const num_groups: u32 = @intCast(
+            std.math.divCeil(
+                u32,
+                num_weights,
+                group_size_val,
+            ) catch unreachable,
+        );
+        const scale_bytes: u32 = num_groups * 2; // f16 = 2 bytes
+        const total_bytes: u32 = packed_bytes + scale_bytes;
+        std.debug.assert(total_bytes > 0);
+
+        const raw = device.msgSend(
+            ?*anyopaque,
+            "newBufferWithLength:options:",
+            .{
+                @as(c_ulong, total_bytes),
+                MTLResourceOptions.storage_shared,
+            },
+        ) orelse return error.MetalBufferAllocFailed;
+
+        const result = PackedBuffer{
+            .obj = objc.Object.fromId(raw),
+            .packed_count = num_weights,
+            .group_size = group_size_val,
+            .byte_len = total_bytes,
+        };
+
+        // Zero-fill to prevent stale data leaks (Rule 21).
+        const ptr = result.obj.msgSend(
+            *anyopaque,
+            "contents",
+            .{},
+        );
+        const byte_ptr: [*]u8 = @ptrCast(ptr);
+        @memset(byte_ptr[0..total_bytes], 0);
+
+        return result;
+    }
+
+    /// Return the underlying Metal buffer object.
+    pub fn metalBuffer(self: PackedBuffer) objc.Object {
+        return self.obj;
+    }
+
+    pub fn deinit(self: *PackedBuffer) void {
+        self.obj.msgSend(void, "release", .{});
+        self.* = undefined;
+    }
+};
+
+// ============================================================================
 // MultiBuffered — generic N-buffered resource for overlapping CPU/GPU work
 // ============================================================================
 
@@ -490,6 +604,22 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "forward_fused_infer_single_f16",
         .shader_name = "forward_fused_infer_single_f16",
     },
+    .{
+        .field_name = "f32_to_1bit",
+        .shader_name = "f32_to_1bit",
+    },
+    .{
+        .field_name = "qmv",
+        .shader_name = "qmv",
+    },
+    .{
+        .field_name = "qmv_fast",
+        .shader_name = "qmv_fast",
+    },
+    .{
+        .field_name = "qmm",
+        .shader_name = "qmm",
+    },
 };
 
 // ============================================================================
@@ -547,6 +677,10 @@ pub const Device = struct {
     f32_to_f16: ComputePipeline,
     forward_fused_infer_batched_f16: ComputePipeline,
     forward_fused_infer_single_f16: ComputePipeline,
+    f32_to_1bit: ComputePipeline,
+    qmv: ComputePipeline,
+    qmv_fast: ComputePipeline,
+    qmm: ComputePipeline,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(
@@ -837,6 +971,43 @@ pub const Device = struct {
         );
     }
 
+    /// Dispatch a compute kernel with explicit threadgroup and
+    /// grid dimensions.  Use this for kernels whose dispatch
+    /// geometry doesn't follow the standard 1D or 2D patterns
+    /// — e.g. `qmv` (64 threads/group, ceil(M/2) groups).
+    pub fn dispatchCustom(
+        self: *const Device,
+        encoder: objc.Object,
+        pipeline: ComputePipeline,
+        grid: MTLSize,
+        group: MTLSize,
+    ) void {
+        std.debug.assert(grid.width > 0);
+        std.debug.assert(group.width > 0);
+        std.debug.assert(self.command_queue.value != null);
+
+        // Threadgroup size must not exceed pipeline's hardware
+        // limit.  Width × height × depth is the total thread
+        // count per threadgroup.
+        const threads_per_group =
+            group.width * group.height * group.depth;
+        std.debug.assert(
+            threads_per_group <= pipeline.max_threads_per_group,
+        );
+
+        encoder.msgSend(
+            void,
+            "setComputePipelineState:",
+            .{pipeline.state.value},
+        );
+
+        encoder.msgSend(
+            void,
+            "dispatchThreadgroups:threadsPerThreadgroup:",
+            .{ grid, group },
+        );
+    }
+
     /// Commit a command buffer and wait for completion
     /// (synchronous).
     pub fn commitAndWait(
@@ -1073,6 +1244,39 @@ pub fn setBytes(
         @as(*const anyopaque, @ptrCast(value)),
         @as(c_ulong, @sizeOf(T)),
         @as(c_ulong, index),
+    });
+}
+
+/// Bind a PackedBuffer's two regions (packed bits and f16 scales)
+/// to a compute encoder at consecutive indices.  Both bindings
+/// reference the same underlying MTLBuffer — the scales binding
+/// uses a byte offset equal to packedBytes().
+///
+/// After this call:
+///   buffer(bits_index)   → packed uint8_t bits, offset 0
+///   buffer(bits_index+1) → f16 scales, offset = packedBytes()
+pub fn setPackedBuffer(
+    encoder: objc.Object,
+    packed_buffer: PackedBuffer,
+    bits_index: u32,
+) void {
+    std.debug.assert(bits_index + 1 <= MAX_BUFFER_INDEX);
+    std.debug.assert(packed_buffer.packed_count > 0);
+
+    // Bind packed bits at offset 0.
+    encoder.msgSend(void, "setBuffer:offset:atIndex:", .{
+        packed_buffer.obj.value,
+        @as(c_ulong, 0),
+        @as(c_ulong, bits_index),
+    });
+
+    // Bind scales at byte offset = packedBytes() (same MTLBuffer).
+    const scale_byte_offset: c_ulong =
+        @as(c_ulong, packed_buffer.scaleOffset());
+    encoder.msgSend(void, "setBuffer:offset:atIndex:", .{
+        packed_buffer.obj.value,
+        scale_byte_offset,
+        @as(c_ulong, bits_index + 1),
     });
 }
 

@@ -969,6 +969,336 @@ pub fn Network(
         }
 
         // ====================================================
+        // 1-bit quantized inference (Q1_0_g128)
+        // ====================================================
+
+        /// Matches Metal's Q1Dims struct for f32_to_1bit.
+        const Q1Dims = extern struct {
+            total_weights: u32,
+            group_size: u32,
+        };
+
+        /// Matches Metal's QMMDims struct for qmm.
+        const QMMDims = extern struct {
+            M: u32,
+            N: u32,
+            K: u32,
+            group_size: u32,
+        };
+
+        /// Total bias element count across all layers
+        /// (contiguous, no weight interleaving).
+        pub const total_bias_count: u32 = f16_bias_count;
+
+        /// Per-layer bias offsets into a flat bias-only
+        /// buffer for 1-bit inference.  Biases are packed
+        /// contiguously: [layer0_biases][layer1_biases]...
+        const q1_bias_offsets: [Layout.num_layers]u32 = blk: {
+            var offsets: [Layout.num_layers]u32 = undefined;
+            var offset: u32 = 0;
+            for (0..Layout.num_layers) |i| {
+                offsets[i] = offset;
+                offset += Layout.bias_counts[i];
+            }
+            break :blk offsets;
+        };
+
+        /// Quantize this network's f32 weights to 1-bit
+        /// Q1_0_g128 format.  Dispatches one f32_to_1bit
+        /// kernel per layer.  Copies biases (f32) into a
+        /// separate contiguous buffer on the CPU — biases
+        /// are small (O(hundreds) of floats) so no GPU
+        /// dispatch is needed.
+        ///
+        /// The caller must allocate:
+        ///   - packed_weights: one PackedBuffer per layer,
+        ///     each with packed_count = weight_counts[i]
+        ///     and group_size = 128.
+        ///   - bias_f32: a Buffer of total_bias_count f32s.
+        ///
+        /// After this call, commitAndWait the command buffer
+        /// before reading the packed weights.
+        pub fn quantizeWeightsTo1Bit(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            packed_weights: *[Layout.num_layers]metal.PackedBuffer,
+            bias_f32: Buffer,
+        ) void {
+            std.debug.assert(
+                self.params.len == Layout.param_count,
+            );
+            std.debug.assert(
+                bias_f32.len >= total_bias_count,
+            );
+
+            // Copy biases on the CPU (small, O(hundreds) of
+            // floats — not worth a GPU dispatch).
+            const params_slice = self.params.asSlice();
+            const bias_slice = bias_f32.asSlice();
+            inline for (0..Layout.num_layers) |i| {
+                const src = Layout.getBiasSlice(
+                    params_slice,
+                    i,
+                );
+                const dst_off: usize = q1_bias_offsets[i];
+                const dst_len: usize = Layout.bias_counts[i];
+                @memcpy(
+                    bias_slice[dst_off..][0..dst_len],
+                    src,
+                );
+            }
+
+            // Dispatch f32_to_1bit for each layer's weights.
+            inline for (0..Layout.num_layers) |i| {
+                encode1BitQuantize(
+                    i,
+                    device,
+                    encoder,
+                    self.params,
+                    &packed_weights[i],
+                );
+            }
+        }
+
+        /// Dispatch f32_to_1bit for one layer's weights.
+        fn encode1BitQuantize(
+            comptime layer: u32,
+            device: *const Device,
+            encoder: objc.Object,
+            params: Buffer,
+            packed_buf: *const metal.PackedBuffer,
+        ) void {
+            comptime {
+                std.debug.assert(layer < Layout.num_layers);
+            }
+            std.debug.assert(
+                params.len == Layout.param_count,
+            );
+            std.debug.assert(
+                packed_buf.packed_count ==
+                    Layout.weight_counts[layer],
+            );
+
+            // buffer(0): f32 weights at layer's offset.
+            metal.setBufferWithOffset(
+                encoder,
+                params,
+                Layout.weight_offsets[layer],
+                0,
+            );
+
+            // buffer(1,2): packed bits + scales.
+            metal.setPackedBuffer(
+                encoder,
+                packed_buf.*,
+                1,
+            );
+
+            // buffer(3): Q1Dims.
+            const dims = Q1Dims{
+                .total_weights = Layout.weight_counts[layer],
+                .group_size = Layout.PACK_GROUP_SIZE,
+            };
+            metal.setBytes(encoder, Q1Dims, &dims, 3);
+
+            // One thread per 128-weight group.
+            const num_groups = Layout.numScaleGroups(layer);
+            device.dispatch1D(
+                encoder,
+                device.f32_to_1bit,
+                num_groups,
+            );
+        }
+
+        /// 1-bit quantized inference: forward pass using
+        /// packed Q1_0_g128 weights.  Biases remain f32.
+        /// Activation functions are applied per-layer after
+        /// bias addition.
+        ///
+        /// Always uses qmm (tiled matmul with bounds checks)
+        /// for all batch sizes.  The qmv simdgroup kernel
+        /// requires K % 32 == 0, which MNIST layer 0 (K=784)
+        /// does not satisfy.  When targeting transformer
+        /// dimensions (K >= 128, K % 128 == 0), a qmv path
+        /// can be added for single-token decode.
+        ///
+        /// Output lands in post_activations[last], readable
+        /// via getOutput().
+        pub fn forwardInfer1Bit(
+            self: *const Self,
+            device: *const Device,
+            encoder: objc.Object,
+            input: Buffer,
+            packed_weights: *const [Layout.num_layers]metal.PackedBuffer,
+            bias_f32: Buffer,
+            batch_size: u32,
+        ) void {
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(batch_size <= max_batch_size);
+            std.debug.assert(
+                input.len >=
+                    batch_size * Layout.input_size,
+            );
+            std.debug.assert(
+                bias_f32.len >= total_bias_count,
+            );
+
+            inline for (0..Layout.num_layers) |i| {
+                const layer_input: Buffer =
+                    if (i == 0)
+                        input
+                    else
+                        self.post_activations[i - 1];
+
+                // Step 1: 1-bit tiled matmul → scratch.
+                encode1BitMatmul(
+                    i,
+                    device,
+                    encoder,
+                    layer_input,
+                    &packed_weights[i],
+                    self.scratch,
+                    batch_size,
+                );
+
+                // Step 2: bias_add → output buffer.
+                // Activation present → pre_activations.
+                // No activation   → post_activations.
+                const bias_target: Buffer =
+                    if (Layout.layers[i].act != .none)
+                        self.pre_activations[i]
+                    else
+                        self.post_activations[i];
+
+                encodeBiasAdd1Bit(
+                    i,
+                    device,
+                    encoder,
+                    self.scratch,
+                    bias_f32,
+                    bias_target,
+                    batch_size,
+                );
+
+                // Step 3: activation (if any).
+                if (Layout.layers[i].act != .none) {
+                    encodeActivation(
+                        Layout.layers[i].act,
+                        Layout.layers[i].out,
+                        device,
+                        encoder,
+                        self.pre_activations[i],
+                        self.post_activations[i],
+                        batch_size,
+                    );
+                }
+            }
+        }
+
+        /// Encode qmm (1-bit tiled matmul) for one layer.
+        /// A is [batch_size × in_size] f32 activations.
+        /// W is [out_size × in_size] packed Q1_0_g128.
+        /// Output is [batch_size × out_size] f32.
+        fn encode1BitMatmul(
+            comptime layer: u32,
+            device: *const Device,
+            encoder: objc.Object,
+            layer_input: Buffer,
+            packed_buf: *const metal.PackedBuffer,
+            output: Buffer,
+            batch_size: u32,
+        ) void {
+            comptime {
+                std.debug.assert(layer < Layout.num_layers);
+            }
+            const in_size = Layout.layers[layer].in;
+            const out_size = Layout.layers[layer].out;
+
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(
+                layer_input.len >=
+                    batch_size * in_size,
+            );
+            std.debug.assert(
+                output.len >= batch_size * out_size,
+            );
+
+            // buffer(0): A (activations).
+            metal.setBuffer(encoder, layer_input, 0);
+            // buffer(1,2): packed bits + scales.
+            metal.setPackedBuffer(
+                encoder,
+                packed_buf.*,
+                1,
+            );
+            // buffer(3): output.
+            metal.setBuffer(encoder, output, 3);
+
+            // buffer(4): QMMDims.
+            const dims = QMMDims{
+                .M = batch_size,
+                .N = out_size,
+                .K = in_size,
+                .group_size = Layout.PACK_GROUP_SIZE,
+            };
+            metal.setBytes(
+                encoder,
+                QMMDims,
+                &dims,
+                4,
+            );
+
+            // 16×16 threadgroups (same as matmul_tiled).
+            device.dispatch2D(
+                encoder,
+                device.qmm,
+                out_size,
+                batch_size,
+            );
+        }
+
+        /// Encode bias_add for 1-bit inference, reading bias
+        /// from the flat bias-only buffer at the layer's
+        /// contiguous offset.
+        fn encodeBiasAdd1Bit(
+            comptime layer: u32,
+            device: *const Device,
+            encoder: objc.Object,
+            matmul_output: Buffer,
+            bias_f32: Buffer,
+            output: Buffer,
+            batch_size: u32,
+        ) void {
+            comptime {
+                std.debug.assert(layer < Layout.num_layers);
+            }
+            std.debug.assert(batch_size > 0);
+            std.debug.assert(
+                bias_f32.len >= total_bias_count,
+            );
+
+            metal.setBuffer(encoder, matmul_output, 0);
+            metal.setBufferWithOffset(
+                encoder,
+                bias_f32,
+                q1_bias_offsets[layer],
+                1,
+            );
+            metal.setBuffer(encoder, output, 2);
+
+            const n_val: u32 = Layout.layers[layer].out;
+            metal.setBytes(encoder, u32, &n_val, 3);
+
+            device.dispatch2D(
+                encoder,
+                device.bias_add,
+                Layout.layers[layer].out,
+                batch_size,
+            );
+        }
+
+        // ====================================================
         // CPU forward pass (pure Zig, no Metal)
         // ====================================================
 
@@ -2089,7 +2419,10 @@ pub fn Network(
                 @as(c_ulong, weight_offset) * @sizeOf(f32);
             const offsets = [_]c_ulong{ 0, w_bytes, 0 };
             metal.setBuffersBatchOffsets(
-                encoder, &bufs, &offsets, 0,
+                encoder,
+                &bufs,
+                &offsets,
+                0,
             );
 
             // Pack M, K, N into 1 setBytes call.
@@ -2099,12 +2432,18 @@ pub fn Network(
                 .N = out_size,
             };
             metal.setBytes(
-                encoder, MatmulDims, &dims, 3,
+                encoder,
+                MatmulDims,
+                &dims,
+                3,
             );
 
             // Bias at buffer(4) for packed variant.
             metal.setBufferWithOffset(
-                encoder, params, bias_offset, 4,
+                encoder,
+                params,
+                bias_offset,
+                4,
             );
 
             device.dispatch2D(
@@ -2139,7 +2478,10 @@ pub fn Network(
                 @as(c_ulong, weight_offset) * @sizeOf(f32);
             const offsets = [_]c_ulong{ 0, w_bytes, 0 };
             metal.setBuffersBatchOffsets(
-                encoder, &bufs, &offsets, 0,
+                encoder,
+                &bufs,
+                &offsets,
+                0,
             );
 
             const dims = MatmulDims{
@@ -2148,11 +2490,17 @@ pub fn Network(
                 .N = out_size,
             };
             metal.setBytes(
-                encoder, MatmulDims, &dims, 3,
+                encoder,
+                MatmulDims,
+                &dims,
+                3,
             );
 
             metal.setBufferWithOffset(
-                encoder, params, bias_offset, 4,
+                encoder,
+                params,
+                bias_offset,
+                4,
             );
 
             device.dispatch2D(
@@ -2832,8 +3180,13 @@ pub fn Network(
 
             if (vt > 0) {
                 cpuMknTail8(
-                    out_size, vc, VEC, vt,
-                    in_p, w_p, tail_accum,
+                    out_size,
+                    vc,
+                    VEC,
+                    vt,
+                    in_p,
+                    w_p,
+                    tail_accum,
                 );
             }
         }
@@ -2898,9 +3251,9 @@ pub fn Network(
                 inline for (0..vt) |t| {
                     out_row[tail_off + t] =
                         applyActScalar(
-                        act,
-                        tail_accum[t],
-                    );
+                            act,
+                            tail_accum[t],
+                        );
                 }
             }
         }

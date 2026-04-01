@@ -1604,3 +1604,432 @@ kernel void adam_update(
     // Parameter update.
     params[gid] -= lr * m_hat / (sqrt(v_hat) + epsilon);
 }
+
+// ============================================================================
+// Float32 to 1-bit quantization (Q1_0_g128 format)
+// ============================================================================
+
+/// Dimensions for the f32_to_1bit quantization kernel.
+struct Q1Dims {
+    uint total_weights;  // Total number of f32 weight elements.
+    uint group_size;     // Weights per scale group (128).
+};
+
+/// Quantize f32 weights to 1-bit Q1_0_g128 format.
+/// Each group of 128 weights shares one f16 scale.
+/// bit=1 → +scale, bit=0 → −scale.
+/// Scale = mean(abs(weights)) for the group.
+///
+/// Output layout: packed_bits buffer + separate scales buffer.
+/// packed_bytes = ceil(total_weights / 8)
+///
+/// Dispatch: one thread per group (ceil(total_weights / 128) threads).
+kernel void f32_to_1bit(
+    device const float* weights      [[buffer(0)]],
+    device uint8_t*     packed_bits  [[buffer(1)]],
+    device half*        scales       [[buffer(2)]],
+    constant Q1Dims&    dims         [[buffer(3)]],
+    uint                gid          [[thread_position_in_grid]])
+{
+    const uint group_idx = gid;
+    const uint group_start = group_idx * dims.group_size;
+
+    // Bounds check: last group may be partial.
+    if (group_start >= dims.total_weights) return;
+
+    const uint group_end = min(
+        group_start + dims.group_size,
+        dims.total_weights
+    );
+    const uint count = group_end - group_start;
+
+    // Compute mean absolute value for the scale.
+    float abs_sum = 0.0f;
+    for (uint i = 0; i < count; i++) {
+        abs_sum += abs(weights[group_start + i]);
+    }
+    float scale = abs_sum / float(count);
+    scales[group_idx] = half(scale);
+
+    // Pack weights into bits: bit=1 if weight >= 0, bit=0 if weight < 0.
+    // LSB-first within each byte.
+    const uint byte_start = group_start / 8;
+    const uint full_bytes = count / 8;
+    const uint remainder = count % 8;
+
+    for (uint i = 0; i < full_bytes; i++) {
+        uint8_t byte_val = 0;
+        const uint w_base = group_start + i * 8;
+        byte_val |= (weights[w_base + 0] >= 0.0f) ? 0x01 : 0;
+        byte_val |= (weights[w_base + 1] >= 0.0f) ? 0x02 : 0;
+        byte_val |= (weights[w_base + 2] >= 0.0f) ? 0x04 : 0;
+        byte_val |= (weights[w_base + 3] >= 0.0f) ? 0x08 : 0;
+        byte_val |= (weights[w_base + 4] >= 0.0f) ? 0x10 : 0;
+        byte_val |= (weights[w_base + 5] >= 0.0f) ? 0x20 : 0;
+        byte_val |= (weights[w_base + 6] >= 0.0f) ? 0x40 : 0;
+        byte_val |= (weights[w_base + 7] >= 0.0f) ? 0x80 : 0;
+        packed_bits[byte_start + i] = byte_val;
+    }
+
+    // Handle the remainder bits in the last partial byte.
+    if (remainder > 0) {
+        uint8_t byte_val = 0;
+        const uint w_base = group_start + full_bytes * 8;
+        for (uint b = 0; b < remainder; b++) {
+            if (weights[w_base + b] >= 0.0f) {
+                byte_val |= (1u << b);
+            }
+        }
+        packed_bits[byte_start + full_bytes] = byte_val;
+    }
+}
+
+// ============================================================================
+// 1-bit matrix-vector multiply (qmv) — Q1_0_g128 format
+// ============================================================================
+
+/// Dimensions for qmv kernel.
+struct QMVDims {
+    uint M;           // Output rows (weight matrix rows).
+    uint K;           // Input dimension (weight matrix columns).
+    uint group_size;  // Weights per scale group (128).
+};
+
+/// 1-bit matrix-vector multiply: output[row] = dot(W_1bit[row], input).
+///
+/// W is [M × K] in Q1_0_g128 packed format:
+///   - Packed bits: ceil(M * K / 8) bytes, row-major.
+///   - Scales: ceil(M * K / group_size) f16 values.
+///
+/// Each output row is computed by one simdgroup (32 threads).
+/// Two simdgroups per threadgroup → two rows per threadgroup.
+///
+/// Uses the identity: scale * (2 * set_accum - group_sum)
+/// where set_accum = sum of input[col] where bit=1,
+/// and group_sum = sum of all input[col] in the group.
+/// This avoids per-element branching on the sign.
+///
+/// Dispatch: threadgroups = ceil(M / 2), threads_per_group = 64.
+kernel void qmv(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    device const float*   input        [[buffer(2)]],
+    device float*         output       [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint                  tgid         [[threadgroup_position_in_grid]],
+    uint                  tid_in_tg    [[thread_index_in_threadgroup]])
+{
+    // Two simdgroups per threadgroup: threads 0–31 handle one row,
+    // threads 32–63 handle the next.
+    const uint simdgroup_idx = tid_in_tg / 32;
+    const uint lane = tid_in_tg % 32;
+    const uint row = tgid * 2 + simdgroup_idx;
+
+    // Bounds check: last threadgroup may have only one valid row.
+    if (row >= dims.M) return;
+
+    const uint K = dims.K;
+    const uint group_size = dims.group_size;
+    const uint groups_per_row = (K + group_size - 1) / group_size;
+
+    // Each of 32 lanes processes K/32 columns.
+    // K must be a multiple of group_size (128), and 128/32 = 4,
+    // so each lane processes complete groups.
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+
+    // Byte offset for this row's packed bits.
+    const uint row_bit_offset = row * (K / 8);
+    // Scale offset for this row.
+    const uint row_scale_offset = row * groups_per_row;
+
+    float accum = 0.0f;
+
+    // Track group boundaries for per-group scale application.
+    uint cur_group = col_start / group_size;
+    float set_accum = 0.0f;   // Sum of input[col] where bit=1.
+    float group_sum = 0.0f;   // Sum of all input[col] in group.
+
+    // Iterate over the columns assigned to this lane.
+    for (uint c = 0; c < cols_per_lane; c++) {
+        const uint col = col_start + c;
+        const uint group_idx = col / group_size;
+
+        // When we cross a group boundary, flush the accumulator.
+        if (group_idx != cur_group) {
+            const float scale = float(
+                scales[row_scale_offset + cur_group]
+            );
+            accum += scale * (2.0f * set_accum - group_sum);
+            set_accum = 0.0f;
+            group_sum = 0.0f;
+            cur_group = group_idx;
+        }
+
+        // Which byte and bit within the packed row.
+        const uint byte_idx = row_bit_offset + col / 8;
+        const uint bit_pos = col % 8;
+        const bool bit_set = (packed_bits[byte_idx] >> bit_pos) & 1;
+
+        // Branchless conditional accumulation via select().
+        const float x_val = input[col];
+        group_sum += x_val;
+        set_accum += select(0.0f, x_val, bit_set);
+    }
+
+    // Flush the final group.
+    {
+        const float scale = float(
+            scales[row_scale_offset + cur_group]
+        );
+        accum += scale * (2.0f * set_accum - group_sum);
+    }
+
+    // Reduce across the 32 lanes in the simdgroup.
+    accum = simd_sum(accum);
+
+    // Lane 0 writes the final result.
+    if (lane == 0) {
+        output[row] = accum;
+    }
+}
+
+// ============================================================================
+// 1-bit matrix-vector multiply (qmv_fast) — aligned, byte-unrolled
+// ============================================================================
+
+/// Fast qmv for aligned dimensions: K % 128 == 0.
+///
+/// Three key optimisations over qmv:
+///   1. Loads the input vector into threadgroup shared memory
+///      so all simdgroups share one copy (4 rows per tgroup).
+///   2. Processes 8 columns per inner-loop iteration (one
+///      packed byte) instead of 1 bit, cutting loop count 8×.
+///   3. Removes the per-column group-boundary check — when
+///      K % 128 == 0 and cols_per_lane <= 128, no lane ever
+///      crosses a group boundary.
+///
+/// Dispatch: threadgroups = ceil(M / 4), threads = 128.
+kernel void qmv_fast(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    device const float*   input        [[buffer(2)]],
+    device float*         output       [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    // 4 simdgroups of 32 lanes → 4 rows per threadgroup.
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    const uint row = tgid * 4 + simdgroup_idx;
+
+    // Cooperatively load input vector into shared memory.
+    // 128 threads load up to K floats (ceil(K/128) iters).
+    threadgroup float shared_input[6144];
+    for (uint i = tid; i < K; i += 128) {
+        shared_input[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= M) return;
+
+    const uint groups_per_row = K / group_size;
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    const uint bytes_per_lane = cols_per_lane / 8;
+
+    // Byte offset for this row's packed bits.
+    const uint row_byte_base = row * (K / 8) + col_start / 8;
+    // Scale offset for this row.
+    const uint row_scale_offset = row * groups_per_row;
+    // Group index for this lane (constant — no crossing).
+    const uint grp = col_start / group_size;
+
+    float set_accum = 0.0f;
+    float group_sum = 0.0f;
+
+    // Process 8 columns (one packed byte) per iteration.
+    for (uint b = 0; b < bytes_per_lane; b++) {
+        const uint byte_val = packed_bits[row_byte_base + b];
+        const uint base_col = col_start + b * 8;
+
+        // Unrolled: 8 columns from one byte.
+        float x0 = shared_input[base_col + 0];
+        float x1 = shared_input[base_col + 1];
+        float x2 = shared_input[base_col + 2];
+        float x3 = shared_input[base_col + 3];
+        float x4 = shared_input[base_col + 4];
+        float x5 = shared_input[base_col + 5];
+        float x6 = shared_input[base_col + 6];
+        float x7 = shared_input[base_col + 7];
+
+        group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+
+        // Branchless conditional sum via select().
+        set_accum += select(0.0f, x0, bool(byte_val & 1));
+        set_accum += select(0.0f, x1, bool(byte_val & 2));
+        set_accum += select(0.0f, x2, bool(byte_val & 4));
+        set_accum += select(0.0f, x3, bool(byte_val & 8));
+        set_accum += select(0.0f, x4, bool(byte_val & 16));
+        set_accum += select(0.0f, x5, bool(byte_val & 32));
+        set_accum += select(0.0f, x6, bool(byte_val & 64));
+        set_accum += select(0.0f, x7, bool(byte_val & 128));
+    }
+
+    // Apply scale for this lane's group.
+    const float scale = float(
+        scales[row_scale_offset + grp]
+    );
+    float accum = scale * (2.0f * set_accum - group_sum);
+
+    // Reduce across the 32 lanes in the simdgroup.
+    accum = simd_sum(accum);
+
+    // Lane 0 writes the final result.
+    if (lane == 0) {
+        output[row] = accum;
+    }
+}
+
+// ============================================================================
+// 1-bit matrix-matrix multiply (qmm) — Q1_0_g128 format
+// ============================================================================
+
+/// Dimensions for qmm kernel.
+struct QMMDims {
+    uint M;           // Rows of A / rows of output.
+    uint N;           // Cols of output (= cols of W).
+    uint K;           // Cols of A / rows of W.
+    uint group_size;  // Weights per scale group (128).
+};
+
+/// 1-bit tiled matrix multiply: output[m][n] = sum_k(A[m][k] * W_dequant[k][n]).
+///
+/// A is [M × K] in f32 (activations).
+/// W is [K × N] in Q1_0_g128 packed format (row-major, matching the
+/// existing matmul convention where weights are [in_size × out_size]).
+/// Output is [M × N] in f32.
+///
+/// Tiling: 16×16 output tiles, K tiles of 128 (= group_size).
+/// Dequantizes W tiles into threadgroup memory as f32 (not f16 — preserves
+/// accumulation precision since weights are already maximally quantized),
+/// then performs a standard tiled matmul.
+///
+/// Threadgroup memory: 16×128×4 bytes × 2 tiles = 16 KB, within Metal's
+/// 32 KB limit.
+///
+/// Dispatch: threadgroups = (ceil(N/16), ceil(M/16)), threads = 16×16.
+kernel void qmm(
+    device const float*   A            [[buffer(0)]],
+    device const uint8_t* packed_bits  [[buffer(1)]],
+    device const half*    scales       [[buffer(2)]],
+    device float*         output       [[buffer(3)]],
+    constant QMMDims&     dims         [[buffer(4)]],
+    uint2                 tgid         [[threadgroup_position_in_grid]],
+    uint2                 tid          [[thread_position_in_threadgroup]])
+{
+    // Tile size matches existing matmul_tiled.
+    const uint QMM_TS = 16;
+    const uint K_TILE = 128; // = group_size
+
+    // Shared memory tiles.
+    threadgroup float tile_A[16][128];
+    threadgroup float tile_W[16][128];
+
+    const uint M = dims.M;
+    const uint N = dims.N;
+    const uint K = dims.K;
+    const uint group_size = dims.group_size;
+
+    // Output tile position.
+    const uint row_base = tgid.y * QMM_TS; // M dimension
+    const uint col_base = tgid.x * QMM_TS; // N dimension
+
+    const uint local_row = tid.y;
+    const uint local_col = tid.x;
+
+    const uint global_row = row_base + local_row;
+    const uint global_col = col_base + local_col;
+
+    float accum = 0.0f;
+
+    // Step through K in chunks of K_TILE (128).
+    const uint num_k_tiles = (K + K_TILE - 1) / K_TILE;
+    for (uint kt = 0; kt < num_k_tiles; kt++) {
+        const uint k_base = kt * K_TILE;
+
+        // Cooperative load of A tile: each thread loads multiple elements.
+        // 16 threads × 16 threads = 256 threads loading 16 × 128 = 2048
+        // elements.  Each thread loads 2048 / 256 = 8 elements.
+        for (uint e = 0; e < 8; e++) {
+            const uint flat_idx =
+                (local_row * QMM_TS + local_col) * 8 + e;
+            const uint tile_r = flat_idx / K_TILE;
+            const uint tile_c = flat_idx % K_TILE;
+            const uint a_row = row_base + tile_r;
+            const uint a_col = k_base + tile_c;
+            if (a_row < M && a_col < K) {
+                tile_A[tile_r][tile_c] = A[a_row * K + a_col];
+            } else {
+                tile_A[tile_r][tile_c] = 0.0f;
+            }
+        }
+
+        // Cooperative load + dequantize of W tile.
+        // W is [K × N] row-major packed (matching the existing matmul
+        // convention).  We load a 128×16 (K×N) region, then store it
+        // as tile_W[n_local][k_local] so the inner loop can index
+        // tile_W[local_col][k] for the dot product.
+        for (uint e = 0; e < 8; e++) {
+            const uint flat_idx =
+                (local_row * QMM_TS + local_col) * 8 + e;
+            const uint tile_n = flat_idx / K_TILE; // N offset (0..15)
+            const uint tile_k = flat_idx % K_TILE; // K offset (0..127)
+            const uint w_k = k_base + tile_k;      // K dimension
+            const uint w_n = col_base + tile_n;     // N dimension
+
+            if (w_k < K && w_n < N) {
+                // Locate the packed bit in [K × N] storage.
+                const uint flat_bit = w_k * N + w_n;
+                const uint byte_idx = flat_bit / 8;
+                const uint bit_pos = flat_bit % 8;
+                const bool bit_set =
+                    (packed_bits[byte_idx] >> bit_pos) & 1;
+
+                // Scale group from flat position in packed data.
+                const uint g_idx = flat_bit / group_size;
+                const float scale = float(scales[g_idx]);
+
+                tile_W[tile_n][tile_k] =
+                    select(-scale, +scale, bit_set);
+            } else {
+                tile_W[tile_n][tile_k] = 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Tile matmul: accumulate dot product for this K tile.
+        // output[global_row][global_col] +=
+        //   sum over k of tile_A[local_row][k] * tile_W[local_col][k]
+        // tile_W[n_local][k] holds W[k_base+k][col_base+n_local].
+        if (global_row < M && global_col < N) {
+            for (uint k = 0; k < K_TILE; k++) {
+                accum += tile_A[local_row][k]
+                       * tile_W[local_col][k];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write result.
+    if (global_row < M && global_col < N) {
+        output[global_row * N + global_col] = accum;
+    }
+}

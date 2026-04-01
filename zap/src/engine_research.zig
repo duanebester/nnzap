@@ -45,11 +45,15 @@ const tools = @import("tools.zig");
 // ============================================================
 
 const ENGINE_FILES = [_][]const u8{
+    "nn/src/transformer.zig",
+    "nn/src/model.zig",
     "nn/src/metal.zig",
-    "nn/src/network.zig",
+    "nn/src/safetensors.zig",
+    "nn/src/tokenizer.zig",
+    "nn/src/shaders/transformer.metal",
     "nn/src/shaders/compute.metal",
-    "nn/src/layout.zig",
-    "nn/examples/mnist.zig",
+    "nn/examples/bonsai.zig",
+    "nn/examples/bonsai_bench.zig",
 };
 
 const SNAPSHOT_DIR = ".engine_snapshots";
@@ -64,6 +68,9 @@ comptime {
     std.debug.assert(ENGINE_FILES.len > 0);
     std.debug.assert(ENGINE_FILES.len <= 16);
     std.debug.assert(TIMESTAMP_LEN == 19);
+    // Bonsai files: 9 source files covering the
+    // transformer inference stack.
+    std.debug.assert(ENGINE_FILES.len == 9);
 }
 
 // ============================================================
@@ -722,72 +729,35 @@ fn writeTestFailure(
 // ============================================================
 
 fn toolBench(arena: Allocator) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        tools.NN_DIR ++ "/" ++ tools.BENCH_DIR,
-    );
-
-    // Clean old benchmarks so we find exactly the new one.
-    _ = tools.cleanBenchmarkFiles(bench_fs);
-
-    std.debug.print(
-        "engine_research: running zig build run...\n",
-        .{},
-    );
-
-    const result = std.process.Child.run(.{
-        .allocator = arena,
-        .argv = &[_][]const u8{ "zig", "build", "run" },
-        .cwd = "../" ++ tools.NN_DIR,
-        .max_output_bytes = tools.MAX_OUTPUT_BYTES,
-    }) catch |err| {
-        const json = try std.fmt.allocPrint(
-            arena,
-            "{{\"status\": \"error\", " ++
-                "\"error\": \"spawn_failed: " ++
-                "{s}\"}}\n",
-            .{@errorName(err)},
-        );
-        try tools.writeStdout(json);
-        return;
-    };
-
-    // Forward training output to stderr for diagnostics.
-    if (result.stderr.len > 0) {
-        tools.stderr_file.writeAll(result.stderr) catch {};
-    }
-
-    const success = switch (result.term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
-
-    if (!success) {
-        try writeBenchError(arena, result.stderr);
-        return;
-    }
-
-    // Find and output the benchmark JSON.
-    try emitBenchmarkResult(arena, bench_fs);
+    // Bonsai bench must run in ReleaseFast — debug mode
+    // is unusably slow (~0.5 tok/s vs ~37 tok/s).
+    try runBonsaiBench(arena);
 }
 
 fn toolBenchInfer(arena: Allocator) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        tools.NN_DIR ++ "/" ++ tools.BENCH_DIR,
-    );
+    // bench and bench-infer are the same for bonsai:
+    // there is only one benchmark (decode throughput).
+    try runBonsaiBench(arena);
+}
 
-    // Clean old benchmarks so we find exactly the new one.
-    _ = tools.cleanBenchmarkFiles(bench_fs);
-
+/// Run the bonsai inference benchmark and emit its
+/// JSON output to stdout.  The benchmark binary
+/// writes structured JSON to stdout directly.
+fn runBonsaiBench(arena: Allocator) !void {
     std.debug.print(
-        "engine_research: running zig build run-infer...\n",
+        "engine_research: running bonsai bench " ++
+            "(ReleaseFast)...\n",
         .{},
     );
 
     const result = std.process.Child.run(.{
         .allocator = arena,
-        .argv = &[_][]const u8{ "zig", "build", "run-infer" },
+        .argv = &[_][]const u8{
+            "zig",
+            "build",
+            "run-bonsai-bench",
+            "-Doptimize=ReleaseFast",
+        },
         .cwd = "../" ++ tools.NN_DIR,
         .max_output_bytes = tools.MAX_OUTPUT_BYTES,
     }) catch |err| {
@@ -802,7 +772,7 @@ fn toolBenchInfer(arena: Allocator) !void {
         return;
     };
 
-    // Forward benchmark output to stderr for diagnostics.
+    // Forward diagnostic output to stderr.
     if (result.stderr.len > 0) {
         tools.stderr_file.writeAll(result.stderr) catch {};
     }
@@ -817,8 +787,16 @@ fn toolBenchInfer(arena: Allocator) !void {
         return;
     }
 
-    // Find and output the benchmark JSON.
-    try emitBenchmarkResult(arena, bench_fs);
+    // The bonsai bench binary writes JSON to stdout.
+    if (result.stdout.len > 0) {
+        try tools.writeStdout(result.stdout);
+    } else {
+        try tools.writeStdout(
+            "{\"status\": \"error\", " ++
+                "\"error\": \"no benchmark " ++
+                "output\"}\n",
+        );
+    }
 }
 
 /// Locate the new benchmark file and write it to stdout.

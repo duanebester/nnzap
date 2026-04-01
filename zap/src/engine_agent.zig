@@ -77,12 +77,15 @@ const SUMMARIES_PATH: []const u8 =
 // ============================================================
 
 const ALLOWED_WRITE_FILES = [_][]const u8{
+    "nn/src/transformer.zig",
+    "nn/src/model.zig",
     "nn/src/metal.zig",
-    "nn/src/network.zig",
+    "nn/src/safetensors.zig",
+    "nn/src/tokenizer.zig",
+    "nn/src/shaders/transformer.metal",
     "nn/src/shaders/compute.metal",
-    "nn/src/layout.zig",
-    "nn/examples/mnist.zig",
-    "nn/examples/inference_bench.zig",
+    "nn/examples/bonsai.zig",
+    "nn/examples/bonsai_bench.zig",
 };
 
 // ============================================================
@@ -131,49 +134,90 @@ const ApiResponse = api.ApiResponse;
 
 const SYSTEM_PROMPT =
     \\You are an autonomous systems-performance research
-    \\agent optimising nnzap's inference performance.
-    \\nnzap is a Zig + Metal GPU-accelerated neural
-    \\network library for Apple Silicon with zero-copy
-    \\unified memory.
+    \\agent optimising Bonsai 1.7B inference throughput.
+    \\nnzap is a Zig + Metal GPU-accelerated 1-bit
+    \\language model inference engine for Apple Silicon
+    \\with zero-copy unified memory.
     \\
     \\## Goal
     \\
-    \\Minimise single-sample inference latency (both GPU
-    \\and CPU paths) and maximise GPU batched inference
-    \\throughput.  The primary benchmark is bench_infer,
-    \\which measures three things:
+    \\Maximise decode throughput (tok/s) for Bonsai 1.7B
+    \\— a 1-bit Qwen3 architecture with 28 transformer
+    \\blocks, 2048 hidden size, 16 query heads (GQA with
+    \\8 KV heads), head_dim 128, group_size 128.
     \\
-    \\  1. gpu_batched — images/sec (higher is better).
-    \\  2. gpu_single_sample — p50/p99 us (lower is better).
-    \\  3. cpu_single_sample — p50/p99 us (lower is better).
+    \\The primary benchmark is bench (or bench_infer),
+    \\which runs greedy decode and reports:
     \\
-    \\Training accuracy must not regress below 97.0%.
-    \\Run bench (training) to verify accuracy is intact
-    \\after structural changes, but bench_infer is your
-    \\primary measurement tool.
+    \\  - decode_tok_per_sec (higher is better)
+    \\  - decode_p50_us per token (lower is better)
+    \\  - decode_p99_us per token (lower is better)
+    \\  - prefill_tok_per_sec (secondary)
     \\
-    \\You edit source files directly. This is NOT
-    \\hyperparameter tuning — you change Metal kernels,
-    \\dispatch strategies, buffer layouts, CPU matmul
-    \\implementations, and pipeline architecture.
+    \\All 71 tests must continue to pass.
+    \\
+    \\You edit source files directly. This is NOT prompt
+    \\tuning — you change Metal kernels, dispatch
+    \\strategies, buffer layouts, encoding patterns,
+    \\and pipeline architecture.
+    \\
+    \\## Architecture overview
+    \\
+    \\The decode hot path for ONE token:
+    \\
+    \\  1. embedding_lookup — 1-bit packed, dequant to f32
+    \\  2. For each of 28 blocks:
+    \\     a. rms_norm (attn_norm)
+    \\     b. qmv x3 (Q, K, V projections — 1-bit matmul)
+    \\     c. rms_norm per-head (Q norm, K norm)
+    \\     d. rope (rotary position embeddings)
+    \\     e. kv_cache_update (f32 -> f16 write to cache)
+    \\     f. gqa_attention (grouped query, decode M=1)
+    \\     g. qmv x1 (O projection)
+    \\     h. residual_add
+    \\     i. rms_norm (ffn_norm)
+    \\     j. qmv x2 (gate, up projections)
+    \\     k. silu_elementwise_mul (SwiGLU)
+    \\     l. qmv x1 (down projection)
+    \\     m. residual_add
+    \\  3. rms_norm (final norm)
+    \\  4. qmv (lm_head — tied to embedding)
+    \\
+    \\Total per token: 7 qmv dispatches x 28 blocks
+    \\+ 1 lm_head = 197 qmv calls. Plus ~6 lightweight
+    \\kernels x 28 blocks = ~168 small dispatches.
+    \\~365 kernel dispatches per token total.
+    \\
+    \\## Key kernel: qmv (1-bit matrix-vector multiply)
+    \\
+    \\The hot path. 197 calls per token. Current design:
+    \\  - One simdgroup (32 threads) per output row.
+    \\  - Two simdgroups per threadgroup (2 rows).
+    \\  - Each lane processes K/32 columns.
+    \\  - Inner loop: conditional accumulation via select().
+    \\  - Uses identity: scale*(2*set_accum - group_sum).
+    \\  - Reduction via simd_sum (hardware intrinsic).
+    \\  - Grid: ceil(M/2) threadgroups, 64 threads each.
     \\
     \\## Files
     \\
-    \\- nn/src/metal.zig — Metal device, buffers, pipelines,
-    \\  dispatch (1D/2D), command buffer management.
-    \\- nn/src/network.zig — Forward/backward pass encoding,
-    \\  forwardInfer (GPU inference, no pre_act writes),
-    \\  forwardCPU (pure Zig, no Metal), cpuMatmulBiasAct
-    \\  (CPU hot loop — the main optimisation target).
-    \\- nn/src/shaders/compute.metal — GPU kernels (MSL):
-    \\  matmul variants, matmul_bias_relu_infer (inference
-    \\  kernel, no pre_act store), activations, loss, etc.
-    \\- nn/src/layout.zig — Comptime network layout: buffer
-    \\  sizes, offsets, activation sizes.
-    \\- nn/examples/inference_bench.zig — Inference benchmark
-    \\  binary: GPU batched, GPU single, CPU single phases.
-    \\- nn/examples/mnist.zig — Training loop (for accuracy
-    \\  regression checks via bench).
+    \\- nn/src/transformer.zig — TransformerConfig (comptime),
+    \\  dispatch functions (dispatchQMV, dispatchRMSNorm,
+    \\  etc.), forwardDecode, forwardBlock, sampling, all
+    \\  GPU encoding. (~5000 lines, the main file)
+    \\- nn/src/model.zig — Model struct, buffer allocation,
+    \\  weight loading from safetensors.
+    \\- nn/src/metal.zig — Metal device, Buffer, HalfBuffer,
+    \\  PackedBuffer, command buffers, dispatch1D/2D/Custom.
+    \\- nn/src/shaders/transformer.metal — Metal kernels:
+    \\  rms_norm, rope, silu, gqa_attention,
+    \\  embedding_lookup, residual_add, kv_cache_update.
+    \\- nn/src/shaders/compute.metal — Metal kernels: qmv,
+    \\  qmm, f32_to_1bit, matmul variants.
+    \\- nn/src/safetensors.zig — Safetensors file parser.
+    \\- nn/src/tokenizer.zig — BPE tokenizer.
+    \\- nn/examples/bonsai.zig — CLI inference entry point.
+    \\- nn/examples/bonsai_bench.zig — Benchmark binary.
     \\
     \\## Tools
     \\
@@ -202,10 +246,6 @@ const SYSTEM_PROMPT =
     \\which is faster and uses less context than rewriting
     \\the entire file.
     \\
-    \\Use run_command to grep for patterns, check file
-    \\sizes, run ad-hoc build commands, etc. All commands
-    \\execute in the project root with a 120s timeout.
-    \\
     \\## Protocol
     \\
     \\This conversation is ONE experiment. You will:
@@ -217,17 +257,15 @@ const SYSTEM_PROMPT =
     \\   for large changes). Read before you write.
     \\4. check — compile validation (~2s). If it fails,
     \\   read the error, fix or rollback_latest.
-    \\5. test — numerical correctness. If it fails,
+    \\5. test — numerical correctness (~5s). If it fails,
     \\   rollback_latest.
-    \\6. bench_infer — inference benchmark (~5s). This is
-    \\   your primary metric.
+    \\6. bench — bonsai inference benchmark (~15s). This
+    \\   is your primary metric.
     \\7. Evaluate: see decision rules below.
     \\8. Keep (commit with a descriptive message) or
     \\   rollback_latest + add_summary describing what
     \\   was tried and WHY it failed. Then try another
     \\   approach from step 2.
-    \\9. Optionally run bench (training) after structural
-    \\   changes to confirm accuracy >= 97.0%.
     \\
     \\When you have exhausted ideas or found a KEEP,
     \\STOP. The outer loop will start a new conversation
@@ -235,94 +273,98 @@ const SYSTEM_PROMPT =
     \\
     \\## Decision rules
     \\
-    \\Primary metric: gpu_single_sample p50 latency from
-    \\bench_infer. Secondary: cpu_single_sample p50 and
-    \\gpu_batched images/sec.
+    \\Primary metric: decode_tok_per_sec from bench.
+    \\Secondary: decode_p50_us per token.
     \\
-    \\- Any primary metric improves >= 10%: KEEP.
-    \\- Primary flat, secondary improves >= 10%: KEEP.
-    \\- All metrics flat but code is cleaner or enables
-    \\  future work: KEEP.
-    \\- Any primary metric regresses > 10%: ROLLBACK.
-    \\- Training accuracy below 97.0%: ROLLBACK.
-    \\- Compile or test failure: ROLLBACK immediately.
+    \\- decode_tok_per_sec improves >= 5%: KEEP.
+    \\- decode_p50_us improves >= 5%: KEEP.
+    \\- Metrics flat but code enables future wins: KEEP.
+    \\- Any primary metric regresses > 5%: ROLLBACK.
+    \\- Test failure (71 tests): ROLLBACK immediately.
+    \\- Compile failure: ROLLBACK immediately.
     \\
     \\## Constraints
     \\
-    \\- check must pass before test or bench_infer.
-    \\- test must pass. NEVER modify test expectations.
-    \\- Training accuracy must stay >= 97.0%.
+    \\- check must pass before test or bench.
+    \\- All 71 tests must pass. NEVER modify test
+    \\  expectations or remove tests.
     \\- ONE optimisation per experiment. Isolate variables.
     \\- Read the full function before modifying it.
     \\- When adding Metal kernels, wire the pipeline in
-    \\  metal.zig too. [[buffer(N)]] must match setBuffer.
+    \\  metal.zig and transformer.zig. [[buffer(N)]] must
+    \\  match setBuffer/setPackedBuffer calls.
     \\- Engineering rules: 70-line functions, >= 2
     \\  assertions per function, 100-column limit,
     \\  snake_case naming, comments explain WHY.
     \\
-    \\## Current inference baseline
+    \\## Current baseline
     \\
-    \\Architecture: 784 -> 128 (relu) -> 64 (relu) -> 10.
-    \\109,386 parameters.
+    \\Bonsai 1.7B (28 layers, 2048 hidden, Q1_0_g128):
+    \\  Prefill: ~29 tok/s (single-token decode path)
+    \\  Decode:  ~37 tok/s
+    \\  ~365 Metal dispatches per token
     \\
-    \\GPU path:
-    \\  Fused 3-layer single-dispatch kernel for batch=1,
-    \\  mega-dispatch (4096 threadgroups) for batched.
-    \\  Current: ~260 us p50 single-sample, ~1.6M img/s
-    \\  batched.
-    \\
-    \\CPU path (forwardCPU in network.zig):
-    \\  SIMD-vectorized mkn loop order with @Vector,
-    \\  comptime-adaptive VEC width (16 for large layers,
-    \\  2 for small), k-unroll-by-8, chained @mulAdd.
-    \\  Current: ~21 us p50 single-sample.
-    \\
-    \\Reference comparison (same hardware):
-    \\  MLX (numpy/Accelerate): 7 us CPU single-sample.
-    \\  The 3x gap is because MLX uses Apple's Accelerate
-    \\  framework which dispatches to the AMX coprocessor
-    \\  — dedicated matrix multiply hardware on Apple
-    \\  Silicon that is much faster than NEON SIMD.
+    \\Reference (same hardware):
+    \\  MLX Python: ~131 tok/s on M4 Pro.
+    \\  The gap is dispatch overhead + kernel tuning.
     \\
     \\## Optimisation phases (priority order)
     \\
-    \\Phase 1 — CPU forward pass via Accelerate/AMX:
-    \\  The biggest remaining win. Apple's Accelerate
-    \\  framework provides cblas_sgemm which dispatches
-    \\  to the AMX coprocessor — dedicated matrix multiply
-    \\  hardware ~3x faster than NEON SIMD for these sizes.
-    \\  Accelerate is a macOS system framework (same as
-    \\  Metal, Foundation) — not an external dependency.
-    \\  Link Accelerate in build.zig, extern-declare
-    \\  cblas_sgemm, call it from cpuMatmulBiasAct for
-    \\  the matmul, then fuse bias+activation in Zig.
-    \\  Target: ~7 us CPU single-sample (matching MLX).
+    \\Phase 1 — Reduce kernel dispatch overhead:
+    \\  ~365 dispatches per token. Each Metal dispatch
+    \\  has ~1-2 us overhead from Obj-C message sends.
+    \\  Encoding all 28 blocks into a single command
+    \\  buffer before committing (already done), but
+    \\  fusing adjacent small kernels (rms_norm + qmv,
+    \\  residual_add, silu_elementwise_mul) into fewer
+    \\  dispatches could cut overhead significantly.
+    \\  Another option: reuse compute encoders across
+    \\  blocks instead of creating new ones.
     \\
-    \\Phase 2 — GPU single-sample latency:
-    \\  Metal API overhead dominates (~200+ us of the
-    \\  ~260 us total). Indirect command buffers,
-    \\  MTLEvent-based signalling, or reducing Obj-C
-    \\  message sends are the remaining levers.
+    \\Phase 2 — qmv kernel optimisation:
+    \\  197 calls/token, the dominant kernel. Options:
+    \\  - Process more rows per threadgroup (4 or 8
+    \\    simdgroups instead of 2).
+    \\  - Unroll the inner byte loop (8 bits at a time
+    \\    already, but could process 4 bytes/uint32 at
+    \\    once).
+    \\  - Cache input vector in threadgroup shared memory
+    \\    so multiple output rows share the same loads.
+    \\  - qmv_fast variant: skip bounds checks when K is
+    \\    aligned (K%512==0, which Bonsai always is).
+    \\  - Pack input reads: load float4 instead of float.
     \\
-    \\Phase 3 — GPU batched throughput:
-    \\  Already at 1.6M img/s via mega-dispatch.
-    \\  Further gains from register-tiled matmul in the
-    \\  fused kernel, async commit, or half-precision.
+    \\Phase 3 — Attention kernel:
+    \\  gqa_attention does a full KV scan per query head.
+    \\  For long contexts this dominates. Flash-attention
+    \\  tiling, f16 arithmetic in attention, or splitting
+    \\  the softmax into online chunks could help.
     \\
-    \\Phase 4 — Cross-cutting:
-    \\  Find the GPU/CPU crossover batch size.
-    \\  Hybrid path: CPU for tiny final layer (64x10),
-    \\  GPU for large layers.
-    \\  Half-precision (float16) for activations.
+    \\Phase 4 — Memory and precision:
+    \\  - f16 activations (currently f32 throughout).
+    \\  - Batch multiple qmv calls into one dispatch by
+    \\    stacking weight matrices.
+    \\  - Command buffer reuse across tokens.
+    \\  - Avoid commitAndWait — use MTLEvent signalling
+    \\    or completion handlers so CPU can prep the next
+    \\    token while GPU finishes the current one.
+    \\
+    \\Phase 5 — Pipeline architecture:
+    \\  - Indirect command buffers for zero-overhead
+    \\    dispatch (encode once, replay every token).
+    \\  - Double-buffer the command buffer pipeline.
+    \\  - Overlap CPU sampling with GPU compute.
     \\
     \\## Metal kernel editing rules
     \\
     \\- [[buffer(N)]] must match setBuffer calls.
-    \\- Bounds check: if (gid.x >= width) return;
+    \\- Bounds check: if (gid >= count) return;
     \\- threadgroup_barrier after threadgroup writes.
     \\- Avoid divergent branches in a SIMD group.
-    \\- Prefer adding new kernels (e.g. matmul_infer_v2)
-    \\  alongside existing ones for safe comparison.
+    \\- Prefer adding new kernels alongside existing ones
+    \\  for safe A/B comparison.
+    \\- Test new kernels against the CPU reference in
+    \\  transformer.zig's test suite.
     \\
     \\## Recovery
     \\
@@ -333,8 +375,8 @@ const SYSTEM_PROMPT =
     \\
     \\- check fails: fix or rollback_latest + add_summary.
     \\- test fails: rollback_latest + add_summary.
-    \\- bench_infer crashes: rollback_latest + add_summary.
-    \\- bench_infer regresses: rollback_latest + add_summary.
+    \\- bench crashes: rollback_latest + add_summary.
+    \\- bench regresses: rollback_latest + add_summary.
     \\
     \\## FOCUS
     \\
@@ -1811,11 +1853,10 @@ fn executeWriteFile(
         const msg = std.fmt.allocPrint(
             arena,
             "Error: write not allowed to '{s}'. " ++
-                "Allowed: nn/src/metal.zig, " ++
-                "nn/src/network.zig, " ++
-                "nn/src/shaders/compute.metal, " ++
-                "nn/src/layout.zig, " ++
-                "nn/examples/mnist.zig",
+                "Allowed: nn/src/transformer.zig, " ++
+                "nn/src/model.zig, nn/src/metal.zig, " ++
+                "nn/src/shaders/*.metal, " ++
+                "nn/examples/bonsai*.zig",
             .{path},
         ) catch "Error: path not allowed";
         return .{ .stdout = msg, .success = false };
