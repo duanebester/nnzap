@@ -675,8 +675,13 @@ fn dispatchQMVFusedPair(
     // buffer(7): QMVDims.
     metal.setBytes(encoder, QMVDims, &dims, 7);
 
-    // 16 rows per threadgroup, 512 threads (same as qmv_fast).
-    const threadgroups = (dims.M + 15) / 16;
+    // For K <= 2048, use constant-cache variant: zero shared
+    // memory for max occupancy, 2 rows/simdgroup (32 rows/tg).
+    // Otherwise, fall back to shared-memory variants.
+    const use_const = dims.K <= 2048;
+    const rows_per_tg: u32 = if (use_const) 32 else 16;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
     const grid = metal.MTLSize{
         .width = @as(c_ulong, threadgroups),
         .height = 1,
@@ -687,10 +692,8 @@ fn dispatchQMVFusedPair(
         .height = 1,
         .depth = 1,
     };
-    // For K <= 2048, use 8 KB shared memory variant to
-    // improve threadgroup occupancy (3× less shared mem).
-    const pipeline = if (dims.K <= 2048)
-        device.qmv_fused_pair_sm
+    const pipeline = if (use_const)
+        device.qmv_fused_pair_const
     else
         device.qmv_fused_pair;
     device.dispatchCustom(encoder, pipeline, grid, group);

@@ -2432,6 +2432,142 @@ kernel void qmv_const(
 }
 
 // ============================================================================
+// qmv_fused_pair_const — fused pair with constant-cache input
+// ============================================================================
+
+/// Fused pair variant using Metal's constant cache for the input
+/// vector instead of threadgroup shared memory.  Zero shared
+/// memory allows maximum occupancy (no 8KB/tg limit).  Each
+/// simdgroup processes 2 adjacent rows from BOTH matrices
+/// (4 dot products per simdgroup), giving 32 rows/tg with 16
+/// simdgroups.  Requires K <= 2048 and single-group lanes.
+///
+/// Dispatch: threadgroups = ceil(M / 32), threads = 512.
+kernel void qmv_fused_pair_const(
+    device const uint8_t* packed_a  [[buffer(0)]],
+    device const half*    scales_a  [[buffer(1)]],
+    constant float*       input     [[buffer(2)]],
+    device float*         output_a  [[buffer(3)]],
+    device const uint8_t* packed_b  [[buffer(4)]],
+    device const half*    scales_b  [[buffer(5)]],
+    device float*         output_b  [[buffer(6)]],
+    constant QMVDims&     dims      [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    // Each simdgroup handles 2 adjacent rows.
+    const uint row0 = tgid * 32 + simdgroup_idx * 2;
+    const uint row1 = row0 + 1;
+
+    // Precompute column layout — identical for all rows.
+    const uint groups_per_row = K / group_size;
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    const uint bytes_per_lane = cols_per_lane / 8;
+    const uint col_byte_off = col_start / 8;
+    const uint grp = col_start / group_size;
+    const uint bytes_per_row = K / 8;
+
+    float sig_a0 = 0.0f, sig_b0 = 0.0f;
+    float sig_a1 = 0.0f, sig_b1 = 0.0f;
+    const bool row0_valid = row0 < M;
+    const bool row1_valid = row1 < M;
+    const uint base_a0 = row0 * bytes_per_row + col_byte_off;
+    const uint base_b0 = row0 * bytes_per_row + col_byte_off;
+    const uint base_a1 = row1 * bytes_per_row + col_byte_off;
+    const uint base_b1 = row1 * bytes_per_row + col_byte_off;
+
+    for (uint b = 0; b < bytes_per_lane; b++) {
+        const uint base_col = col_start + b * 8;
+
+        // Read input from constant cache — no shared memory.
+        float x0 = input[base_col + 0];
+        float x1 = input[base_col + 1];
+        float x2 = input[base_col + 2];
+        float x3 = input[base_col + 3];
+        float x4 = input[base_col + 4];
+        float x5 = input[base_col + 5];
+        float x6 = input[base_col + 6];
+        float x7 = input[base_col + 7];
+
+        if (row0_valid) {
+            const uint bva0 = packed_a[base_a0 + b];
+            sig_a0 += select(-x0, x0, bool(bva0 & 1));
+            sig_a0 += select(-x1, x1, bool(bva0 & 2));
+            sig_a0 += select(-x2, x2, bool(bva0 & 4));
+            sig_a0 += select(-x3, x3, bool(bva0 & 8));
+            sig_a0 += select(-x4, x4, bool(bva0 & 16));
+            sig_a0 += select(-x5, x5, bool(bva0 & 32));
+            sig_a0 += select(-x6, x6, bool(bva0 & 64));
+            sig_a0 += select(-x7, x7, bool(bva0 & 128));
+
+            const uint bvb0 = packed_b[base_b0 + b];
+            sig_b0 += select(-x0, x0, bool(bvb0 & 1));
+            sig_b0 += select(-x1, x1, bool(bvb0 & 2));
+            sig_b0 += select(-x2, x2, bool(bvb0 & 4));
+            sig_b0 += select(-x3, x3, bool(bvb0 & 8));
+            sig_b0 += select(-x4, x4, bool(bvb0 & 16));
+            sig_b0 += select(-x5, x5, bool(bvb0 & 32));
+            sig_b0 += select(-x6, x6, bool(bvb0 & 64));
+            sig_b0 += select(-x7, x7, bool(bvb0 & 128));
+        }
+
+        if (row1_valid) {
+            const uint bva1 = packed_a[base_a1 + b];
+            sig_a1 += select(-x0, x0, bool(bva1 & 1));
+            sig_a1 += select(-x1, x1, bool(bva1 & 2));
+            sig_a1 += select(-x2, x2, bool(bva1 & 4));
+            sig_a1 += select(-x3, x3, bool(bva1 & 8));
+            sig_a1 += select(-x4, x4, bool(bva1 & 16));
+            sig_a1 += select(-x5, x5, bool(bva1 & 32));
+            sig_a1 += select(-x6, x6, bool(bva1 & 64));
+            sig_a1 += select(-x7, x7, bool(bva1 & 128));
+
+            const uint bvb1 = packed_b[base_b1 + b];
+            sig_b1 += select(-x0, x0, bool(bvb1 & 1));
+            sig_b1 += select(-x1, x1, bool(bvb1 & 2));
+            sig_b1 += select(-x2, x2, bool(bvb1 & 4));
+            sig_b1 += select(-x3, x3, bool(bvb1 & 8));
+            sig_b1 += select(-x4, x4, bool(bvb1 & 16));
+            sig_b1 += select(-x5, x5, bool(bvb1 & 32));
+            sig_b1 += select(-x6, x6, bool(bvb1 & 64));
+            sig_b1 += select(-x7, x7, bool(bvb1 & 128));
+        }
+    }
+
+    const uint sc_off0 = row0 * groups_per_row + grp;
+    const uint sc_off1 = row1 * groups_per_row + grp;
+
+    if (row0_valid) {
+        float acc_a0 = float(scales_a[sc_off0]) * sig_a0;
+        float acc_b0 = float(scales_b[sc_off0]) * sig_b0;
+        acc_a0 = simd_sum(acc_a0);
+        acc_b0 = simd_sum(acc_b0);
+        if (lane == 0) {
+            output_a[row0] = acc_a0;
+            output_b[row0] = acc_b0;
+        }
+    }
+
+    if (row1_valid) {
+        float acc_a1 = float(scales_a[sc_off1]) * sig_a1;
+        float acc_b1 = float(scales_b[sc_off1]) * sig_b1;
+        acc_a1 = simd_sum(acc_a1);
+        acc_b1 = simd_sum(acc_b1);
+        if (lane == 0) {
+            output_a[row1] = acc_a1;
+            output_b[row1] = acc_b1;
+        }
+    }
+}
+
+// ============================================================================
 // qmv_fast_multigroup — handles lanes spanning multiple groups
 // ============================================================================
 
