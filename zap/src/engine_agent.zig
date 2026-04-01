@@ -30,6 +30,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const tools = @import("tools.zig");
 const api = @import("api_client.zig");
+const ollama = @import("ollama_client.zig");
 
 // ============================================================
 // Constants (Rule 4 — hard limits)
@@ -63,6 +64,28 @@ const API_VERSION: []const u8 = "2023-06-01";
 const DEFAULT_MODEL: []const u8 =
     "claude-opus-4-6";
 const MAX_TOKENS_STR: []const u8 = "16384";
+
+// Local LLM executor constants for two-tier mode.
+// Must match the LM Studio model identifier shown
+// after `lms load`.
+const DEFAULT_LOCAL_MODEL: []const u8 =
+    "mlx-qwen3.5-27b-claude-4.6-opus-" ++
+    "reasoning-distilled-v2";
+const MAX_TURNS_PER_EXECUTION: u32 = 60;
+const LOCAL_LLM_MAX_TOKENS_STR: []const u8 = "16384";
+
+// Source files included as code context for the Opus
+// strategist.  These are the hot-path files the
+// strategist needs to design concrete experiments.
+// Read once at startup (Rule 8 — amortise upfront).
+const CODE_CONTEXT_FILES = [_][]const u8{
+    "nn/src/shaders/transformer.metal",
+    "nn/src/shaders/compute.metal",
+    "nn/src/transformer.zig",
+    "nn/src/metal.zig",
+    "nn/src/model.zig",
+};
+const MAX_CODE_CONTEXT: usize = 4 * 1024 * 1024;
 
 const TOOL_PATH: []const u8 =
     "./zig-out/bin/engine_research";
@@ -515,6 +538,152 @@ const TOOL_SCHEMAS =
 ;
 
 // ============================================================
+// Executor system prompt (local LLM — implements plans)
+//
+// Lean prompt for the Qwen executor in two-tier mode.
+// Contains only: role, tool list, protocol, decision
+// rules, and constraints.  No architecture deep-dive,
+// no CLAUDE.md rules — Opus already encoded relevant
+// details into the experiment plan.  The executor
+// pulls additional context via tools as needed.
+// ============================================================
+
+const EXECUTOR_SYSTEM_PROMPT =
+    \\You are an executor agent for nnzap, a Zig + Metal
+    \\GPU inference engine. A senior strategist designed
+    \\an experiment plan for you. Implement it precisely
+    \\using the tools below.
+    \\
+    \\## Tools
+    \\
+    \\Safety: snapshot, snapshot_list, rollback,
+    \\  rollback_latest, diff
+    \\Validation: check (compile ~2s), test (correctness
+    \\  ~5s), bench / bench_infer (perf ~15s),
+    \\  bench_compare
+    \\Inspection: show, show_function, read_file,
+    \\  list_directory, history, cwd
+    \\Editing: edit_file (find-and-replace, preferred),
+    \\  write_file (full rewrite)
+    \\Shell: run_command (120s timeout)
+    \\Record: commit, add_summary
+    \\
+    \\## Protocol
+    \\
+    \\1. snapshot — before any edits.
+    \\2. Read target code with show / show_function /
+    \\   read_file / run_command (e.g. grep).
+    \\3. Edit with edit_file or write_file.
+    \\4. check — must pass before test or bench.
+    \\5. test — all 71 tests must pass.
+    \\6. bench — primary metric: decode_tok_per_sec.
+    \\7. Evaluate (see decision rules).
+    \\8. KEEP → commit. ROLLBACK → rollback_latest +
+    \\   add_summary explaining what failed and why.
+    \\
+    \\## Decision rules
+    \\
+    \\- decode_tok_per_sec improves >= 5%: KEEP.
+    \\- decode_p50_us improves >= 5%: KEEP.
+    \\- Enables future wins: KEEP.
+    \\- Any primary metric regresses > 5%: ROLLBACK.
+    \\- Test or compile failure: ROLLBACK immediately.
+    \\
+    \\## Constraints
+    \\
+    \\- ONE optimisation per experiment.
+    \\- Read a function fully before modifying it.
+    \\- Metal [[buffer(N)]] must match setBuffer calls.
+    \\- Never modify test expectations or remove tests.
+    \\- Use edit_file for small changes (faster, less
+    \\  context than write_file).
+    \\
+    \\When done (KEEP or exhausted ideas), STOP.
+;
+
+// ============================================================
+// Strategist prompt (Opus — designs experiments)
+//
+// Used in two-tier mode.  Opus reviews summaries and
+// history, then outputs ONE concrete experiment plan
+// for the local Ollama executor to implement.
+// ============================================================
+
+const STRATEGIST_PROMPT =
+    \\You are a systems-performance research strategist
+    \\for nnzap, a Zig + Metal GPU-accelerated 1-bit
+    \\language model inference engine for Apple Silicon
+    \\with zero-copy unified memory.
+    \\
+    \\## Role
+    \\
+    \\Review past experiment history and summaries, then
+    \\design ONE specific optimisation experiment. An
+    \\executor agent (a capable local LLM with full tool
+    \\access) will implement your plan — you do NOT
+    \\execute anything yourself.
+    \\
+    \\## Architecture
+    \\
+    \\Bonsai 1.7B decode hot path per token (28 blocks,
+    \\2048 hidden, 16 Q heads / 8 KV heads, head_dim
+    \\128, group_size 128):
+    \\
+    \\  1. embedding_lookup (1-bit packed, dequant)
+    \\  2. Per block (x28):
+    \\     rms_norm -> qmv x3 (Q,K,V) -> rms_norm ->
+    \\     rope -> kv_cache_update -> gqa_attention ->
+    \\     qmv (O) -> residual_add -> rms_norm ->
+    \\     qmv x2 (gate, up) -> silu_mul -> qmv (down)
+    \\     -> residual_add
+    \\  3. rms_norm (final) -> qmv (lm_head)
+    \\
+    \\Total: 197 qmv calls + ~168 lightweight dispatches
+    \\= ~365 kernel dispatches per token.
+    \\
+    \\Key files:
+    \\  nn/src/transformer.zig — dispatch, decode loop
+    \\  nn/src/model.zig — buffer allocation, weights
+    \\  nn/src/metal.zig — Metal device, buffers, dispatch
+    \\  nn/src/shaders/compute.metal — qmv, qmm kernels
+    \\  nn/src/shaders/transformer.metal — rms, rope, etc
+    \\  nn/examples/bonsai_bench.zig — benchmark binary
+    \\
+    \\## Output format
+    \\
+    \\Respond with ONLY a detailed experiment plan:
+    \\
+    \\1. TITLE: One-line optimisation description.
+    \\2. HYPOTHESIS: Why this should improve decode tok/s.
+    \\3. TARGET FILES: Which files to modify.
+    \\4. CHANGES: Exact functions to modify, what to change,
+    \\   and concrete implementation guidance. Name
+    \\   functions, parameters, buffer indices, thread
+    \\   counts. The executor needs enough detail to
+    \\   implement without creative leaps.
+    \\5. VALIDATION: Expected compile/test/bench results.
+    \\6. ROLLBACK IF: When to abandon the approach.
+    \\
+    \\## Rules
+    \\
+    \\- Do NOT use any tools. Output ONLY the plan text.
+    \\- Do NOT repeat approaches from the summaries —
+    \\  check them carefully before proposing.
+    \\- Focus on the highest-impact change first.
+    \\- ONE change per experiment. Isolate variables.
+    \\- The executor has: snapshot, rollback, check, test,
+    \\  bench, bench_infer, show, show_function, read_file,
+    \\  edit_file, write_file, run_command, commit,
+    \\  add_summary. It can read and modify any engine
+    \\  source file.
+    \\- All 71 tests must keep passing. Never suggest
+    \\  removing or weakening tests.
+    \\- Engineering rules apply: 70-line functions, >= 2
+    \\  assertions per function, 100-column limit,
+    \\  snake_case naming, comments explain WHY.
+;
+
+// ============================================================
 // Entry point
 // ============================================================
 
@@ -569,6 +738,27 @@ fn mainInner() !void {
 
     const rules = loadEngineeringRules(arena);
 
+    // Two-tier mode: Opus strategises, local LLM executes.
+    // Requires both ANTHROPIC_API_KEY (for Opus) and
+    // LOCAL_LLM_MODEL env var (for the local executor,
+    // e.g. LM Studio serving an MLX model).
+    const local_model = loadLocalModel();
+    if (local_model) |executor_model| {
+        api.log(
+            "Two-tier mode: {s} (strategist)" ++
+                " + {s} (executor via LM Studio)\n",
+            .{ model, executor_model },
+        );
+        return runTwoTierLoop(
+            arena,
+            run_start,
+            api_key,
+            model,
+            executor_model,
+            rules,
+        );
+    }
+
     // Global counters for the run summary.
     var total_experiments: u32 = 0;
     var total_turns: u32 = 0;
@@ -577,6 +767,8 @@ fn mainInner() !void {
     var total_api_errors: u32 = 0;
     var total_api_ms: i64 = 0;
     var total_tool_ms: i64 = 0;
+    var total_input_tokens: u64 = 0;
+    var total_output_tokens: u64 = 0;
 
     // ── Outer loop: one experiment per iteration ─────
     var experiment: u32 = 0;
@@ -611,7 +803,6 @@ fn mainInner() !void {
         var bench_ran = false;
         var experiment_complete = false;
         var api_failed = false;
-        var last_claude_text: []const u8 = "";
 
         // ── Inner loop: turns within one experiment ──
         var turn: u32 = 0;
@@ -635,6 +826,8 @@ fn mainInner() !void {
                 api_key,
                 model,
                 messages[0..count],
+                SYSTEM_PROMPT,
+                TOOL_SCHEMAS,
             );
             const api_elapsed = timestampMs() -
                 api_start;
@@ -670,9 +863,58 @@ fn mainInner() !void {
                 },
             );
 
+            // Extract and accumulate token usage from
+            // the raw response saved by callApi.
+            {
+                const usage_path = "../" ++
+                    HISTORY_DIR ++ "/_response.json";
+                const usage_raw =
+                    std.fs.cwd().readFileAlloc(
+                        arena,
+                        usage_path,
+                        MAX_API_RESPONSE,
+                    ) catch "";
+                if (usage_raw.len > 0) {
+                    const in_str =
+                        api.extractJsonNumber(
+                            usage_raw,
+                            "\"input_tokens\":",
+                        );
+                    const out_str =
+                        api.extractJsonNumber(
+                            usage_raw,
+                            "\"output_tokens\":",
+                        );
+                    const in_tok: u64 =
+                        if (in_str) |s|
+                            std.fmt.parseInt(
+                                u64,
+                                s,
+                                10,
+                            ) catch 0
+                        else
+                            0;
+                    const out_tok: u64 =
+                        if (out_str) |s|
+                            std.fmt.parseInt(
+                                u64,
+                                s,
+                                10,
+                            ) catch 0
+                        else
+                            0;
+                    total_input_tokens += in_tok;
+                    total_output_tokens += out_tok;
+                    api.log(
+                        "  Tokens: {d} in," ++
+                            " {d} out\n",
+                        .{ in_tok, out_tok },
+                    );
+                }
+            }
+
             if (resp.text.len > 0) {
                 api.logClaudeText(resp.text);
-                last_claude_text = resp.text;
             }
 
             messages[count] = api.buildAssistantMsg(
@@ -803,17 +1045,6 @@ fn mainInner() !void {
         // Save this experiment's conversation log.
         api.saveRunLog(arena, messages[0..count], "../" ++ HISTORY_DIR);
 
-        // Persist a one-line summary so future
-        // experiments know what was tried and why
-        // it succeeded or failed.
-        if (last_claude_text.len > 0) {
-            appendSummary(
-                arena,
-                experiment + 1,
-                last_claude_text,
-            );
-        }
-
         if (experiment_complete or bench_ran) {
             total_experiments += 1;
         }
@@ -836,6 +1067,17 @@ fn mainInner() !void {
 
     // ── Run summary ─────────────────────────────────
     const run_elapsed = timestampMs() - run_start;
+
+    // Opus 4.6 pricing: $5/MTok input, $25/MTok output.
+    const cost_cents =
+        (total_input_tokens * 5 +
+            total_output_tokens * 25) / 10_000;
+    const cost_str = std.fmt.allocPrint(
+        arena,
+        "${d}.{d:0>2}",
+        .{ cost_cents / 100, cost_cents % 100 },
+    ) catch "$?.??";
+
     api.log(
         "\n" ++
             "============================================" ++
@@ -848,6 +1090,9 @@ fn mainInner() !void {
             "  Tool calls:  {d}\n" ++
             "  Benchmarks:  {d}\n" ++
             "  API errors:  {d}\n" ++
+            "  In tokens:   {d}\n" ++
+            "  Out tokens:  {d}\n" ++
+            "  Est. cost:   {s}\n" ++
             "  API time:    {s}\n" ++
             "  Tool time:   {s}\n" ++
             "  Total time:  {s}\n" ++
@@ -859,6 +1104,9 @@ fn mainInner() !void {
             total_tool_calls,
             total_bench_count,
             total_api_errors,
+            total_input_tokens,
+            total_output_tokens,
+            cost_str,
             nanosToMsStr(
                 arena,
                 total_api_ms * 1_000_000,
@@ -875,7 +1123,552 @@ fn mainInner() !void {
     );
 }
 
-/// Sum the byte lengths of all messages in the array.
+// ============================================================
+// Two-tier mode: Opus strategist + Ollama executor
+//
+// Opus reviews history and designs experiments (one API
+// call per experiment, high-quality reasoning).  A local
+// Ollama model executes the plan by driving the tool
+// loop (free, fast, many tool calls).
+// ============================================================
+
+const ExecutionResult = struct {
+    turns: u32,
+    tool_calls: u32,
+    api_ms: i64,
+    tool_ms: i64,
+    input_tokens: u64,
+    output_tokens: u64,
+    completed: bool,
+};
+
+/// Outer loop for two-tier mode.  Converts tool schemas
+/// once, then alternates between Opus strategy calls and
+/// Ollama execution loops.
+fn runTwoTierLoop(
+    arena: Allocator,
+    run_start: i64,
+    api_key: []const u8,
+    opus_model: []const u8,
+    ollama_model: []const u8,
+    rules: []const u8,
+) !void {
+    std.debug.assert(opus_model.len > 0);
+    std.debug.assert(ollama_model.len > 0);
+
+    // Convert Anthropic tool schemas to OpenAI format
+    // once at startup (Rule 8 — amortise upfront work).
+    const openai_tools = ollama.convertAnthropicTools(
+        arena,
+        TOOL_SCHEMAS,
+    ) catch {
+        api.fatal(
+            "Failed to convert tool schemas.\n",
+        );
+        unreachable;
+    };
+
+    // Load hot-path source files once so the strategist
+    // can design concrete, line-level experiments.
+    const code_context = loadCodeContext(arena);
+    api.log(
+        "Code context: {d} KB from {d} files\n",
+        .{
+            code_context.len / 1024,
+            CODE_CONTEXT_FILES.len,
+        },
+    );
+
+    var total_experiments: u32 = 0;
+    var total_turns: u32 = 0;
+    var total_tool_calls: u32 = 0;
+    var total_api_errors: u32 = 0;
+    var total_api_ms: i64 = 0;
+    var total_tool_ms: i64 = 0;
+    var opus_in_tokens: u64 = 0;
+    var opus_out_tokens: u64 = 0;
+
+    var experiment: u32 = 0;
+    while (experiment < MAX_EXPERIMENTS) : (experiment += 1) {
+        api.log(
+            "\n" ++
+                "======================================" ++
+                "========\n" ++
+                "  Experiment {d}/{d} (two-tier)\n" ++
+                "======================================" ++
+                "========\n",
+            .{ experiment + 1, MAX_EXPERIMENTS },
+        );
+
+        const should_stop = runOneStrategyExperiment(
+            arena,
+            api_key,
+            opus_model,
+            ollama_model,
+            rules,
+            code_context,
+            openai_tools,
+            experiment,
+            &total_turns,
+            &total_tool_calls,
+            &total_api_errors,
+            &total_api_ms,
+            &total_tool_ms,
+            &opus_in_tokens,
+            &opus_out_tokens,
+        );
+        total_experiments += 1;
+        if (should_stop) break;
+    }
+
+    printTwoTierSummary(
+        arena,
+        run_start,
+        total_experiments,
+        total_turns,
+        total_tool_calls,
+        total_api_errors,
+        total_api_ms,
+        total_tool_ms,
+        opus_in_tokens,
+        opus_out_tokens,
+    );
+}
+
+/// Run one strategy→execution cycle.  Returns true if the
+/// outer loop should stop (e.g. strategist failure).
+fn runOneStrategyExperiment(
+    arena: Allocator,
+    api_key: []const u8,
+    opus_model: []const u8,
+    ollama_model: []const u8,
+    rules: []const u8,
+    code_context: []const u8,
+    openai_tools: []const u8,
+    experiment: u32,
+    total_turns: *u32,
+    total_tool_calls: *u32,
+    total_api_errors: *u32,
+    total_api_ms: *i64,
+    total_tool_ms: *i64,
+    opus_in: *u64,
+    opus_out: *u64,
+) bool {
+    std.debug.assert(api_key.len > 0);
+    std.debug.assert(ollama_model.len > 0);
+
+    // Phase 1: Opus designs the experiment.
+    const history = buildHistorySummary(arena);
+    const summaries = buildSummariesSection(arena);
+
+    api.log("  Phase 1: Opus strategy...\n", .{});
+    const strat_start = timestampMs();
+    const plan_resp = callOpusStrategist(
+        arena,
+        api_key,
+        opus_model,
+        history,
+        summaries,
+        rules,
+        code_context,
+    );
+    const strat_ms = timestampMs() - strat_start;
+    total_api_ms.* += strat_ms;
+    opus_in.* += plan_resp.input_tokens;
+    opus_out.* += plan_resp.output_tokens;
+
+    if (!plan_resp.success or plan_resp.text.len == 0) {
+        api.log(
+            "  Strategist failed ({s}): {s}\n",
+            .{
+                nanosToMsStr(
+                    arena,
+                    strat_ms * 1_000_000,
+                ),
+                plan_resp.error_message,
+            },
+        );
+        total_api_errors.* += 1;
+        return true; // Stop outer loop.
+    }
+
+    api.log(
+        "  Plan received ({s}):\n",
+        .{nanosToMsStr(arena, strat_ms * 1_000_000)},
+    );
+    api.logClaudeText(plan_resp.text);
+
+    // Phase 2: Local LLM executes the plan.
+    api.log("\n  Phase 2: Local LLM executor...\n", .{});
+    const exec = runLocalExecution(
+        arena,
+        ollama_model,
+        plan_resp.text,
+        openai_tools,
+    );
+
+    total_turns.* += exec.turns;
+    total_tool_calls.* += exec.tool_calls;
+    total_api_ms.* += exec.api_ms;
+    total_tool_ms.* += exec.tool_ms;
+    if (!exec.completed) total_api_errors.* += 1;
+
+    api.log(
+        "  Experiment {d} done " ++
+            "({d} turns, {d} tool calls).\n",
+        .{ experiment + 1, exec.turns, exec.tool_calls },
+    );
+    return false; // Continue outer loop.
+}
+
+/// Call Opus to design a single experiment plan.
+/// Returns the full ApiResponse with the plan in .text.
+fn callOpusStrategist(
+    arena: Allocator,
+    api_key: []const u8,
+    model: []const u8,
+    history: []const u8,
+    summaries: []const u8,
+    rules: []const u8,
+    code_context: []const u8,
+) ApiResponse {
+    std.debug.assert(api_key.len > 0);
+    std.debug.assert(model.len > 0);
+
+    const context = buildStrategyContext(
+        arena,
+        history,
+        summaries,
+        rules,
+        code_context,
+    );
+    const user_msg = api.wrapUserTextMessage(
+        arena,
+        context,
+    );
+    const messages = [_][]const u8{user_msg};
+
+    // Strategist: custom prompt, no tools (output only).
+    return callApiWithRetry(
+        arena,
+        api_key,
+        model,
+        &messages,
+        STRATEGIST_PROMPT,
+        "[]",
+    );
+}
+
+/// Build the user message context for the strategist.
+/// Includes benchmark history, summaries of past
+/// experiments, and engineering rules.
+fn buildStrategyContext(
+    arena: Allocator,
+    history: []const u8,
+    summaries: []const u8,
+    rules: []const u8,
+    code_context: []const u8,
+) []const u8 {
+    std.debug.assert(rules.len > 0);
+
+    const hist_header = if (history.len > 0)
+        "## Benchmark history\n\n"
+    else
+        "No benchmark history yet.\n\n";
+
+    const code_section = if (code_context.len > 0)
+        code_context
+    else
+        "(code context unavailable)\n";
+
+    return std.fmt.allocPrint(
+        arena,
+        "{s}{s}{s}" ++
+            "## Engineering rules (CLAUDE.md)\n\n" ++
+            "{s}\n\n" ++
+            "## Source code (hot path)\n\n" ++
+            "Below are the current source files for " ++
+            "the engine hot path. Use these to design " ++
+            "specific, line-level changes. Reference " ++
+            "exact function names, buffer indices, " ++
+            "thread counts, and kernel parameters.\n\n" ++
+            "{s}\n\n" ++
+            "Design the next experiment.",
+        .{
+            hist_header,
+            if (history.len > 0) history else "",
+            if (summaries.len > 0) summaries else "",
+            rules,
+            code_section,
+        },
+    ) catch "Design an experiment to improve throughput.";
+}
+
+/// Read all hot-path source files into a single code
+/// context string with file headers.  Each file is
+/// wrapped with a clear delimiter so the strategist
+/// can reference specific locations.
+fn loadCodeContext(arena: Allocator) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+
+    for (&CODE_CONTEXT_FILES) |path| {
+        const content = readFileContent(
+            arena,
+            path,
+        ) orelse continue;
+
+        // File header with path and line count.
+        var line_count: u32 = 1;
+        for (content) |c| {
+            if (c == '\n') line_count += 1;
+        }
+
+        const header = std.fmt.allocPrint(
+            arena,
+            "### {s} ({d} lines)\n" ++
+                "```\n",
+            .{ path, line_count },
+        ) catch continue;
+        buf.appendSlice(arena, header) catch continue;
+        buf.appendSlice(arena, content) catch continue;
+        buf.appendSlice(
+            arena,
+            "\n```\n\n",
+        ) catch continue;
+
+        // Guard against runaway context size.
+        if (buf.items.len > MAX_CODE_CONTEXT) {
+            api.log(
+                "  Code context truncated at " ++
+                    "{d} KB (limit {d} KB)\n",
+                .{
+                    buf.items.len / 1024,
+                    MAX_CODE_CONTEXT / 1024,
+                },
+            );
+            break;
+        }
+    }
+
+    std.debug.assert(buf.items.len <= MAX_CODE_CONTEXT +
+        MAX_FILE_SIZE);
+    return buf.items;
+}
+
+/// Execute an experiment plan using the local LLM
+/// (e.g. LM Studio).  Drives the tool-calling loop:
+/// snapshot, edit, check, test, bench, report.
+fn runLocalExecution(
+    arena: Allocator,
+    model: []const u8,
+    plan: []const u8,
+    openai_tools: []const u8,
+) ExecutionResult {
+    std.debug.assert(model.len > 0);
+    std.debug.assert(plan.len > 0);
+
+    const executor_prompt = buildExecutorPrompt();
+    const first_msg = buildExecutorInitialMsg(
+        arena,
+        plan,
+    );
+    const history_dir = "../" ++ HISTORY_DIR;
+
+    var msgs: [MAX_MESSAGES][]const u8 = undefined;
+    var count: u32 = 0;
+    msgs[0] = first_msg;
+    count = 1;
+
+    var r = ExecutionResult{
+        .turns = 0,
+        .tool_calls = 0,
+        .api_ms = 0,
+        .tool_ms = 0,
+        .input_tokens = 0,
+        .output_tokens = 0,
+        .completed = false,
+    };
+
+    var turn: u32 = 0;
+    while (turn < MAX_TURNS_PER_EXECUTION) : (turn += 1) {
+        api.log(
+            "\n  --- Executor turn {d} ---\n",
+            .{turn + 1},
+        );
+        const t0 = timestampMs();
+        const resp = ollama.callApi(
+            arena,
+            model,
+            executor_prompt,
+            msgs[0..count],
+            openai_tools,
+            LOCAL_LLM_MAX_TOKENS_STR,
+            history_dir,
+        );
+        r.api_ms += timestampMs() - t0;
+
+        if (!resp.success) {
+            api.log(
+                "  Local LLM error: {s}\n",
+                .{resp.error_message},
+            );
+            break;
+        }
+
+        r.input_tokens += resp.input_tokens;
+        r.output_tokens += resp.output_tokens;
+        if (resp.text.len > 0) {
+            api.logClaudeText(resp.text);
+        }
+
+        // Append assistant message (OpenAI format).
+        msgs[count] = ollama.buildAssistantMsg(
+            arena,
+            resp,
+        );
+        count += 1;
+
+        // Model chose to stop — no tool calls.
+        if (!api.eql(resp.stop_reason, "tool_use") or
+            resp.tool_calls.len == 0)
+        {
+            r.completed = true;
+            break;
+        }
+
+        // Execute tools and append results.
+        const t1 = timestampMs();
+        const results = executeTools(
+            arena,
+            resp.tool_calls,
+        );
+        r.tool_ms += timestampMs() - t1;
+        r.tool_calls += @intCast(
+            resp.tool_calls.len,
+        );
+
+        // OpenAI format: one message per tool result.
+        for (results) |tr| {
+            if (count >= MAX_MESSAGES - 1) break;
+            msgs[count] = ollama.buildToolResultMsg(
+                arena,
+                tr,
+            );
+            count += 1;
+        }
+        if (count >= MAX_MESSAGES - 2) break;
+    }
+
+    r.turns = turn + 1;
+    return r;
+}
+
+/// Build the system prompt for the local LLM executor.
+/// Returns the lean EXECUTOR_SYSTEM_PROMPT — role,
+/// tools, protocol, and constraints only.  The Opus
+/// strategist already embedded architecture details
+/// and engineering rules into the experiment plan.
+fn buildExecutorPrompt() []const u8 {
+    comptime std.debug.assert(
+        EXECUTOR_SYSTEM_PROMPT.len > 0,
+    );
+    return EXECUTOR_SYSTEM_PROMPT;
+}
+
+/// Build the initial user message for the executor,
+/// containing filesystem orientation and the plan
+/// from the Opus strategist.
+fn buildExecutorInitialMsg(
+    arena: Allocator,
+    plan: []const u8,
+) []const u8 {
+    std.debug.assert(plan.len > 0);
+
+    const orientation = buildOrientation(arena);
+    const text = std.fmt.allocPrint(
+        arena,
+        "{s}\n\n## Experiment plan\n\n" ++
+            "A senior strategist designed this " ++
+            "experiment for you. Follow it " ++
+            "precisely:\n\n{s}\n\n" ++
+            "## Begin\n\n" ++
+            "Execute this plan now. Start by " ++
+            "calling snapshot to create a restore " ++
+            "point, then proceed step by step.",
+        .{ orientation, plan },
+    ) catch "Execute the experiment plan.";
+
+    return ollama.buildUserTextMsg(arena, text);
+}
+
+/// Print the run summary for two-tier mode.
+fn printTwoTierSummary(
+    arena: Allocator,
+    run_start: i64,
+    total_experiments: u32,
+    total_turns: u32,
+    total_tool_calls: u32,
+    total_api_errors: u32,
+    total_api_ms: i64,
+    total_tool_ms: i64,
+    opus_in_tokens: u64,
+    opus_out_tokens: u64,
+) void {
+    const run_elapsed = timestampMs() - run_start;
+
+    // Opus pricing: $5/MTok in, $25/MTok out.
+    // Ollama is free (local).
+    const cost_cents =
+        (opus_in_tokens * 5 +
+            opus_out_tokens * 25) / 10_000;
+    const cost_str = std.fmt.allocPrint(
+        arena,
+        "${d}.{d:0>2}",
+        .{ cost_cents / 100, cost_cents % 100 },
+    ) catch "$?.??";
+
+    api.log(
+        "\n" ++
+            "======================================" ++
+            "========\n" ++
+            "  Run summary (two-tier)\n" ++
+            "======================================" ++
+            "========\n" ++
+            "  Experiments:    {d}\n" ++
+            "  Total turns:    {d} (Ollama)\n" ++
+            "  Tool calls:     {d}\n" ++
+            "  API errors:     {d}\n" ++
+            "  Opus tokens:    {d} in, {d} out\n" ++
+            "  Est. cost:      {s} (Opus only)\n" ++
+            "  API time:       {s}\n" ++
+            "  Tool time:      {s}\n" ++
+            "  Total time:     {s}\n" ++
+            "======================================" ++
+            "========\n",
+        .{
+            total_experiments,
+            total_turns,
+            total_tool_calls,
+            total_api_errors,
+            opus_in_tokens,
+            opus_out_tokens,
+            cost_str,
+            nanosToMsStr(
+                arena,
+                total_api_ms * 1_000_000,
+            ),
+            nanosToMsStr(
+                arena,
+                total_tool_ms * 1_000_000,
+            ),
+            nanosToMsStr(
+                arena,
+                run_elapsed * 1_000_000,
+            ),
+        },
+    );
+}
+
 fn contextSizeBytes(
     messages: []const []const u8,
 ) usize {
@@ -906,6 +1699,21 @@ fn loadModel() []const u8 {
         return model;
     }
     return DEFAULT_MODEL;
+}
+
+/// Load the local LLM executor model from LOCAL_LLM_MODEL.
+/// Returns null when not set (single-tier mode).
+/// Falls back to DEFAULT_LOCAL_MODEL if set to "default".
+fn loadLocalModel() ?[]const u8 {
+    const val = std.posix.getenv("LOCAL_LLM_MODEL");
+    if (val) |model| {
+        std.debug.assert(model.len > 0);
+        if (api.eql(model, "default")) {
+            return DEFAULT_LOCAL_MODEL;
+        }
+        return model;
+    }
+    return null;
 }
 
 /// Load CLAUDE.md engineering rules from disk.
@@ -995,6 +1803,8 @@ fn callApiWithRetry(
     api_key: []const u8,
     model: []const u8,
     messages: []const []const u8,
+    system_prompt: []const u8,
+    tool_schemas: []const u8,
 ) ApiResponse {
     std.debug.assert(api_key.len > 0);
     std.debug.assert(messages.len > 0);
@@ -1027,6 +1837,8 @@ fn callApiWithRetry(
             api_key,
             model,
             messages,
+            system_prompt,
+            tool_schemas,
         );
 
         if (resp.success) return resp;
@@ -1066,6 +1878,8 @@ fn callApi(
     api_key: []const u8,
     model: []const u8,
     messages: []const []const u8,
+    system_prompt: []const u8,
+    tool_schemas: []const u8,
 ) ApiResponse {
     std.debug.assert(api_key.len > 0);
     std.debug.assert(messages.len > 0);
@@ -1074,8 +1888,8 @@ fn callApi(
         arena,
         model,
         messages,
-        SYSTEM_PROMPT,
-        TOOL_SCHEMAS,
+        system_prompt,
+        tool_schemas,
         MAX_TOKENS_STR,
     ) catch return api.errResp(
         "request build failed",
@@ -1224,6 +2038,14 @@ fn callApi(
     if (response_data.len == 0) {
         return api.errResp("empty API response", true);
     }
+
+    // Persist raw response so the main loop can
+    // extract token usage without changing the
+    // shared ApiResponse type.
+    api.writeFile(
+        "../" ++ HISTORY_DIR ++ "/_response.json",
+        response_data,
+    ) catch {};
 
     return api.parseApiResponse(arena, response_data);
 }
@@ -3062,13 +3884,10 @@ fn appendSummary(
     var ts_buf: [api.TIMESTAMP_LEN]u8 = undefined;
     const ts = api.formatTimestamp(&ts_buf, '-');
 
-    // Truncate to keep summaries compact — the first
-    // 500 chars capture the key decision and rationale.
-    const max_len: usize = 500;
-    const trimmed = if (text.len > max_len)
-        text[0..max_len]
-    else
-        text;
+    // Truncate at a sentence boundary so the result
+    // tag (KEPT/FAILED/ROLLBACK) and conclusion are
+    // never cut mid-sentence.
+    const trimmed = truncateAtSentence(text, 500);
 
     var buf: std.ArrayList(u8) = .empty;
     buf.appendSlice(
@@ -3133,6 +3952,45 @@ fn appendSummary(
 
     file.seekFromEnd(0) catch return;
     file.writeAll(buf.items) catch return;
+}
+
+/// Truncate text at the last sentence boundary within
+/// max_len bytes.  A sentence boundary is a period,
+/// exclamation mark, question mark, or closing paren
+/// followed by whitespace (or sitting at the cut
+/// point).  Falls back to a hard cut when no boundary
+/// exists — rare for prose but safe.
+fn truncateAtSentence(
+    text: []const u8,
+    max_len: usize,
+) []const u8 {
+    std.debug.assert(max_len > 0);
+    if (text.len <= max_len) return text;
+
+    // Scan backwards from max_len for a sentence end.
+    var pos: usize = max_len;
+    while (pos > 0) {
+        pos -= 1;
+        const c = text[pos];
+        const is_ender = c == '.' or c == '!' or
+            c == '?' or c == ')';
+        if (!is_ender) continue;
+
+        // Accept if at the cut boundary or followed
+        // by whitespace (start of next sentence).
+        if (pos + 1 >= max_len) {
+            return text[0 .. pos + 1];
+        }
+        const next = text[pos + 1];
+        if (next == ' ' or next == '\n' or
+            next == '\r')
+        {
+            return text[0 .. pos + 1];
+        }
+    }
+
+    // No sentence boundary — hard cut as last resort.
+    return text[0..max_len];
 }
 
 // ============================================================

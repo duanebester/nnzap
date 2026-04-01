@@ -56,6 +56,8 @@ pub const ApiResponse = struct {
     tool_calls: []const ToolCall,
     error_message: []const u8,
     retryable: bool,
+    input_tokens: u32,
+    output_tokens: u32,
 };
 
 pub const ParsedContent = struct {
@@ -476,6 +478,16 @@ pub fn parseApiResponse(
 
     const parsed = parseContentBlocks(arena, content);
 
+    // Extract token usage from the "usage" object.
+    const input_tokens = parseTokenCount(
+        raw,
+        "\"input_tokens\":",
+    );
+    const output_tokens = parseTokenCount(
+        raw,
+        "\"output_tokens\":",
+    );
+
     return .{
         .success = true,
         .stop_reason = stop,
@@ -484,7 +496,22 @@ pub fn parseApiResponse(
         .tool_calls = parsed.tool_calls,
         .error_message = "",
         .retryable = false,
+        .input_tokens = input_tokens,
+        .output_tokens = output_tokens,
     };
+}
+
+/// Parse a token count integer from a JSON field like
+/// `"input_tokens": 1234`.  Returns 0 if not found.
+fn parseTokenCount(
+    raw: []const u8,
+    needle: []const u8,
+) u32 {
+    const num_str = extractJsonNumber(
+        raw,
+        needle,
+    ) orelse return 0;
+    return std.fmt.parseInt(u32, num_str, 10) catch 0;
 }
 
 /// Split the content array into text and tool_use blocks.
@@ -833,5 +860,7 @@ pub fn errResp(
         .tool_calls = &.{},
         .error_message = msg,
         .retryable = retryable,
+        .input_tokens = 0,
+        .output_tokens = 0,
     };
 }

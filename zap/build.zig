@@ -17,6 +17,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const ollama_client_module = b.createModule(.{
+        .root_source_file = b.path("src/ollama_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "api_client.zig", .module = api_client_module },
+        },
+    });
+
     // ── Autoresearch CLI ──────────────────────────────────────────────
     const autoresearch = b.addExecutable(.{
         .name = "autoresearch",
@@ -93,6 +102,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "tools.zig", .module = tools_module },
                 .{ .name = "api_client.zig", .module = api_client_module },
+                .{ .name = "ollama_client.zig", .module = ollama_client_module },
             },
         }),
     });
