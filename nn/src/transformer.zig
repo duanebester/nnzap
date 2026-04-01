@@ -1208,8 +1208,28 @@ fn encodeAttentionProjections(
         .K = Config.hidden_size,
         .group_size = Config.group_size,
     });
-    dispatchQMV(device, encoder, device.qmv, a.k_proj, a.norm_out, a.k, kv_qmv);
-    dispatchQMV(device, encoder, device.qmv, a.v_proj, a.norm_out, a.v, kv_qmv);
+    // K and V projections share input (norm_out) and dims
+    // (kv_dim x hidden_size). Fuse into one dispatch to
+    // halve input vector loads and save dispatch overhead.
+    const can_fuse_kv = comptime (Config.hidden_size % Config.group_size == 0) and
+        (Config.hidden_size <= 6144) and
+        (Config.hidden_size >= 256) and
+        (Config.hidden_size / 32 <= Config.group_size);
+    if (can_fuse_kv) {
+        dispatchQMVFusedPair(
+            device,
+            encoder,
+            a.k_proj,
+            a.v_proj,
+            a.norm_out,
+            a.k,
+            a.v,
+            kv_qmv,
+        );
+    } else {
+        dispatchQMV(device, encoder, device.qmv, a.k_proj, a.norm_out, a.k, kv_qmv);
+        dispatchQMV(device, encoder, device.qmv, a.v_proj, a.norm_out, a.v, kv_qmv);
+    }
     bufferBarrier(encoder);
     // QK norms: per-head RMSNorm on Q and K before RoPE.
     // Reuses rms_norm with hidden_size = head_dim, treating
