@@ -687,12 +687,13 @@ fn dispatchQMVFusedPair(
         .height = 1,
         .depth = 1,
     };
-    device.dispatchCustom(
-        encoder,
-        device.qmv_fused_pair,
-        grid,
-        group,
-    );
+    // For K <= 2048, use 8 KB shared memory variant to
+    // improve threadgroup occupancy (3× less shared mem).
+    const pipeline = if (dims.K <= 2048)
+        device.qmv_fused_pair_sm
+    else
+        device.qmv_fused_pair;
+    device.dispatchCustom(encoder, pipeline, grid, group);
 }
 
 /// Dispatch 1-bit matrix-vector multiply (qmv): output = W_1bit × input.
@@ -726,7 +727,11 @@ pub fn dispatchQMV(
     const aligned = (dims.K % dims.group_size == 0) and
         (dims.K <= 6144) and (dims.K >= 256);
     const single_group = dims.K / 32 <= dims.group_size;
-    const actual_pipeline = if (aligned and single_group)
+    // For K <= 2048, use qmv_fast_sm with 8 KB shared memory
+    // (vs 24 KB in qmv_fast) to improve threadgroup occupancy.
+    const actual_pipeline = if (aligned and single_group and dims.K <= 2048)
+        device.qmv_fast_sm
+    else if (aligned and single_group)
         device.qmv_fast
     else if (aligned)
         device.qmv_fast_multigroup

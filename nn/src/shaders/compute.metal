@@ -1853,8 +1853,11 @@ kernel void qmv_fast(
     // Group index for this lane (constant — no crossing).
     const uint grp = col_start / group_size;
 
-    float set_accum = 0.0f;
-    float group_sum = 0.0f;
+    // Signed accumulation: select(-x, x, bit) directly
+    // produces the ternary 1-bit contribution (+x or -x),
+    // eliminating the separate group_sum accumulator and
+    // saving 8 additions per byte (25% fewer ALU ops).
+    float signed_accum = 0.0f;
 
     // Process 8 columns (one packed byte) per iteration.
     for (uint b = 0; b < bytes_per_lane; b++) {
@@ -1871,24 +1874,23 @@ kernel void qmv_fast(
         float x6 = shared_input[base_col + 6];
         float x7 = shared_input[base_col + 7];
 
-        group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
-
-        // Branchless conditional sum via select().
-        set_accum += select(0.0f, x0, bool(byte_val & 1));
-        set_accum += select(0.0f, x1, bool(byte_val & 2));
-        set_accum += select(0.0f, x2, bool(byte_val & 4));
-        set_accum += select(0.0f, x3, bool(byte_val & 8));
-        set_accum += select(0.0f, x4, bool(byte_val & 16));
-        set_accum += select(0.0f, x5, bool(byte_val & 32));
-        set_accum += select(0.0f, x6, bool(byte_val & 64));
-        set_accum += select(0.0f, x7, bool(byte_val & 128));
+        // Branchless signed accumulation: bit=1 → +x,
+        // bit=0 → -x. Equivalent to scale*(2*set-gsum).
+        signed_accum += select(-x0, x0, bool(byte_val & 1));
+        signed_accum += select(-x1, x1, bool(byte_val & 2));
+        signed_accum += select(-x2, x2, bool(byte_val & 4));
+        signed_accum += select(-x3, x3, bool(byte_val & 8));
+        signed_accum += select(-x4, x4, bool(byte_val & 16));
+        signed_accum += select(-x5, x5, bool(byte_val & 32));
+        signed_accum += select(-x6, x6, bool(byte_val & 64));
+        signed_accum += select(-x7, x7, bool(byte_val & 128));
     }
 
     // Apply scale for this lane's group.
     const float scale = float(
         scales[row_scale_offset + grp]
     );
-    float accum = scale * (2.0f * set_accum - group_sum);
+    float accum = scale * signed_accum;
 
     // Reduce across the 32 lanes in the simdgroup.
     accum = simd_sum(accum);
@@ -1963,7 +1965,102 @@ kernel void qmv_fused_pair(
     const uint scale_offset = row * groups_per_row;
     const uint grp = col_start / group_size;
 
-    // Two accumulators: one per weight matrix.
+    // Signed accumulators: one per weight matrix.
+    // Eliminates the shared group_sum, saving 8 adds/byte.
+    float sig_a = 0.0f, sig_b = 0.0f;
+
+    for (uint b = 0; b < bytes_per_lane; b++) {
+        const uint bval_a = packed_a[byte_offset + b];
+        const uint bval_b = packed_b[byte_offset + b];
+        const uint base = col_start + b * 8;
+
+        float x0 = shared_input[base + 0];
+        float x1 = shared_input[base + 1];
+        float x2 = shared_input[base + 2];
+        float x3 = shared_input[base + 3];
+        float x4 = shared_input[base + 4];
+        float x5 = shared_input[base + 5];
+        float x6 = shared_input[base + 6];
+        float x7 = shared_input[base + 7];
+
+        sig_a += select(-x0, x0, bool(bval_a & 1));
+        sig_a += select(-x1, x1, bool(bval_a & 2));
+        sig_a += select(-x2, x2, bool(bval_a & 4));
+        sig_a += select(-x3, x3, bool(bval_a & 8));
+        sig_a += select(-x4, x4, bool(bval_a & 16));
+        sig_a += select(-x5, x5, bool(bval_a & 32));
+        sig_a += select(-x6, x6, bool(bval_a & 64));
+        sig_a += select(-x7, x7, bool(bval_a & 128));
+
+        sig_b += select(-x0, x0, bool(bval_b & 1));
+        sig_b += select(-x1, x1, bool(bval_b & 2));
+        sig_b += select(-x2, x2, bool(bval_b & 4));
+        sig_b += select(-x3, x3, bool(bval_b & 8));
+        sig_b += select(-x4, x4, bool(bval_b & 16));
+        sig_b += select(-x5, x5, bool(bval_b & 32));
+        sig_b += select(-x6, x6, bool(bval_b & 64));
+        sig_b += select(-x7, x7, bool(bval_b & 128));
+    }
+
+    const float sc_a = float(scales_a[scale_offset + grp]);
+    const float sc_b = float(scales_b[scale_offset + grp]);
+    float acc_a = sc_a * sig_a;
+    float acc_b = sc_b * sig_b;
+
+    acc_a = simd_sum(acc_a);
+    acc_b = simd_sum(acc_b);
+
+    if (lane == 0) {
+        output_a[row] = acc_a;
+        output_b[row] = acc_b;
+    }
+}
+
+// ============================================================================
+// qmv_fused_pair_sm — fused pair with smaller shared memory
+// ============================================================================
+
+/// Same as qmv_fused_pair but with 2048-float shared memory
+/// (8 KB) for K <= 2048.  Allows more threadgroups per EU.
+///
+/// Dispatch: threadgroups = ceil(M/16), threads = 512.
+kernel void qmv_fused_pair_sm(
+    device const uint8_t* packed_a  [[buffer(0)]],
+    device const half*    scales_a  [[buffer(1)]],
+    device const float*   input     [[buffer(2)]],
+    device float*         output_a  [[buffer(3)]],
+    device const uint8_t* packed_b  [[buffer(4)]],
+    device const half*    scales_b  [[buffer(5)]],
+    device float*         output_b  [[buffer(6)]],
+    constant QMVDims&     dims      [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    const uint row = tgid * 16 + simdgroup_idx;
+
+    // 8 KB shared memory for K <= 2048.
+    threadgroup float shared_input[2048];
+    for (uint i = tid; i < K; i += 512) {
+        shared_input[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= M) return;
+
+    const uint groups_per_row = K / group_size;
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    const uint bytes_per_lane = cols_per_lane / 8;
+    const uint byte_offset = row * (K / 8) + col_start / 8;
+    const uint scale_offset = row * groups_per_row;
+    const uint grp = col_start / group_size;
+
     float set_a = 0.0f, set_b = 0.0f;
     float gsum = 0.0f;
 
@@ -2023,10 +2120,11 @@ kernel void qmv_fused_pair(
 /// qmv_fast variant with 2048-float shared memory (8 KB) for
 /// K <= 2048.  The 3× smaller footprint (vs 24 KB in qmv_fast)
 /// lets more threadgroups co-execute on one execution unit,
-/// hiding memory latency through higher occupancy.  Otherwise
-/// identical logic to qmv_fast.
+/// hiding memory latency through higher occupancy.  Uses 16
+/// simdgroups (512 threads) same as qmv_fast for maximum row
+/// throughput.  Otherwise identical logic.
 ///
-/// Dispatch: threadgroups = ceil(M / 4), threads = 128.
+/// Dispatch: threadgroups = ceil(M / 16), threads = 512.
 kernel void qmv_fast_sm(
     device const uint8_t* packed_bits  [[buffer(0)]],
     device const half*    scales       [[buffer(1)]],
@@ -2040,13 +2138,16 @@ kernel void qmv_fast_sm(
     const uint M = dims.M;
     const uint group_size = dims.group_size;
 
+    // 16 simdgroups of 32 lanes — same as qmv_fast.
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
-    const uint row = tgid * 4 + simdgroup_idx;
+    const uint row = tgid * 16 + simdgroup_idx;
 
     // 8 KB shared memory — 3× smaller than qmv_fast's 24 KB.
+    // For K <= 2048 this is sufficient and allows more
+    // threadgroups to co-execute per execution unit.
     threadgroup float shared_input[2048];
-    for (uint i = tid; i < K; i += 128) {
+    for (uint i = tid; i < K; i += 512) {
         shared_input[i] = input[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2062,8 +2163,9 @@ kernel void qmv_fast_sm(
     const uint row_scale_offset = row * groups_per_row;
     const uint grp = col_start / group_size;
 
-    float set_accum = 0.0f;
-    float group_sum = 0.0f;
+    // Signed accumulation: select(-x, x, bit) directly
+    // computes ternary contribution, eliminating group_sum.
+    float signed_accum = 0.0f;
 
     for (uint b = 0; b < bytes_per_lane; b++) {
         const uint byte_val = packed_bits[row_byte_base + b];
@@ -2078,31 +2180,28 @@ kernel void qmv_fast_sm(
         float x6 = shared_input[base_col + 6];
         float x7 = shared_input[base_col + 7];
 
-        group_sum += x0 + x1 + x2 + x3
-                   + x4 + x5 + x6 + x7;
-
-        set_accum += select(0.0f, x0, bool(byte_val & 1));
-        set_accum += select(0.0f, x1, bool(byte_val & 2));
-        set_accum += select(0.0f, x2, bool(byte_val & 4));
-        set_accum += select(0.0f, x3, bool(byte_val & 8));
-        set_accum += select(
-            0.0f, x4, bool(byte_val & 16)
+        signed_accum += select(-x0, x0, bool(byte_val & 1));
+        signed_accum += select(-x1, x1, bool(byte_val & 2));
+        signed_accum += select(-x2, x2, bool(byte_val & 4));
+        signed_accum += select(-x3, x3, bool(byte_val & 8));
+        signed_accum += select(
+            -x4, x4, bool(byte_val & 16)
         );
-        set_accum += select(
-            0.0f, x5, bool(byte_val & 32)
+        signed_accum += select(
+            -x5, x5, bool(byte_val & 32)
         );
-        set_accum += select(
-            0.0f, x6, bool(byte_val & 64)
+        signed_accum += select(
+            -x6, x6, bool(byte_val & 64)
         );
-        set_accum += select(
-            0.0f, x7, bool(byte_val & 128)
+        signed_accum += select(
+            -x7, x7, bool(byte_val & 128)
         );
     }
 
     const float scale = float(
         scales[row_scale_offset + grp]
     );
-    float accum = scale * (2.0f * set_accum - group_sum);
+    float accum = scale * signed_accum;
     accum = simd_sum(accum);
 
     if (lane == 0) {
@@ -2163,9 +2262,9 @@ kernel void qmv_fast_multigroup(
     // Bytes per group (group_size always multiple of 8).
     const uint bytes_per_group = group_size / 8;
 
+    // Signed accumulation with multi-group tracking.
     float accum = 0.0f;
-    float set_accum = 0.0f;
-    float group_sum = 0.0f;
+    float signed_accum = 0.0f;
     uint cur_group = col_start / group_size;
     uint byte_in_group = (col_start % group_size) / 8;
 
@@ -2182,29 +2281,23 @@ kernel void qmv_fast_multigroup(
         float x6 = shared_input[base_col + 6];
         float x7 = shared_input[base_col + 7];
 
-        group_sum += x0 + x1 + x2 + x3
-                   + x4 + x5 + x6 + x7;
+        signed_accum += select(-x0, x0, bool(byte_val & 1));
+        signed_accum += select(-x1, x1, bool(byte_val & 2));
+        signed_accum += select(-x2, x2, bool(byte_val & 4));
+        signed_accum += select(-x3, x3, bool(byte_val & 8));
+        signed_accum += select(-x4, x4, bool(byte_val & 16));
+        signed_accum += select(-x5, x5, bool(byte_val & 32));
+        signed_accum += select(-x6, x6, bool(byte_val & 64));
+        signed_accum += select(-x7, x7, bool(byte_val & 128));
 
-        set_accum += select(0.0f, x0, bool(byte_val & 1));
-        set_accum += select(0.0f, x1, bool(byte_val & 2));
-        set_accum += select(0.0f, x2, bool(byte_val & 4));
-        set_accum += select(0.0f, x3, bool(byte_val & 8));
-        set_accum += select(0.0f, x4, bool(byte_val & 16));
-        set_accum += select(0.0f, x5, bool(byte_val & 32));
-        set_accum += select(0.0f, x6, bool(byte_val & 64));
-        set_accum += select(0.0f, x7, bool(byte_val & 128));
-
-        // Check group boundary (every group_size/8 bytes).
+        // Flush at group boundary (every group_size/8 bytes).
         byte_in_group++;
         if (byte_in_group == bytes_per_group) {
             const float scale = float(
                 scales[row_scale_offset + cur_group]
             );
-            accum += scale * (
-                2.0f * set_accum - group_sum
-            );
-            set_accum = 0.0f;
-            group_sum = 0.0f;
+            accum += scale * signed_accum;
+            signed_accum = 0.0f;
             cur_group++;
             byte_in_group = 0;
         }
@@ -2215,9 +2308,7 @@ kernel void qmv_fast_multigroup(
         const float scale = float(
             scales[row_scale_offset + cur_group]
         );
-        accum += scale * (
-            2.0f * set_accum - group_sum
-        );
+        accum += scale * signed_accum;
     }
 
     accum = simd_sum(accum);

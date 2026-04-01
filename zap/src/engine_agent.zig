@@ -37,6 +37,7 @@ const api = @import("api_client.zig");
 
 const MAX_EXPERIMENTS: u32 = 50;
 const MAX_TURNS_PER_EXPERIMENT: u32 = 80;
+const TURN_WARNING_THRESHOLD: u32 = 70;
 const MAX_MESSAGES: u32 = 512;
 const MAX_TOOL_CALLS: u32 = 16;
 const MAX_TOOL_OUTPUT: usize = 50_000;
@@ -746,6 +747,49 @@ fn mainInner() !void {
                 arena,
                 results,
             );
+
+            // Inject a turn-limit warning so the agent
+            // knows to wrap up with a summary before the
+            // hard cutoff.  Appended as a text block
+            // inside the tool-results user message.
+            if (turn + 1 >= TURN_WARNING_THRESHOLD) {
+                const remaining =
+                    MAX_TURNS_PER_EXPERIMENT - turn - 1;
+                const warn = std.fmt.allocPrint(
+                    arena,
+                    ",{{\"type\":\"text\",\"text\":" ++
+                        "\"WARNING: {d} turns remaining " ++
+                        "out of {d}. Wrap up NOW. " ++
+                        "If your current approach is " ++
+                        "not working, call " ++
+                        "rollback_latest then " ++
+                        "add_summary describing what " ++
+                        "you tried and why it failed, " ++
+                        "then STOP. Do not start new " ++
+                        "optimisations.\"}}]}}",
+                    .{
+                        remaining,
+                        MAX_TURNS_PER_EXPERIMENT,
+                    },
+                ) catch null;
+
+                if (warn) |w| {
+                    const prev = messages[count];
+                    // Replace closing "]}" with the
+                    // warning text block + "]}".
+                    if (prev.len >= 2) {
+                        const trimmed =
+                            prev[0 .. prev.len - 2];
+                        messages[count] =
+                            std.fmt.allocPrint(
+                                arena,
+                                "{s}{s}",
+                                .{ trimmed, w },
+                            ) catch prev;
+                    }
+                }
+            }
+
             count += 1;
 
             if (count + 2 >= MAX_MESSAGES) {
