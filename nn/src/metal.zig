@@ -652,6 +652,38 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "qmm",
         .shader_name = "qmm",
     },
+    .{
+        .field_name = "qmv_f16in",
+        .shader_name = "qmv_f16in",
+    },
+    .{
+        .field_name = "qmv_const_f16in",
+        .shader_name = "qmv_const_f16in",
+    },
+    .{
+        .field_name = "qmv_fused_pair_const_f16in",
+        .shader_name = "qmv_fused_pair_const_f16in",
+    },
+    .{
+        .field_name = "qmv_const_multigroup_f16in",
+        .shader_name = "qmv_const_multigroup_f16in",
+    },
+    .{
+        .field_name = "qmv_f16io",
+        .shader_name = "qmv_f16io",
+    },
+    .{
+        .field_name = "qmv_const_f16io",
+        .shader_name = "qmv_const_f16io",
+    },
+    .{
+        .field_name = "qmv_fused_pair_const_f16io",
+        .shader_name = "qmv_fused_pair_const_f16io",
+    },
+    .{
+        .field_name = "qmv_const_multigroup_f16io",
+        .shader_name = "qmv_const_multigroup_f16io",
+    },
 };
 
 // ============================================================================
@@ -721,6 +753,20 @@ pub const Device = struct {
     qmv_fused_pair_sm: ComputePipeline,
     qmv_fused_pair_const: ComputePipeline,
     qmm: ComputePipeline,
+    // f16-input QMV variants for the f16 activation pipeline.
+    // These read half* input instead of float*, halving constant-
+    // cache pressure and activation memory bandwidth.
+    qmv_f16in: ComputePipeline,
+    qmv_const_f16in: ComputePipeline,
+    qmv_fused_pair_const_f16in: ComputePipeline,
+    qmv_const_multigroup_f16in: ComputePipeline,
+    // f16-input, f16-output QMV variants.  Used when both the
+    // input activation (e.g. norm_out) and the output activation
+    // (e.g. Q, K, V, gate, up) are f16 buffers.
+    qmv_f16io: ComputePipeline,
+    qmv_const_f16io: ComputePipeline,
+    qmv_fused_pair_const_f16io: ComputePipeline,
+    qmv_const_multigroup_f16io: ComputePipeline,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(

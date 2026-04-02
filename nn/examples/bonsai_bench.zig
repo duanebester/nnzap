@@ -335,7 +335,7 @@ fn dispatchOneDecode(
         position,
     );
 
-    const cmd = device.beginCommandBuffer();
+    const cmd = device.beginCommandBufferUnretained();
     const enc = device.beginCompute(cmd);
     nn.transformer.forwardDecode(
         Config,

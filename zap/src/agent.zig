@@ -44,7 +44,8 @@ const API_URL: []const u8 =
     "https://api.anthropic.com/v1/messages";
 const API_VERSION: []const u8 = "2023-06-01";
 const DEFAULT_MODEL: []const u8 = "claude-opus-4-6";
-const MAX_TOKENS_STR: []const u8 = "16384";
+const MAX_TOKENS_STR: []const u8 = "32768";
+const THINKING_BUDGET_STR: []const u8 = "16384";
 
 const TOOL_PATH: []const u8 = "./zig-out/bin/autoresearch";
 const HISTORY_DIR: []const u8 = ".agent_history";
@@ -363,6 +364,7 @@ fn callApi(
         SYSTEM_PROMPT,
         TOOL_SCHEMAS,
         MAX_TOKENS_STR,
+        THINKING_BUDGET_STR,
     ) catch return api.errResp("request build failed", false);
 
     const uri = Uri.parse(API_URL) catch {

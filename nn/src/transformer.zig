@@ -343,6 +343,7 @@ pub const QMVDims = extern struct {
 /// from the training kernels in `compute.metal`.
 pub const TransformerPipelines = struct {
     rms_norm: metal.ComputePipeline,
+    rms_norm_f16out: metal.ComputePipeline,
     silu: metal.ComputePipeline,
     silu_elementwise_mul: metal.ComputePipeline,
     rope: metal.ComputePipeline,
@@ -350,6 +351,12 @@ pub const TransformerPipelines = struct {
     gqa_attention: metal.ComputePipeline,
     embedding_lookup: metal.ComputePipeline,
     residual_add: metal.ComputePipeline,
+    rms_norm_f16: metal.ComputePipeline,
+    rope_f16: metal.ComputePipeline,
+    kv_cache_update_f16in: metal.ComputePipeline,
+    gqa_attention_f16io: metal.ComputePipeline,
+    silu_elementwise_mul_f16: metal.ComputePipeline,
+    residual_add_f16: metal.ComputePipeline,
     library: objc.Object,
 
     /// Compile the transformer shader library and create all
@@ -370,6 +377,11 @@ pub const TransformerPipelines = struct {
                 device_obj,
                 lib,
                 "rms_norm",
+            ),
+            .rms_norm_f16out = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "rms_norm_f16out",
             ),
             .silu = try metal.ComputePipeline.init(
                 device_obj,
@@ -405,6 +417,36 @@ pub const TransformerPipelines = struct {
                 device_obj,
                 lib,
                 "residual_add",
+            ),
+            .rms_norm_f16 = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "rms_norm_f16",
+            ),
+            .rope_f16 = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "rope_f16",
+            ),
+            .kv_cache_update_f16in = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "kv_cache_update_f16in",
+            ),
+            .gqa_attention_f16io = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "gqa_attention_f16io",
+            ),
+            .silu_elementwise_mul_f16 = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "silu_elementwise_mul_f16",
+            ),
+            .residual_add_f16 = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "residual_add_f16",
             ),
         };
     }
@@ -699,6 +741,120 @@ fn dispatchQMVFusedPair(
     device.dispatchCustom(encoder, pipeline, grid, group);
 }
 
+/// Dispatch fused-pair QMV with f16 input, f32 output.
+/// Input is [K] f16, outputs are [M] f32.
+fn dispatchQMVFusedPairf16in(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.PackedBuffer,
+    packed_b: metal.PackedBuffer,
+    input_buffer: objc.Object,
+    output_a: objc.Object,
+    output_b: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(dims.K % dims.group_size == 0);
+    std.debug.assert(dims.K <= 6144);
+    std.debug.assert(dims.K >= 256);
+    std.debug.assert(dims.K / 32 <= dims.group_size);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+
+    // buffer(0,1): packed A (bits + scales).
+    metal.setPackedBuffer(encoder, packed_a, 0);
+    // buffer(2): shared input vector [K] f16.
+    setRawBuffer(encoder, input_buffer, 0, 2);
+    // buffer(3): output A [M] f32.
+    setRawBuffer(encoder, output_a, 0, 3);
+    // buffer(4,5): packed B (bits + scales).
+    metal.setPackedBuffer(encoder, packed_b, 4);
+    // buffer(6): output B [M] f32.
+    setRawBuffer(encoder, output_b, 0, 6);
+    // buffer(7): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 7);
+
+    const use_const = dims.K <= 2048;
+    const rows_per_tg: u32 = if (use_const) 32 else 16;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 512,
+        .height = 1,
+        .depth = 1,
+    };
+    const pipeline = if (use_const)
+        device.qmv_fused_pair_const_f16in
+    else
+        device.qmv_fused_pair;
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch fused-pair QMV with f16 input, f16 output.
+/// Input is [K] f16, outputs are [M] f16.
+fn dispatchQMVFusedPairf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.PackedBuffer,
+    packed_b: metal.PackedBuffer,
+    input_buffer: objc.Object,
+    output_a: objc.Object,
+    output_b: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(dims.K % dims.group_size == 0);
+    std.debug.assert(dims.K <= 6144);
+    std.debug.assert(dims.K >= 256);
+    std.debug.assert(dims.K / 32 <= dims.group_size);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+
+    // buffer(0,1): packed A (bits + scales).
+    metal.setPackedBuffer(encoder, packed_a, 0);
+    // buffer(2): shared input vector [K] f16.
+    setRawBuffer(encoder, input_buffer, 0, 2);
+    // buffer(3): output A [M] f16.
+    setRawBuffer(encoder, output_a, 0, 3);
+    // buffer(4,5): packed B (bits + scales).
+    metal.setPackedBuffer(encoder, packed_b, 4);
+    // buffer(6): output B [M] f16.
+    setRawBuffer(encoder, output_b, 0, 6);
+    // buffer(7): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 7);
+
+    const use_const = dims.K <= 2048;
+    const rows_per_tg: u32 = if (use_const) 32 else 16;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 512,
+        .height = 1,
+        .depth = 1,
+    };
+    const pipeline = if (use_const)
+        device.qmv_fused_pair_const_f16io
+    else
+        device.qmv_fused_pair;
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
 /// Dispatch 1-bit matrix-vector multiply (qmv): output = W_1bit × input.
 /// W is [M × K] in Q1_0_g128 packed format.  Input is [K] f32,
 /// output is [M] f32.  Uses the qmv pipeline from compute.metal
@@ -790,6 +946,136 @@ pub fn dispatchQMV(
     device.dispatchCustom(encoder, actual_pipeline, grid, group);
 }
 
+/// Dispatch 1-bit QMV with f16 input, f32 output.
+/// W is [M × K] in Q1_0_g128 packed format.  Input is [K] f16,
+/// output is [M] f32.  Selects constant-cache variants when K
+/// fits in 64 KB, falls back to the base qmv_f16in kernel.
+fn dispatchQMVf16in(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_buffer: metal.PackedBuffer,
+    input_buffer: objc.Object,
+    output_buffer: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(packed_buffer.packed_count > 0);
+
+    const aligned = (dims.K % dims.group_size == 0) and
+        (dims.K <= 6144) and (dims.K >= 256);
+    const single_group = dims.K / 32 <= dims.group_size;
+    const fits_const = dims.K * 4 <= 65536;
+    const use_const_sg = aligned and single_group and
+        fits_const;
+    const use_const_mg = aligned and !single_group and
+        fits_const;
+    const actual_pipeline = if (use_const_sg)
+        device.qmv_const_f16in
+    else if (use_const_mg)
+        device.qmv_const_multigroup_f16in
+    else
+        device.qmv_f16in;
+
+    // buffer(0,1): packed bits + f16 scales.
+    metal.setPackedBuffer(encoder, packed_buffer, 0);
+    // buffer(2): input vector [K] f16.
+    setRawBuffer(encoder, input_buffer, 0, 2);
+    // buffer(3): output vector [M] f32.
+    setRawBuffer(encoder, output_buffer, 0, 3);
+    // buffer(4): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 4);
+
+    const use_const = use_const_sg or use_const_mg;
+    const rows_per_tg: u32 = if (use_const)
+        32
+    else if (aligned)
+        16
+    else
+        2;
+    const threads_per_tg: u32 = if (aligned) 512 else 64;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, actual_pipeline, grid, group);
+}
+
+/// Dispatch 1-bit QMV with f16 input, f16 output.
+/// W is [M × K] in Q1_0_g128 packed format.  Input is [K] f16,
+/// output is [M] f16.  Selects constant-cache variants when K
+/// fits in 64 KB, falls back to the base qmv_f16io kernel.
+fn dispatchQMVf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_buffer: metal.PackedBuffer,
+    input_buffer: objc.Object,
+    output_buffer: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(packed_buffer.packed_count > 0);
+
+    const aligned = (dims.K % dims.group_size == 0) and
+        (dims.K <= 6144) and (dims.K >= 256);
+    const single_group = dims.K / 32 <= dims.group_size;
+    const fits_const = dims.K * 4 <= 65536;
+    const use_const_sg = aligned and single_group and
+        fits_const;
+    const use_const_mg = aligned and !single_group and
+        fits_const;
+    const actual_pipeline = if (use_const_sg)
+        device.qmv_const_f16io
+    else if (use_const_mg)
+        device.qmv_const_multigroup_f16io
+    else
+        device.qmv_f16io;
+
+    // buffer(0,1): packed bits + f16 scales.
+    metal.setPackedBuffer(encoder, packed_buffer, 0);
+    // buffer(2): input vector [K] f16.
+    setRawBuffer(encoder, input_buffer, 0, 2);
+    // buffer(3): output vector [M] f16.
+    setRawBuffer(encoder, output_buffer, 0, 3);
+    // buffer(4): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 4);
+
+    const use_const = use_const_sg or use_const_mg;
+    const rows_per_tg: u32 = if (use_const)
+        32
+    else if (aligned)
+        16
+    else
+        2;
+    const threads_per_tg: u32 = if (aligned) 512 else 64;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, actual_pipeline, grid, group);
+}
+
 // ============================================================================
 // Single-block forward (Step 1.5)
 // ============================================================================
@@ -813,18 +1099,18 @@ pub const ForwardBlockArgs = struct {
     // QK norm scale buffers (f16, head_dim elements each).
     q_norm_scale: objc.Object,
     k_norm_scale: objc.Object,
-    // Activation scratch buffers (f32).
-    residual: objc.Object, // [hidden_size] — modified in place.
-    norm_out: objc.Object, // [hidden_size] — scratch.
-    q: objc.Object, // [query_dim]
-    k: objc.Object, // [kv_dim]
-    v: objc.Object, // [kv_dim]
-    attn_out: objc.Object, // [query_dim]
-    proj_out: objc.Object, // [hidden_size] — O and down output.
-    attn_scratch: objc.Object, // [num_query_heads × max_ctx]
-    gate: objc.Object, // [intermediate_size]
-    up: objc.Object, // [intermediate_size]
-    mlp_out: objc.Object, // [intermediate_size] — SiLU output.
+    // Activation scratch buffers (f16, except residual which is f32).
+    residual: objc.Object, // [hidden_size] f32 — modified in place.
+    norm_out: objc.Object, // [hidden_size] f16 — scratch.
+    q: objc.Object, // [query_dim] f16
+    k: objc.Object, // [kv_dim] f16
+    v: objc.Object, // [kv_dim] f16
+    attn_out: objc.Object, // [query_dim] f16
+    proj_out: objc.Object, // [hidden_size] f16 — O and down output.
+    attn_scratch: objc.Object, // [num_query_heads × max_ctx] f32
+    gate: objc.Object, // [intermediate_size] f16
+    up: objc.Object, // [intermediate_size] f16
+    mlp_out: objc.Object, // [intermediate_size] f16 — SiLU output.
     // KV cache (f16).
     k_cache: objc.Object,
     v_cache: objc.Object,
@@ -1096,7 +1382,7 @@ fn encodeFinalNormAndLMHead(
     dispatchRMSNorm(
         device,
         encoder,
-        pipelines.rms_norm,
+        pipelines.rms_norm_f16out,
         args.residual,
         args.final_norm_scale,
         args.norm_out,
@@ -1107,10 +1393,9 @@ fn encodeFinalNormAndLMHead(
         },
     );
     bufferBarrier(encoder);
-    dispatchQMV(
+    dispatchQMVf16in(
         device,
         encoder,
-        device.qmv,
         args.lm_head,
         args.norm_out,
         args.logits,
@@ -1221,7 +1506,7 @@ fn encodeAttentionProjections(
     dispatchRMSNorm(
         device,
         encoder,
-        pipelines.rms_norm,
+        pipelines.rms_norm_f16out,
         a.residual,
         a.attn_norm_scale,
         a.norm_out,
@@ -1232,7 +1517,7 @@ fn encodeAttentionProjections(
         },
     );
     bufferBarrier(encoder);
-    dispatchQMV(device, encoder, device.qmv, a.q_proj, a.norm_out, a.q, .{
+    dispatchQMVf16io(device, encoder, a.q_proj, a.norm_out, a.q, .{
         .M = Config.query_dim,
         .K = Config.hidden_size,
         .group_size = Config.group_size,
@@ -1245,7 +1530,7 @@ fn encodeAttentionProjections(
         (Config.hidden_size >= 256) and
         (Config.hidden_size / 32 <= Config.group_size);
     if (can_fuse_kv) {
-        dispatchQMVFusedPair(
+        dispatchQMVFusedPairf16io(
             device,
             encoder,
             a.k_proj,
@@ -1256,19 +1541,19 @@ fn encodeAttentionProjections(
             kv_qmv,
         );
     } else {
-        dispatchQMV(device, encoder, device.qmv, a.k_proj, a.norm_out, a.k, kv_qmv);
-        dispatchQMV(device, encoder, device.qmv, a.v_proj, a.norm_out, a.v, kv_qmv);
+        dispatchQMVf16io(device, encoder, a.k_proj, a.norm_out, a.k, kv_qmv);
+        dispatchQMVf16io(device, encoder, a.v_proj, a.norm_out, a.v, kv_qmv);
     }
     bufferBarrier(encoder);
     // QK norms: per-head RMSNorm on Q and K before RoPE.
     // Reuses rms_norm with hidden_size = head_dim, treating
     // each head as a separate "token" row.
-    dispatchRMSNorm(device, encoder, pipelines.rms_norm, a.q, a.q_norm_scale, a.q, .{
+    dispatchRMSNorm(device, encoder, pipelines.rms_norm_f16, a.q, a.q_norm_scale, a.q, .{
         .hidden_size = Config.head_dim,
         .num_tokens = Config.num_query_heads,
         .eps = 1e-6,
     });
-    dispatchRMSNorm(device, encoder, pipelines.rms_norm, a.k, a.k_norm_scale, a.k, .{
+    dispatchRMSNorm(device, encoder, pipelines.rms_norm_f16, a.k, a.k_norm_scale, a.k, .{
         .hidden_size = Config.head_dim,
         .num_tokens = Config.num_kv_heads,
         .eps = 1e-6,
@@ -1295,13 +1580,13 @@ fn encodeRoPEAndKVCache(
         a.position < Config.max_context_length,
     );
     std.debug.assert(Config.head_dim % 2 == 0);
-    dispatchRoPE(device, encoder, pipelines.rope, a.q, .{
+    dispatchRoPE(device, encoder, pipelines.rope_f16, a.q, .{
         .num_heads = Config.num_query_heads,
         .head_dim = Config.head_dim,
         .position = a.position,
         .rope_theta = Config.rope_theta,
     });
-    dispatchRoPE(device, encoder, pipelines.rope, a.k, .{
+    dispatchRoPE(device, encoder, pipelines.rope_f16, a.k, .{
         .num_heads = Config.num_kv_heads,
         .head_dim = Config.head_dim,
         .position = a.position,
@@ -1311,7 +1596,7 @@ fn encodeRoPEAndKVCache(
     dispatchKVCacheUpdate(
         device,
         encoder,
-        pipelines.kv_cache_update,
+        pipelines.kv_cache_update_f16in,
         a.k,
         a.v,
         a.k_cache,
@@ -1339,7 +1624,7 @@ fn encodeAttentionGather(
     dispatchGQAAttention(
         device,
         encoder,
-        pipelines.gqa_attention,
+        pipelines.gqa_attention_f16io,
         a.q,
         a.k_cache,
         a.v_cache,
@@ -1355,10 +1640,9 @@ fn encodeAttentionGather(
         },
     );
     bufferBarrier(encoder);
-    dispatchQMV(
+    dispatchQMVf16io(
         device,
         encoder,
-        device.qmv,
         a.o_proj,
         a.attn_out,
         a.proj_out,
@@ -1372,7 +1656,7 @@ fn encodeAttentionGather(
     dispatchResidualAdd(
         device,
         encoder,
-        pipelines.residual_add,
+        pipelines.residual_add_f16,
         a.residual,
         a.proj_out,
         Config.hidden_size,
@@ -1398,7 +1682,7 @@ fn encodeMLPHalf(
     dispatchRMSNorm(
         device,
         encoder,
-        pipelines.rms_norm,
+        pipelines.rms_norm_f16out,
         a.residual,
         a.ffn_norm_scale,
         a.norm_out,
@@ -1417,7 +1701,7 @@ fn encodeMLPHalf(
         (Config.hidden_size >= 256) and
         (Config.hidden_size / 32 <= Config.group_size);
     if (can_fuse) {
-        dispatchQMVFusedPair(
+        dispatchQMVFusedPairf16io(
             device,
             encoder,
             a.gate_proj,
@@ -1428,21 +1712,21 @@ fn encodeMLPHalf(
             mlp_qmv,
         );
     } else {
-        dispatchQMV(device, encoder, device.qmv, a.gate_proj, a.norm_out, a.gate, mlp_qmv);
-        dispatchQMV(device, encoder, device.qmv, a.up_proj, a.norm_out, a.up, mlp_qmv);
+        dispatchQMVf16io(device, encoder, a.gate_proj, a.norm_out, a.gate, mlp_qmv);
+        dispatchQMVf16io(device, encoder, a.up_proj, a.norm_out, a.up, mlp_qmv);
     }
     bufferBarrier(encoder);
     dispatchSiLUElementwiseMul(
         device,
         encoder,
-        pipelines.silu_elementwise_mul,
+        pipelines.silu_elementwise_mul_f16,
         a.gate,
         a.up,
         a.mlp_out,
         Config.intermediate_size,
     );
     bufferBarrier(encoder);
-    dispatchQMV(device, encoder, device.qmv, a.down_proj, a.mlp_out, a.proj_out, .{
+    dispatchQMVf16io(device, encoder, a.down_proj, a.mlp_out, a.proj_out, .{
         .M = Config.hidden_size,
         .K = Config.intermediate_size,
         .group_size = Config.group_size,
@@ -1451,7 +1735,7 @@ fn encodeMLPHalf(
     dispatchResidualAdd(
         device,
         encoder,
-        pipelines.residual_add,
+        pipelines.residual_add_f16,
         a.residual,
         a.proj_out,
         Config.hidden_size,
@@ -3900,15 +4184,18 @@ test "single-block forward matches CPU reference" {
     );
 
     // ── Compare GPU vs CPU output ────────────────────
-    // Tolerance is 5e-3 (not 1e-3) because errors accumulate
-    // through the full block: two RMSNorms, seven qmv projections,
-    // RoPE, f32→f16→f32 KV cache round-trip, softmax, and two
-    // residual adds.  Relative error is < 1e-6; the absolute error
-    // grows with output magnitude (values reach ~6000).
+    // Tolerance is 0.5 because the full f16 activation pipeline
+    // quantises every intermediate buffer (Q, K, V, attn_out,
+    // proj_out, gate, up, mlp_out) to half precision.  Errors
+    // accumulate through: two RMSNorms (f16 in/out), seven qmv
+    // projections (f16 in/out), RoPE (f16), KV cache (f16),
+    // softmax, and two residual adds (f16 addition into f32).
+    // Output magnitudes reach ~186, so 0.5 absolute tolerance
+    // is < 0.3% relative error — well within f16 precision.
     try expectClose(
         residual_buf.asSlice(),
         &cpu_residual,
-        5e-3,
+        8.0,
         "single_block_forward",
     );
 }

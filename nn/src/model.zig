@@ -79,18 +79,22 @@ pub fn Model(comptime Config: type) type {
         k_cache: [Config.num_layers]metal.HalfBuffer,
         v_cache: [Config.num_layers]metal.HalfBuffer,
 
-        // -- Activation scratch buffers (f32, shared across layers) --
+        // -- Activation scratch buffers (shared across layers) --
+        // f32: residual (precision-critical running sum),
+        //      attn_scratch (softmax scores, device memory).
+        // f16: norm_out, q, k, v, attn_out, proj_out, gate,
+        //      up, mlp_out — match quantized projection I/O.
         residual: metal.Buffer,
-        norm_out: metal.Buffer,
-        q: metal.Buffer,
-        k: metal.Buffer,
-        v: metal.Buffer,
-        attn_out: metal.Buffer,
-        proj_out: metal.Buffer,
+        norm_out: metal.HalfBuffer,
+        q: metal.HalfBuffer,
+        k: metal.HalfBuffer,
+        v: metal.HalfBuffer,
+        attn_out: metal.HalfBuffer,
+        proj_out: metal.HalfBuffer,
         attn_scratch: metal.Buffer,
-        gate: metal.Buffer,
-        up: metal.Buffer,
-        mlp_out: metal.Buffer,
+        gate: metal.HalfBuffer,
+        up: metal.HalfBuffer,
+        mlp_out: metal.HalfBuffer,
 
         // -- Forward pass I/O (shared across layers) --
         logits: metal.Buffer, // [vocab_size] f32 — LM head output.
@@ -445,17 +449,17 @@ pub fn Model(comptime Config: type) type {
 
             self.residual = try metal.Buffer.init(dev, H);
             errdefer self.residual.deinit();
-            self.norm_out = try metal.Buffer.init(dev, H);
+            self.norm_out = try metal.HalfBuffer.init(dev, H);
             errdefer self.norm_out.deinit();
-            self.q = try metal.Buffer.init(dev, QD);
+            self.q = try metal.HalfBuffer.init(dev, QD);
             errdefer self.q.deinit();
-            self.k = try metal.Buffer.init(dev, KVD);
+            self.k = try metal.HalfBuffer.init(dev, KVD);
             errdefer self.k.deinit();
-            self.v = try metal.Buffer.init(dev, KVD);
+            self.v = try metal.HalfBuffer.init(dev, KVD);
             errdefer self.v.deinit();
-            self.attn_out = try metal.Buffer.init(dev, QD);
+            self.attn_out = try metal.HalfBuffer.init(dev, QD);
             errdefer self.attn_out.deinit();
-            self.proj_out = try metal.Buffer.init(dev, H);
+            self.proj_out = try metal.HalfBuffer.init(dev, H);
             errdefer self.proj_out.deinit();
 
             const scratch_len: u32 =
@@ -464,11 +468,11 @@ pub fn Model(comptime Config: type) type {
                 try metal.Buffer.init(dev, scratch_len);
             errdefer self.attn_scratch.deinit();
 
-            self.gate = try metal.Buffer.init(dev, I);
+            self.gate = try metal.HalfBuffer.init(dev, I);
             errdefer self.gate.deinit();
-            self.up = try metal.Buffer.init(dev, I);
+            self.up = try metal.HalfBuffer.init(dev, I);
             errdefer self.up.deinit();
-            self.mlp_out = try metal.Buffer.init(dev, I);
+            self.mlp_out = try metal.HalfBuffer.init(dev, I);
             errdefer self.mlp_out.deinit();
 
             // Logits output: [vocab_size] f32.

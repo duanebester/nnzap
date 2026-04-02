@@ -63,7 +63,8 @@ const API_URL: []const u8 =
 const API_VERSION: []const u8 = "2023-06-01";
 const DEFAULT_MODEL: []const u8 =
     "claude-opus-4-6";
-const MAX_TOKENS_STR: []const u8 = "16384";
+const MAX_TOKENS_STR: []const u8 = "32768";
+const THINKING_BUDGET_STR: []const u8 = "16384";
 
 // Local LLM executor constants for two-tier mode.
 // Must match the LM Studio model identifier shown
@@ -313,8 +314,12 @@ const SYSTEM_PROMPT =
     \\## Constraints
     \\
     \\- check must pass before test or bench.
-    \\- All 71 tests must pass. NEVER modify test
-    \\  expectations or remove tests.
+    \\- All 71 tests must pass. Do not remove tests
+    \\  or weaken tolerances to paper over bugs. If an
+    \\  architectural change (e.g. f16 activations)
+    \\  legitimately changes numerical precision, update
+    \\  the CPU reference or tolerance to match — but
+    \\  document WHY in a comment.
     \\- ONE optimisation per experiment. Isolate variables.
     \\- Read the full function before modifying it.
     \\- When adding Metal kernels, wire the pipeline in
@@ -327,74 +332,132 @@ const SYSTEM_PROMPT =
     \\## Current baseline
     \\
     \\Bonsai 1.7B (28 layers, 2048 hidden, Q1_0_g128):
-    \\  Decode:  146-166 tok/s (M2 Max, quiet system)
+    \\  Decode:  ~169 tok/s (M2 Max, after uint32 opt)
     \\  ~451 Metal dispatches per token
     \\  ~366 memory barriers per token
     \\  ~3,748 total Obj-C API calls per token
+    \\  ~8% memory bandwidth utilisation (GPU starving)
     \\
     \\Reference (same hardware, M2 Max):
-    \\  PrismML MLX fork: 224 tok/s (35% faster).
+    \\  PrismML MLX fork: 224 tok/s (32% faster).
     \\  Target: match or beat 224 tok/s.
     \\
     \\## Competitive analysis (read docs/PERF_PLAN.md)
     \\
     \\The PrismML MLX fork uses affine_qmv kernels with
     \\bits=1 support added to MLX's template system.
-    \\Key differences from our implementation:
-    \\  1. bf16 activations (we use f32 everywhere).
-    \\  2. Graph-level kernel fusion (fewer dispatches).
-    \\  3. uint32 weight loads (we use uint8 byte loads).
-    \\  4. 4 rows/simdgroup (we use 2 rows/simdgroup).
-    \\  5. Algebraic qdot trick (accum + bias*sum_x).
+    \\The SINGLE BIGGEST difference is:
+    \\  1. bf16 activations (we use f32 — 2x bandwidth).
+    \\Other differences (already addressed or marginal):
+    \\  2. uint32 weight loads — DONE (experiment 26).
+    \\  3. 4 rows/simdgroup — tried, flat (experiment 21).
+    \\  4. Algebraic qdot trick — tried, flat (exp 25).
+    \\  5. Graph-level fusion — marginal at our scale.
     \\
     \\See docs/PERF_PLAN.md for full analysis with code
     \\references, arithmetic, and implementation notes.
     \\
-    \\## Optimisation phases (priority order)
+    \\## Completed phases (do NOT re-attempt these)
     \\
-    \\Phase 1 — qmv kernel: 4 rows per simdgroup:
-    \\  In qmv_const and qmv_fused_pair_const, change
-    \\  from 2 to 4 output rows per simdgroup. This
-    \\  amortises the 8 constant-cache input reads over
-    \\  4 weight rows instead of 2. Each simdgroup gets
-    \\  4 accumulators (sig0-sig3) and 4 byte reads per
-    \\  inner-loop iteration instead of 2. Rows/TG stays
-    \\  at 32 (8 simdgroups x 4 rows). Expected: +3-5%.
+    \\Phase 1 — 4 rows/simdgroup: DONE, flat. Exp 21.
+    \\Phase 2 — uint32 weight loads: DONE, +3.9%. Exp 26.
+    \\  Applied to qmv_const and qmv_fused_pair_const.
+    \\  Cannot apply to qmv_const_multigroup (alignment).
+    \\Phase 3 — qdot algebraic trick: DONE, flat. Exp 25.
+    \\  Metal compiler already optimises select() well.
+    \\Phase 5 — Barrier/dispatch reduction: exhausted.
+    \\  Fused RoPE QK: +0.5% (below threshold). Exp 27.
+    \\  Fused residual+RMSNorm: regressed 8%. Exp 13.
+    \\  Fused qk_norm_rope: regressed 8%. Exp 17.
+    \\  Concurrent dispatch: no improvement. Exp 23.
+    \\  Obj-C overhead reduction: marginal. Exp 9.
     \\
-    \\Phase 2 — qmv kernel: uint32 weight loads:
-    \\  Load 4 packed bytes at once as uint32 instead of
-    \\  1 byte at a time. Process 32 elements per inner
-    \\  loop iteration instead of 8. This cuts the loop
-    \\  trip count by 4x and reduces weight load
-    \\  instructions by 4x. Expected: +2-4%.
+    \\Kernel-level micro-optimisations are EXHAUSTED.
+    \\The GPU is at ~8% memory bandwidth utilisation —
+    \\it finishes each kernel fast then stalls on the
+    \\next barrier. Making individual kernels faster
+    \\does not help. The bottleneck is total memory
+    \\traffic, not per-kernel compute.
     \\
-    \\Phase 3 — qmv kernel: algebraic qdot trick:
-    \\  Replace select(-x, x, bit) with accumulate-where
-    \\  -bit-set: accum += x * (bit & mask). Then apply
-    \\  result = 2 * accum - sum_x at the end. This
-    \\  eliminates the select instruction — just mask
-    \\  and add. Pre-compute sum_x once per input chunk.
-    \\  MLX uses this pattern. Expected: +2-3%.
+    \\## >>> DO THIS NEXT: Phase 4 — f16 activations <<<
     \\
-    \\Phase 4 — f16 activation pipeline (biggest win):
-    \\  Switch activations from f32 to f16 throughout.
-    \\  This halves memory traffic for every RMSNorm,
-    \\  SiLU, residual_add, and QMV input vector load.
-    \\  MLX uses bfloat16_t activations — their kernel
-    \\  names confirm it. QMV accumulation stays f32
-    \\  internally; only loads/stores go to f16. This
-    \\  touches every kernel and the Zig dispatch code.
-    \\  Expected: +15-20%. The single biggest win.
+    \\This is the ONLY remaining optimisation with a
+    \\large expected payoff (+15-20%). It is the single
+    \\biggest difference between us and MLX. Every MLX
+    \\kernel name contains bfloat16_t. We use f32 for
+    \\all activations — 2x the memory traffic.
     \\
-    \\Phase 5 — Reduce dispatch overhead:
-    \\  451 dispatches + 366 barriers per token. Each
-    \\  dispatch needs setPipelineState + setBuffer x4-7
-    \\  + setBytes + dispatchThreadgroups — all Obj-C
-    \\  message sends at ~100ns each. Total: ~375us of
-    \\  pure CPU overhead per token (~6% of budget).
-    \\  Options: fuse RMSNorm+QMV, use targeted barriers
-    \\  (memoryBarrierWithResources instead of global
-    \\  memoryBarrierWithScope). Expected: +2-5%.
+    \\WHY THIS WORKS: The system is memory-bandwidth
+    \\bound at 8% utilisation. Halving activation size
+    \\from f32 to f16 halves the bandwidth for EVERY
+    \\kernel's input/output across all 451 dispatches.
+    \\This is fundamentally different from making one
+    \\kernel's inner loop faster.
+    \\
+    \\IMPORTANT: This is NOT experiment 12. Experiment
+    \\12 tried f16 in qmv SHARED MEMORY (the tile in
+    \\threadgroup memory), which lost precision in the
+    \\matmul accumulation. That was a different thing.
+    \\The f16 activation pipeline changes the BUFFERS
+    \\BETWEEN kernels — the device-memory activation
+    \\scratch. Each kernel still accumulates in f32
+    \\internally, just loads/stores are f16.
+    \\
+    \\IMPLEMENTATION PLAN (do this incrementally):
+    \\
+    \\Step 1 — Start with ONE kernel: rms_norm.
+    \\  Add a new kernel rms_norm_f16 that reads f16
+    \\  input and writes f16 output (accumulation stays
+    \\  f32 internally). Wire it with a new pipeline in
+    \\  metal.zig. Test against CPU reference. This
+    \\  validates the f16 path with minimal risk.
+    \\
+    \\Step 2 — Convert activation scratch buffers.
+    \\  In transformer.zig, change norm_out from Buffer
+    \\  (f32) to HalfBuffer (f16). Update the dispatch
+    \\  for rms_norm to use rms_norm_f16. Update the
+    \\  qmv kernels to read f16 input (add half* input
+    \\  variants or use a template). QMV accumulation
+    \\  stays f32; only the constant-cache loads change
+    \\  from float to half (4KB instead of 8KB).
+    \\
+    \\Step 3 — Expand to all activation buffers.
+    \\  Convert q, k, v, attn_out, proj_out, gate, up,
+    \\  mlp_out to f16. Update silu_elementwise_mul,
+    \\  residual_add, rope, kv_cache_update, embedding
+    \\  lookup, gqa_attention to use f16 I/O. Keep the
+    \\  residual buffer in f32 if precision is an issue
+    \\  (residual accumulates across 28 layers).
+    \\
+    \\Step 4 — Benchmark and validate generation.
+    \\  Run bench, verify tok/s improvement. Run a long
+    \\  generation to check output quality hasn't
+    \\  degraded noticeably.
+    \\
+    \\KEY FILES TO MODIFY:
+    \\  - nn/src/shaders/transformer.metal: add f16 I/O
+    \\    variants of rms_norm, silu_elementwise_mul,
+    \\    residual_add, rope, embedding_lookup,
+    \\    gqa_attention, kv_cache_update.
+    \\  - nn/src/shaders/compute.metal: add f16 input
+    \\    variants of qmv_const, qmv_fused_pair_const,
+    \\    qmv_const_multigroup (constant half* input
+    \\    instead of constant float* input).
+    \\  - nn/src/transformer.zig: change activation
+    \\    buffer types, update dispatch calls.
+    \\  - nn/src/metal.zig: add new pipeline states for
+    \\    f16 kernel variants.
+    \\  - nn/src/model.zig: change buffer allocation
+    \\    sizes (halved for f16 activations).
+    \\
+    \\PRECISION RULES:
+    \\  - QMV internal accumulation: ALWAYS f32.
+    \\  - RMSNorm sum-of-squares: ALWAYS f32.
+    \\  - Softmax in GQA attention: ALWAYS f32.
+    \\  - Residual buffer: f32 (safest) or f16 (test).
+    \\  - Everything else: f16 loads and stores are fine.
+    \\
+    \\## Later phases (after f16 is done)
     \\
     \\Phase 6 — Async token pipelining:
     \\  Replace commitAndWait with completion handler +
@@ -1986,6 +2049,7 @@ fn callApi(
         system_prompt,
         tool_schemas,
         MAX_TOKENS_STR,
+        THINKING_BUDGET_STR,
     ) catch return api.errResp(
         "request build failed",
         false,

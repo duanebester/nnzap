@@ -414,6 +414,7 @@ pub fn buildRequestJson(
     system_prompt: []const u8,
     tool_schemas: []const u8,
     max_tokens_str: []const u8,
+    thinking_budget_str: []const u8,
 ) ![]u8 {
     std.debug.assert(model.len > 0);
     std.debug.assert(messages.len > 0);
@@ -426,6 +427,18 @@ pub fn buildRequestJson(
     try buf.appendSlice(arena, model);
     try buf.appendSlice(arena, "\",\"max_tokens\":");
     try buf.appendSlice(arena, max_tokens_str);
+
+    // Enable extended thinking when a budget is provided.
+    if (thinking_budget_str.len > 0) {
+        try buf.appendSlice(
+            arena,
+            ",\"thinking\":{\"type\":\"enabled\"" ++
+                ",\"budget_tokens\":",
+        );
+        try buf.appendSlice(arena, thinking_budget_str);
+        try buf.appendSlice(arena, "}");
+    }
+
     try buf.appendSlice(
         arena,
         ",\"cache_control\":{\"type\":\"ephemeral\"}",
