@@ -2377,19 +2377,66 @@ kernel void qmv_const(
     const uint base0 = row0 * bytes_per_row + col_byte_off;
     const uint base1 = row1 * bytes_per_row + col_byte_off;
 
-    for (uint b = 0; b < bytes_per_lane; b++) {
-        const uint base_col = col_start + b * 8;
+    // Load weights as uint32 (4 bytes = 32 elements per load)
+    // to reduce weight memory instructions by 4×. col_start
+    // is always 4-byte aligned (multiple of 8, from lane * K/32
+    // where K >= 256). Load 0 for invalid rows to eliminate
+    // per-byte branch in the inner loop.
+    const uint words_per_lane = bytes_per_lane / 4;
+    const uint tail_bytes = bytes_per_lane % 4;
+    device const uint32_t* bits32_r0 =
+        (device const uint32_t*)(packed_bits + base0);
+    device const uint32_t* bits32_r1 =
+        (device const uint32_t*)(packed_bits + base1);
 
-        // Read input from constant cache — no shared memory.
-        float x0 = input[base_col + 0];
-        float x1 = input[base_col + 1];
-        float x2 = input[base_col + 2];
-        float x3 = input[base_col + 3];
-        float x4 = input[base_col + 4];
-        float x5 = input[base_col + 5];
-        float x6 = input[base_col + 6];
-        float x7 = input[base_col + 7];
+    for (uint w = 0; w < words_per_lane; w++) {
+        const uint32_t w0 = row0_valid ? bits32_r0[w] : 0;
+        const uint32_t w1 = row1_valid ? bits32_r1[w] : 0;
 
+        // Process 4 bytes from each uint32. Extract bytes via
+        // shift and process 8 elements per byte.
+        for (uint bi = 0; bi < 4; bi++) {
+            const uint ci = col_start + w * 32 + bi * 8;
+            const float x0 = input[ci];
+            const float x1 = input[ci + 1];
+            const float x2 = input[ci + 2];
+            const float x3 = input[ci + 3];
+            const float x4 = input[ci + 4];
+            const float x5 = input[ci + 5];
+            const float x6 = input[ci + 6];
+            const float x7 = input[ci + 7];
+            const uint bv0 = (w0 >> (bi * 8)) & 0xFFu;
+            const uint bv1 = (w1 >> (bi * 8)) & 0xFFu;
+            sig0 += select(-x0, x0, bool(bv0 & 1));
+            sig0 += select(-x1, x1, bool(bv0 & 2));
+            sig0 += select(-x2, x2, bool(bv0 & 4));
+            sig0 += select(-x3, x3, bool(bv0 & 8));
+            sig0 += select(-x4, x4, bool(bv0 & 16));
+            sig0 += select(-x5, x5, bool(bv0 & 32));
+            sig0 += select(-x6, x6, bool(bv0 & 64));
+            sig0 += select(-x7, x7, bool(bv0 & 128));
+            sig1 += select(-x0, x0, bool(bv1 & 1));
+            sig1 += select(-x1, x1, bool(bv1 & 2));
+            sig1 += select(-x2, x2, bool(bv1 & 4));
+            sig1 += select(-x3, x3, bool(bv1 & 8));
+            sig1 += select(-x4, x4, bool(bv1 & 16));
+            sig1 += select(-x5, x5, bool(bv1 & 32));
+            sig1 += select(-x6, x6, bool(bv1 & 64));
+            sig1 += select(-x7, x7, bool(bv1 & 128));
+        }
+    }
+
+    // Tail: remaining bytes when bytes_per_lane % 4 != 0.
+    for (uint b = words_per_lane * 4; b < bytes_per_lane; b++) {
+        const uint ci = col_start + b * 8;
+        const float x0 = input[ci];
+        const float x1 = input[ci + 1];
+        const float x2 = input[ci + 2];
+        const float x3 = input[ci + 3];
+        const float x4 = input[ci + 4];
+        const float x5 = input[ci + 5];
+        const float x6 = input[ci + 6];
+        const float x7 = input[ci + 7];
         if (row0_valid) {
             const uint bv0 = packed_bits[base0 + b];
             sig0 += select(-x0, x0, bool(bv0 & 1));
@@ -2401,7 +2448,6 @@ kernel void qmv_const(
             sig0 += select(-x6, x6, bool(bv0 & 64));
             sig0 += select(-x7, x7, bool(bv0 & 128));
         }
-
         if (row1_valid) {
             const uint bv1 = packed_bits[base1 + b];
             sig1 += select(-x0, x0, bool(bv1 & 1));
@@ -2483,19 +2529,87 @@ kernel void qmv_fused_pair_const(
     const uint base_a1 = row1 * bytes_per_row + col_byte_off;
     const uint base_b1 = row1 * bytes_per_row + col_byte_off;
 
-    for (uint b = 0; b < bytes_per_lane; b++) {
-        const uint base_col = col_start + b * 8;
+    // Load weights as uint32 (4 bytes per load) to reduce
+    // weight memory instructions. Load 0 for invalid rows
+    // to remove inner-loop branches.
+    const uint words_per_lane = bytes_per_lane / 4;
+    device const uint32_t* w32_a0 =
+        (device const uint32_t*)(packed_a + base_a0);
+    device const uint32_t* w32_b0 =
+        (device const uint32_t*)(packed_b + base_b0);
+    device const uint32_t* w32_a1 =
+        (device const uint32_t*)(packed_a + base_a1);
+    device const uint32_t* w32_b1 =
+        (device const uint32_t*)(packed_b + base_b1);
 
-        // Read input from constant cache — no shared memory.
-        float x0 = input[base_col + 0];
-        float x1 = input[base_col + 1];
-        float x2 = input[base_col + 2];
-        float x3 = input[base_col + 3];
-        float x4 = input[base_col + 4];
-        float x5 = input[base_col + 5];
-        float x6 = input[base_col + 6];
-        float x7 = input[base_col + 7];
+    for (uint w = 0; w < words_per_lane; w++) {
+        const uint32_t wa0 = row0_valid ? w32_a0[w] : 0;
+        const uint32_t wb0 = row0_valid ? w32_b0[w] : 0;
+        const uint32_t wa1 = row1_valid ? w32_a1[w] : 0;
+        const uint32_t wb1 = row1_valid ? w32_b1[w] : 0;
 
+        for (uint bi = 0; bi < 4; bi++) {
+            const uint ci = col_start + w * 32 + bi * 8;
+            const float x0 = input[ci];
+            const float x1 = input[ci + 1];
+            const float x2 = input[ci + 2];
+            const float x3 = input[ci + 3];
+            const float x4 = input[ci + 4];
+            const float x5 = input[ci + 5];
+            const float x6 = input[ci + 6];
+            const float x7 = input[ci + 7];
+            const uint sh = bi * 8;
+            const uint ba0 = (wa0 >> sh) & 0xFFu;
+            const uint bb0 = (wb0 >> sh) & 0xFFu;
+            const uint ba1 = (wa1 >> sh) & 0xFFu;
+            const uint bb1 = (wb1 >> sh) & 0xFFu;
+            sig_a0 += select(-x0, x0, bool(ba0 & 1));
+            sig_a0 += select(-x1, x1, bool(ba0 & 2));
+            sig_a0 += select(-x2, x2, bool(ba0 & 4));
+            sig_a0 += select(-x3, x3, bool(ba0 & 8));
+            sig_a0 += select(-x4, x4, bool(ba0 & 16));
+            sig_a0 += select(-x5, x5, bool(ba0 & 32));
+            sig_a0 += select(-x6, x6, bool(ba0 & 64));
+            sig_a0 += select(-x7, x7, bool(ba0 & 128));
+            sig_b0 += select(-x0, x0, bool(bb0 & 1));
+            sig_b0 += select(-x1, x1, bool(bb0 & 2));
+            sig_b0 += select(-x2, x2, bool(bb0 & 4));
+            sig_b0 += select(-x3, x3, bool(bb0 & 8));
+            sig_b0 += select(-x4, x4, bool(bb0 & 16));
+            sig_b0 += select(-x5, x5, bool(bb0 & 32));
+            sig_b0 += select(-x6, x6, bool(bb0 & 64));
+            sig_b0 += select(-x7, x7, bool(bb0 & 128));
+            sig_a1 += select(-x0, x0, bool(ba1 & 1));
+            sig_a1 += select(-x1, x1, bool(ba1 & 2));
+            sig_a1 += select(-x2, x2, bool(ba1 & 4));
+            sig_a1 += select(-x3, x3, bool(ba1 & 8));
+            sig_a1 += select(-x4, x4, bool(ba1 & 16));
+            sig_a1 += select(-x5, x5, bool(ba1 & 32));
+            sig_a1 += select(-x6, x6, bool(ba1 & 64));
+            sig_a1 += select(-x7, x7, bool(ba1 & 128));
+            sig_b1 += select(-x0, x0, bool(bb1 & 1));
+            sig_b1 += select(-x1, x1, bool(bb1 & 2));
+            sig_b1 += select(-x2, x2, bool(bb1 & 4));
+            sig_b1 += select(-x3, x3, bool(bb1 & 8));
+            sig_b1 += select(-x4, x4, bool(bb1 & 16));
+            sig_b1 += select(-x5, x5, bool(bb1 & 32));
+            sig_b1 += select(-x6, x6, bool(bb1 & 64));
+            sig_b1 += select(-x7, x7, bool(bb1 & 128));
+        }
+    }
+
+    // Tail bytes when bytes_per_lane % 4 != 0.
+    for (uint b = words_per_lane * 4;
+         b < bytes_per_lane; b++) {
+        const uint ci = col_start + b * 8;
+        const float x0 = input[ci];
+        const float x1 = input[ci + 1];
+        const float x2 = input[ci + 2];
+        const float x3 = input[ci + 3];
+        const float x4 = input[ci + 4];
+        const float x5 = input[ci + 5];
+        const float x6 = input[ci + 6];
+        const float x7 = input[ci + 7];
         if (row0_valid) {
             const uint bva0 = packed_a[base_a0 + b];
             sig_a0 += select(-x0, x0, bool(bva0 & 1));
@@ -2506,7 +2620,6 @@ kernel void qmv_fused_pair_const(
             sig_a0 += select(-x5, x5, bool(bva0 & 32));
             sig_a0 += select(-x6, x6, bool(bva0 & 64));
             sig_a0 += select(-x7, x7, bool(bva0 & 128));
-
             const uint bvb0 = packed_b[base_b0 + b];
             sig_b0 += select(-x0, x0, bool(bvb0 & 1));
             sig_b0 += select(-x1, x1, bool(bvb0 & 2));
@@ -2517,7 +2630,6 @@ kernel void qmv_fused_pair_const(
             sig_b0 += select(-x6, x6, bool(bvb0 & 64));
             sig_b0 += select(-x7, x7, bool(bvb0 & 128));
         }
-
         if (row1_valid) {
             const uint bva1 = packed_a[base_a1 + b];
             sig_a1 += select(-x0, x0, bool(bva1 & 1));
@@ -2528,7 +2640,6 @@ kernel void qmv_fused_pair_const(
             sig_a1 += select(-x5, x5, bool(bva1 & 32));
             sig_a1 += select(-x6, x6, bool(bva1 & 64));
             sig_a1 += select(-x7, x7, bool(bva1 & 128));
-
             const uint bvb1 = packed_b[base_b1 + b];
             sig_b1 += select(-x0, x0, bool(bvb1 & 1));
             sig_b1 += select(-x1, x1, bool(bvb1 & 2));

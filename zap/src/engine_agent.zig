@@ -79,6 +79,7 @@ const LOCAL_LLM_MAX_TOKENS_STR: []const u8 = "16384";
 // strategist needs to design concrete experiments.
 // Read once at startup (Rule 8 — amortise upfront).
 const CODE_CONTEXT_FILES = [_][]const u8{
+    "docs/PERF_PLAN.md",
     "nn/src/shaders/transformer.metal",
     "nn/src/shaders/compute.metal",
     "nn/src/transformer.zig",
@@ -326,60 +327,85 @@ const SYSTEM_PROMPT =
     \\## Current baseline
     \\
     \\Bonsai 1.7B (28 layers, 2048 hidden, Q1_0_g128):
-    \\  Prefill: ~29 tok/s (single-token decode path)
-    \\  Decode:  ~37 tok/s
-    \\  ~365 Metal dispatches per token
+    \\  Decode:  146-166 tok/s (M2 Max, quiet system)
+    \\  ~451 Metal dispatches per token
+    \\  ~366 memory barriers per token
+    \\  ~3,748 total Obj-C API calls per token
     \\
-    \\Reference (same hardware):
-    \\  MLX Python: ~131 tok/s on M4 Pro.
-    \\  The gap is dispatch overhead + kernel tuning.
+    \\Reference (same hardware, M2 Max):
+    \\  PrismML MLX fork: 224 tok/s (35% faster).
+    \\  Target: match or beat 224 tok/s.
+    \\
+    \\## Competitive analysis (read docs/PERF_PLAN.md)
+    \\
+    \\The PrismML MLX fork uses affine_qmv kernels with
+    \\bits=1 support added to MLX's template system.
+    \\Key differences from our implementation:
+    \\  1. bf16 activations (we use f32 everywhere).
+    \\  2. Graph-level kernel fusion (fewer dispatches).
+    \\  3. uint32 weight loads (we use uint8 byte loads).
+    \\  4. 4 rows/simdgroup (we use 2 rows/simdgroup).
+    \\  5. Algebraic qdot trick (accum + bias*sum_x).
+    \\
+    \\See docs/PERF_PLAN.md for full analysis with code
+    \\references, arithmetic, and implementation notes.
     \\
     \\## Optimisation phases (priority order)
     \\
-    \\Phase 1 — Reduce kernel dispatch overhead:
-    \\  ~365 dispatches per token. Each Metal dispatch
-    \\  has ~1-2 us overhead from Obj-C message sends.
-    \\  Encoding all 28 blocks into a single command
-    \\  buffer before committing (already done), but
-    \\  fusing adjacent small kernels (rms_norm + qmv,
-    \\  residual_add, silu_elementwise_mul) into fewer
-    \\  dispatches could cut overhead significantly.
-    \\  Another option: reuse compute encoders across
-    \\  blocks instead of creating new ones.
+    \\Phase 1 — qmv kernel: 4 rows per simdgroup:
+    \\  In qmv_const and qmv_fused_pair_const, change
+    \\  from 2 to 4 output rows per simdgroup. This
+    \\  amortises the 8 constant-cache input reads over
+    \\  4 weight rows instead of 2. Each simdgroup gets
+    \\  4 accumulators (sig0-sig3) and 4 byte reads per
+    \\  inner-loop iteration instead of 2. Rows/TG stays
+    \\  at 32 (8 simdgroups x 4 rows). Expected: +3-5%.
     \\
-    \\Phase 2 — qmv kernel optimisation:
-    \\  197 calls/token, the dominant kernel. Options:
-    \\  - Process more rows per threadgroup (4 or 8
-    \\    simdgroups instead of 2).
-    \\  - Unroll the inner byte loop (8 bits at a time
-    \\    already, but could process 4 bytes/uint32 at
-    \\    once).
-    \\  - Cache input vector in threadgroup shared memory
-    \\    so multiple output rows share the same loads.
-    \\  - qmv_fast variant: skip bounds checks when K is
-    \\    aligned (K%512==0, which Bonsai always is).
-    \\  - Pack input reads: load float4 instead of float.
+    \\Phase 2 — qmv kernel: uint32 weight loads:
+    \\  Load 4 packed bytes at once as uint32 instead of
+    \\  1 byte at a time. Process 32 elements per inner
+    \\  loop iteration instead of 8. This cuts the loop
+    \\  trip count by 4x and reduces weight load
+    \\  instructions by 4x. Expected: +2-4%.
     \\
-    \\Phase 3 — Attention kernel:
-    \\  gqa_attention does a full KV scan per query head.
-    \\  For long contexts this dominates. Flash-attention
-    \\  tiling, f16 arithmetic in attention, or splitting
-    \\  the softmax into online chunks could help.
+    \\Phase 3 — qmv kernel: algebraic qdot trick:
+    \\  Replace select(-x, x, bit) with accumulate-where
+    \\  -bit-set: accum += x * (bit & mask). Then apply
+    \\  result = 2 * accum - sum_x at the end. This
+    \\  eliminates the select instruction — just mask
+    \\  and add. Pre-compute sum_x once per input chunk.
+    \\  MLX uses this pattern. Expected: +2-3%.
     \\
-    \\Phase 4 — Memory and precision:
-    \\  - f16 activations (currently f32 throughout).
-    \\  - Batch multiple qmv calls into one dispatch by
-    \\    stacking weight matrices.
-    \\  - Command buffer reuse across tokens.
-    \\  - Avoid commitAndWait — use MTLEvent signalling
-    \\    or completion handlers so CPU can prep the next
-    \\    token while GPU finishes the current one.
+    \\Phase 4 — f16 activation pipeline (biggest win):
+    \\  Switch activations from f32 to f16 throughout.
+    \\  This halves memory traffic for every RMSNorm,
+    \\  SiLU, residual_add, and QMV input vector load.
+    \\  MLX uses bfloat16_t activations — their kernel
+    \\  names confirm it. QMV accumulation stays f32
+    \\  internally; only loads/stores go to f16. This
+    \\  touches every kernel and the Zig dispatch code.
+    \\  Expected: +15-20%. The single biggest win.
     \\
-    \\Phase 5 — Pipeline architecture:
-    \\  - Indirect command buffers for zero-overhead
-    \\    dispatch (encode once, replay every token).
-    \\  - Double-buffer the command buffer pipeline.
-    \\  - Overlap CPU sampling with GPU compute.
+    \\Phase 5 — Reduce dispatch overhead:
+    \\  451 dispatches + 366 barriers per token. Each
+    \\  dispatch needs setPipelineState + setBuffer x4-7
+    \\  + setBytes + dispatchThreadgroups — all Obj-C
+    \\  message sends at ~100ns each. Total: ~375us of
+    \\  pure CPU overhead per token (~6% of budget).
+    \\  Options: fuse RMSNorm+QMV, use targeted barriers
+    \\  (memoryBarrierWithResources instead of global
+    \\  memoryBarrierWithScope). Expected: +2-5%.
+    \\
+    \\Phase 6 — Async token pipelining:
+    \\  Replace commitAndWait with completion handler +
+    \\  double-buffered logits. CPU samples token N
+    \\  while GPU starts token N+1. Expected: +2-3%.
+    \\
+    \\Phase 7 — GQA attention vectorisation:
+    \\  The QK dot product and V accumulation are fully
+    \\  scalar. Use half4 loads from KV cache to reduce
+    \\  memory transactions by 4x. Matters more at
+    \\  longer sequence lengths. Expected: +2-5%.
     \\
     \\## Metal kernel editing rules
     \\
@@ -625,6 +651,35 @@ const STRATEGIST_PROMPT =
     \\access) will implement your plan — you do NOT
     \\execute anything yourself.
     \\
+    \\## Current baseline
+    \\
+    \\Bonsai 1.7B (28 layers, 2048 hidden, Q1_0_g128):
+    \\  Decode:  146-166 tok/s (M2 Max, quiet system)
+    \\  ~451 Metal dispatches per token
+    \\  ~366 memory barriers per token
+    \\  ~3,748 total Obj-C API calls per token
+    \\
+    \\Target: PrismML MLX fork achieves 224 tok/s on
+    \\the same hardware. That is the number to beat.
+    \\
+    \\## Competitive analysis
+    \\
+    \\The PrismML MLX fork uses affine_qmv kernels with
+    \\bits=1 added to MLX's template system. Five key
+    \\differences explain the 35% gap:
+    \\  1. bf16 activations (we use f32: 2x bandwidth).
+    \\  2. Graph-level kernel fusion (fewer dispatches).
+    \\  3. uint32 weight loads (we use uint8: 4x more
+    \\     weight load instructions).
+    \\  4. 4 rows/simdgroup (we use 2: half the reuse
+    \\     of input vector reads).
+    \\  5. Algebraic qdot trick (accum + bias*sum_x
+    \\     instead of select per element).
+    \\
+    \\Full analysis with code references, arithmetic,
+    \\and implementation notes: docs/PERF_PLAN.md
+    \\(included in the source context below).
+    \\
     \\## Architecture
     \\
     \\Bonsai 1.7B decode hot path per token (28 blocks,
@@ -633,15 +688,16 @@ const STRATEGIST_PROMPT =
     \\
     \\  1. embedding_lookup (1-bit packed, dequant)
     \\  2. Per block (x28):
-    \\     rms_norm -> qmv x3 (Q,K,V) -> rms_norm ->
-    \\     rope -> kv_cache_update -> gqa_attention ->
-    \\     qmv (O) -> residual_add -> rms_norm ->
-    \\     qmv x2 (gate, up) -> silu_mul -> qmv (down)
-    \\     -> residual_add
-    \\  3. rms_norm (final) -> qmv (lm_head)
+    \\     rms_norm -> qmv (Q) -> qmv_fused_pair (K+V)
+    \\     -> rms_norm (Q head) -> rms_norm (K head)
+    \\     -> rope(Q) -> rope(K) -> kv_cache_update
+    \\     -> gqa_attention -> qmv (O) -> residual_add
+    \\     -> rms_norm -> qmv_fused_pair (gate+up)
+    \\     -> silu_mul -> qmv (down) -> residual_add
+    \\  3. rms_norm (final) -> qmv (lm_head, tied)
     \\
-    \\Total: 197 qmv calls + ~168 lightweight dispatches
-    \\= ~365 kernel dispatches per token.
+    \\16 dispatches + 13 barriers per block.
+    \\Total: 451 dispatches, 366 barriers per token.
     \\
     \\Key files:
     \\  nn/src/transformer.zig — dispatch, decode loop
@@ -650,6 +706,40 @@ const STRATEGIST_PROMPT =
     \\  nn/src/shaders/compute.metal — qmv, qmm kernels
     \\  nn/src/shaders/transformer.metal — rms, rope, etc
     \\  nn/examples/bonsai_bench.zig — benchmark binary
+    \\  docs/PERF_PLAN.md — full competitive analysis
+    \\
+    \\## Optimisation phases (priority order)
+    \\
+    \\Phase 1 — qmv: 4 rows per simdgroup (+3-5%):
+    \\  Change qmv_const / qmv_fused_pair_const from 2
+    \\  to 4 rows per simdgroup. Amortises constant-cache
+    \\  input reads over 4 weight rows instead of 2.
+    \\
+    \\Phase 2 — qmv: uint32 weight loads (+2-4%):
+    \\  Load 4 packed bytes as uint32. Process 32 elements
+    \\  per inner loop iteration instead of 8. Cuts loop
+    \\  trip count and weight load instructions by 4x.
+    \\
+    \\Phase 3 — qmv: algebraic qdot trick (+2-3%):
+    \\  Replace select(-x,x,bit) with accumulate-where-set
+    \\  then result = 2*accum - sum_x. Eliminates select.
+    \\
+    \\Phase 4 — f16 activations (+15-20%, biggest win):
+    \\  Switch all activations from f32 to f16. Halves
+    \\  memory traffic for every kernel. QMV accumulation
+    \\  stays f32 internally. Touches every kernel and
+    \\  Zig dispatch code.
+    \\
+    \\Phase 5 — Reduce dispatch overhead (+2-5%):
+    \\  Fuse RMSNorm+QMV, use targeted barriers
+    \\  (memoryBarrierWithResources vs global scope).
+    \\
+    \\Phase 6 — Async token pipelining (+2-3%):
+    \\  Replace commitAndWait with completion handler +
+    \\  double-buffered logits.
+    \\
+    \\Phase 7 — GQA attention vectorisation (+2-5%):
+    \\  half4 loads from KV cache, online softmax.
     \\
     \\## Output format
     \\
@@ -657,6 +747,7 @@ const STRATEGIST_PROMPT =
     \\
     \\1. TITLE: One-line optimisation description.
     \\2. HYPOTHESIS: Why this should improve decode tok/s.
+    \\   Reference the competitive analysis where relevant.
     \\3. TARGET FILES: Which files to modify.
     \\4. CHANGES: Exact functions to modify, what to change,
     \\   and concrete implementation guidance. Name
@@ -671,7 +762,9 @@ const STRATEGIST_PROMPT =
     \\- Do NOT use any tools. Output ONLY the plan text.
     \\- Do NOT repeat approaches from the summaries —
     \\  check them carefully before proposing.
-    \\- Focus on the highest-impact change first.
+    \\- Follow the phase order above — tackle the highest
+    \\  numbered incomplete phase first, unless summaries
+    \\  show it was already attempted and failed.
     \\- ONE change per experiment. Isolate variables.
     \\- The executor has: snapshot, rollback, check, test,
     \\  bench, bench_infer, show, show_function, read_file,
