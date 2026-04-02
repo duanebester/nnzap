@@ -100,6 +100,10 @@ pub fn Model(comptime Config: type) type {
         logits: metal.Buffer, // [vocab_size] f32 — LM head output.
         token_ids: metal.Buffer, // [max_prefill_length] u32 as f32 slots.
 
+        // GPU completion flag for spin-wait synchronization.
+        // Allocated as a 1-element f32 buffer (same size as u32).
+        completion_flag: metal.Buffer,
+
         // -- Device reference for downstream use --
         device_obj: objc.Object,
 
@@ -332,6 +336,11 @@ pub fn Model(comptime Config: type) type {
                 .mlp_out = self.mlp_out.obj,
                 .token_ids = self.token_ids.obj,
                 .logits = self.logits.obj,
+                .flag_buf = self.completion_flag.obj,
+                .flag_ptr = blk: {
+                    const slice = self.completion_flag.asSlice();
+                    break :blk @ptrCast(&slice[0]);
+                },
                 .token_id = token_id,
                 .position = position,
             };
@@ -489,6 +498,14 @@ pub fn Model(comptime Config: type) type {
                 dev,
                 Config.max_prefill_length,
             );
+            errdefer self.token_ids.deinit();
+
+            // Completion flag: 1 element for GPU→CPU spin-wait.
+            self.completion_flag = try metal.Buffer.init(
+                dev,
+                1,
+            );
+            self.completion_flag.asSlice()[0] = 0;
         }
 
         // ----------------------------------------------------------------
@@ -526,6 +543,7 @@ pub fn Model(comptime Config: type) type {
             std.debug.assert(self.residual.len > 0);
             std.debug.assert(self.mlp_out.len > 0);
             std.debug.assert(self.logits.len > 0);
+            self.completion_flag.deinit();
             self.token_ids.deinit();
             self.logits.deinit();
             self.mlp_out.deinit();

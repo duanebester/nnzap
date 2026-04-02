@@ -18,6 +18,7 @@ pub const transformer = @import("transformer.zig");
 pub const safetensors = @import("safetensors.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const model = @import("model.zig");
+pub const specialized_qmv = @import("specialized_qmv.zig");
 
 // Re-exports for convenience
 pub const Device = metal.Device;

@@ -9,6 +9,7 @@
 // ============================================================
 
 const std = @import("std");
+const json = std.json;
 const Allocator = std.mem.Allocator;
 const api = @import("api_client.zig");
 
@@ -41,6 +42,63 @@ comptime {
 }
 
 // ============================================================
+// JSON Value navigation helpers
+//
+// Mirrors the private helpers in api_client.zig.  These
+// pull typed fields from a parsed json.ObjectMap with
+// sensible defaults when the field is missing or has the
+// wrong type.
+// ============================================================
+
+/// Get a string field from a JSON object, or null.
+fn getStr(
+    obj: json.ObjectMap,
+    key: []const u8,
+) ?[]const u8 {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Get an integer field, or 0.
+fn getInt(
+    obj: json.ObjectMap,
+    key: []const u8,
+) i64 {
+    const val = obj.get(key) orelse return 0;
+    return switch (val) {
+        .integer => |i| i,
+        else => 0,
+    };
+}
+
+/// Get an object field.
+fn getObj(
+    obj: json.ObjectMap,
+    key: []const u8,
+) ?json.ObjectMap {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
+/// Get an array field as a slice of Values.
+fn getArr(
+    obj: json.ObjectMap,
+    key: []const u8,
+) ?[]const json.Value {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .array => |a| a.items,
+        else => null,
+    };
+}
+
+// ============================================================
 // Tool schema translation
 // ============================================================
 
@@ -54,58 +112,82 @@ pub fn convertAnthropicTools(
 ) ![]u8 {
     std.debug.assert(anthropic_tools.len > 2);
 
-    const tool_objects = try api.splitTopLevelObjects(
+    const parsed = try json.parseFromSliceLeaky(
+        json.Value,
         arena,
         anthropic_tools,
+        .{},
     );
-    std.debug.assert(tool_objects.len > 0);
 
-    var buf: std.ArrayList(u8) = .empty;
-    try buf.append(arena, '[');
+    const tools = switch (parsed) {
+        .array => |a| a.items,
+        else => return error.InvalidToolsFormat,
+    };
+    std.debug.assert(tools.len > 0);
 
-    for (tool_objects, 0..) |tool, i| {
-        if (i > 0) try buf.append(arena, ',');
+    var out: std.io.Writer.Allocating = .init(arena);
+    var w: json.Stringify = .{
+        .writer = &out.writer,
+    };
 
-        // Extract fields from the Anthropic tool object.
-        const name = api.extractJsonString(
-            tool,
-            "\"name\":\"",
-        ) orelse api.extractJsonString(
-            tool,
-            "\"name\": \"",
-        ) orelse return error.MissingToolName;
+    try w.beginArray();
+    for (tools) |tool_val| {
+        const tool = switch (tool_val) {
+            .object => |o| o,
+            else => continue,
+        };
+        try writeOpenAITool(&w, &out, arena, tool);
+    }
+    try w.endArray();
 
-        const description = api.extractJsonString(
-            tool,
-            "\"description\":\"",
-        ) orelse api.extractJsonString(
-            tool,
-            "\"description\": \"",
-        ) orelse "";
+    return out.written();
+}
 
-        const parameters = api.extractRawObject(
-            tool,
-            "\"input_schema\"",
-        ) orelse "{}";
+/// Write a single tool in OpenAI function-calling format.
+fn writeOpenAITool(
+    w: *json.Stringify,
+    out: *std.io.Writer.Allocating,
+    arena: Allocator,
+    tool: json.ObjectMap,
+) !void {
+    const name = getStr(tool, "name") orelse
+        return error.MissingToolName;
+    const description = getStr(
+        tool,
+        "description",
+    ) orelse "";
+    std.debug.assert(name.len >= 0);
 
-        // Build OpenAI format:
-        // {"type":"function","function":{"name":"...",
-        //   "description":"...","parameters":{...}}}
-        try buf.appendSlice(
-            arena,
-            "{\"type\":\"function\",\"function\":{",
-        );
-        try buf.appendSlice(arena, "\"name\":\"");
-        try buf.appendSlice(arena, name);
-        try buf.appendSlice(arena, "\",\"description\":");
-        try api.appendJsonString(arena, &buf, description);
-        try buf.appendSlice(arena, ",\"parameters\":");
-        try buf.appendSlice(arena, parameters);
-        try buf.appendSlice(arena, "}}");
+    try w.beginObject();
+    try w.objectField("type");
+    try w.write("function");
+    try w.objectField("function");
+    try w.beginObject();
+    try w.objectField("name");
+    try w.write(name);
+    try w.objectField("description");
+    try w.write(description);
+    try w.objectField("parameters");
+
+    // Write input_schema as raw JSON if present.
+    if (tool.get("input_schema")) |schema| {
+        const raw: []const u8 =
+            json.Stringify.valueAlloc(
+                arena,
+                schema,
+                .{},
+            ) catch "{}";
+        try w.beginWriteRaw();
+        try out.writer.writeAll(raw);
+        w.endWriteRaw();
+    } else {
+        try w.beginWriteRaw();
+        try out.writer.writeAll("{}");
+        w.endWriteRaw();
     }
 
-    try buf.append(arena, ']');
-    return buf.items;
+    try w.endObject(); // Close function.
+    try w.endObject(); // Close tool wrapper.
 }
 
 // ============================================================
@@ -127,39 +209,76 @@ pub fn buildRequestJson(
     std.debug.assert(model.len > 0);
     std.debug.assert(messages.len > 0);
 
-    var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(arena, "{\"model\":\"");
-    try buf.appendSlice(arena, model);
-    try buf.appendSlice(arena, "\",\"max_tokens\":");
-    try buf.appendSlice(arena, max_tokens_str);
-    try buf.appendSlice(arena, ",\"temperature\":0.6");
-    try buf.appendSlice(arena, ",\"stream\":false");
-    try buf.appendSlice(arena, ",\"messages\":[");
+    var out: std.io.Writer.Allocating = .init(arena);
+    var w: json.Stringify = .{
+        .writer = &out.writer,
+    };
+
+    try w.beginObject();
+    try w.objectField("model");
+    try w.write(model);
+    try w.objectField("max_tokens");
+    try w.beginWriteRaw();
+    try out.writer.writeAll(max_tokens_str);
+    w.endWriteRaw();
+    try w.objectField("temperature");
+    try w.beginWriteRaw();
+    try out.writer.writeAll("0.6");
+    w.endWriteRaw();
+    try w.objectField("stream");
+    try w.write(false);
+
+    try writeRequestMessages(
+        &w,
+        &out,
+        system_prompt,
+        messages,
+        tools_json,
+    );
+
+    return out.written();
+}
+
+/// Write messages, tools, and close the request object.
+fn writeRequestMessages(
+    w: *json.Stringify,
+    out: *std.io.Writer.Allocating,
+    system_prompt: []const u8,
+    messages: []const []const u8,
+    tools_json: []const u8,
+) !void {
+    std.debug.assert(system_prompt.len > 0);
+    std.debug.assert(messages.len > 0);
+
+    try w.objectField("messages");
+    try w.beginArray();
 
     // System message first.
-    try buf.appendSlice(
-        arena,
-        "{\"role\":\"system\",\"content\":",
-    );
-    try api.appendJsonString(arena, &buf, system_prompt);
-    try buf.append(arena, '}');
+    try w.beginObject();
+    try w.objectField("role");
+    try w.write("system");
+    try w.objectField("content");
+    try w.write(system_prompt);
+    try w.endObject();
 
-    // Append conversation messages.
+    // Append pre-built conversation messages as raw JSON.
     for (messages) |msg| {
-        try buf.append(arena, ',');
-        try buf.appendSlice(arena, msg);
+        try w.beginWriteRaw();
+        try out.writer.writeAll(msg);
+        w.endWriteRaw();
     }
 
-    try buf.append(arena, ']');
+    try w.endArray();
 
     // Append tools if provided.
     if (tools_json.len > 2) {
-        try buf.appendSlice(arena, ",\"tools\":");
-        try buf.appendSlice(arena, tools_json);
+        try w.objectField("tools");
+        try w.beginWriteRaw();
+        try out.writer.writeAll(tools_json);
+        w.endWriteRaw();
     }
 
-    try buf.appendSlice(arena, "}");
-    return buf.items;
+    try w.endObject();
 }
 
 // ============================================================
@@ -191,6 +310,23 @@ pub fn callApi(
         "ollama request build failed",
         false,
     );
+
+    return executeCurlAndProcess(
+        arena,
+        body,
+        history_dir,
+    );
+}
+
+/// Save the request, execute curl, and hand off to
+/// response processing.
+fn executeCurlAndProcess(
+    arena: Allocator,
+    body: []const u8,
+    history_dir: []const u8,
+) api.ApiResponse {
+    std.debug.assert(body.len > 0);
+    std.debug.assert(history_dir.len > 0);
 
     // Save request for debugging.
     const request_path = std.fmt.allocPrint(
@@ -253,7 +389,6 @@ pub fn callApi(
         .Exited => |code| code == 0,
         else => false,
     };
-
     if (!curl_ok) {
         const detail = if (result.stderr.len > 0)
             api.truncate(result.stderr, 500)
@@ -267,7 +402,22 @@ pub fn callApi(
         return api.errResp(msg, true);
     }
 
-    const output = result.stdout;
+    return processRawOutput(
+        arena,
+        result.stdout,
+        history_dir,
+    );
+}
+
+/// Split the HTTP status code from the curl output, handle
+/// non-200 responses, and parse the successful body.
+fn processRawOutput(
+    arena: Allocator,
+    output: []const u8,
+    history_dir: []const u8,
+) api.ApiResponse {
+    std.debug.assert(history_dir.len > 0);
+
     if (output.len < 4) {
         return api.errResp(
             "empty ollama output",
@@ -312,18 +462,11 @@ pub fn callApi(
     );
 
     if (status_code != 200) {
-        // Extract error message if present.
-        const err_msg = api.extractJsonString(
-            response_data,
-            "\"message\":\"",
-        ) orelse api.truncate(response_data, 500);
-        const msg = std.fmt.allocPrint(
+        return handleNon200(
             arena,
-            "ollama HTTP {d}: {s}",
-            .{ status_code, err_msg },
-        ) catch "ollama HTTP error";
-        const retryable = (status_code >= 500);
-        return api.errResp(msg, retryable);
+            response_data,
+            status_code,
+        );
     }
 
     if (response_data.len == 0) {
@@ -334,16 +477,78 @@ pub fn callApi(
     }
 
     // Persist raw response for debugging.
-    const response_path = std.fmt.allocPrint(
+    saveDebugResponse(arena, history_dir, response_data);
+
+    return parseApiResponse(arena, response_data);
+}
+
+/// Build an error ApiResponse for a non-200 HTTP status.
+fn handleNon200(
+    arena: Allocator,
+    body: []const u8,
+    status: u16,
+) api.ApiResponse {
+    std.debug.assert(status != 200);
+    std.debug.assert(status > 0);
+
+    const err_msg = if (body.len > 0)
+        extractErrorMsg(arena, body)
+    else
+        "empty error response";
+
+    const msg = std.fmt.allocPrint(
+        arena,
+        "ollama HTTP {d}: {s}",
+        .{ status, err_msg },
+    ) catch "ollama HTTP error";
+    return api.errResp(msg, status >= 500);
+}
+
+/// Try to extract an error message from a JSON error body.
+/// Falls back to truncated raw text if parsing fails.
+fn extractErrorMsg(
+    arena: Allocator,
+    data: []const u8,
+) []const u8 {
+    std.debug.assert(data.len > 0);
+
+    const parsed = json.parseFromSliceLeaky(
+        json.Value,
+        arena,
+        data,
+        .{},
+    ) catch return api.truncate(data, 500);
+
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return api.truncate(data, 500),
+    };
+
+    // Try top-level "message", then nested "error.message".
+    if (getStr(obj, "message")) |msg| {
+        return msg;
+    }
+    if (getObj(obj, "error")) |err| {
+        if (getStr(err, "message")) |msg| return msg;
+    }
+    return api.truncate(data, 500);
+}
+
+/// Persist the raw response JSON for debugging.
+fn saveDebugResponse(
+    arena: Allocator,
+    history_dir: []const u8,
+    body: []const u8,
+) void {
+    std.debug.assert(history_dir.len > 0);
+    std.debug.assert(body.len > 0);
+
+    const path = std.fmt.allocPrint(
         arena,
         "{s}/_ollama_response.json",
         .{history_dir},
-    ) catch "";
-    if (response_path.len > 0) {
-        api.writeFile(response_path, response_data) catch {};
-    }
-
-    return parseApiResponse(arena, response_data);
+    ) catch return;
+    api.writeFile(path, body) catch {};
 }
 
 // ============================================================
@@ -367,127 +572,123 @@ pub fn callApi(
 ///     },
 ///     "finish_reason": "stop"
 ///   }],
-///   "usage": {"prompt_tokens":100,"completion_tokens":50}
+///   "usage": {
+///     "prompt_tokens": 100,
+///     "completion_tokens": 50
+///   }
 /// }
 pub fn parseApiResponse(
     arena: Allocator,
     raw: []const u8,
 ) api.ApiResponse {
     std.debug.assert(raw.len > 0);
+    std.debug.assert(raw.len <= MAX_API_RESPONSE);
 
-    // Check for error responses.
-    if (api.indexOf(raw, "\"error\"") != null) {
-        const msg = api.extractJsonString(
-            raw,
-            "\"message\":\"",
-        ) orelse "unknown ollama error";
-        return api.errResp(msg, false);
+    const root = json.parseFromSliceLeaky(
+        json.Value,
+        arena,
+        raw,
+        .{},
+    ) catch return api.errResp(
+        "invalid JSON from ollama",
+        false,
+    );
+
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return api.errResp(
+            "expected JSON object from ollama",
+            false,
+        ),
+    };
+
+    // Check for error field in the response.
+    if (obj.get("error")) |err_val| {
+        switch (err_val) {
+            .string => |s| {
+                if (s.len > 0) {
+                    return api.errResp(s, false);
+                }
+            },
+            .object => |e| {
+                const msg = getStr(
+                    e,
+                    "message",
+                ) orelse "unknown ollama error";
+                return api.errResp(msg, false);
+            },
+            else => {},
+        }
     }
 
-    // Extract the choices array, then the first choice.
-    const choices_arr = api.extractRawArray(
-        raw,
-        "\"choices\"",
-    ) orelse {
+    return buildOllamaSuccess(arena, obj);
+}
+
+/// Build a successful ApiResponse from the parsed choices,
+/// message content, tool calls, and token usage.
+fn buildOllamaSuccess(
+    arena: Allocator,
+    obj: json.ObjectMap,
+) api.ApiResponse {
+    // Extract choices array.
+    const choices = getArr(obj, "choices") orelse
         return api.errResp(
             "no choices in ollama response",
             false,
         );
-    };
-
-    const choice_objects = api.splitTopLevelObjects(
-        arena,
-        choices_arr,
-    ) catch {
-        return api.errResp(
-            "failed to parse choices array",
-            false,
-        );
-    };
-
-    if (choice_objects.len == 0) {
+    if (choices.len == 0) {
         return api.errResp(
             "empty choices array",
             false,
         );
     }
+    // At least one choice exists after the length check.
+    std.debug.assert(choices.len > 0);
 
-    const choice = choice_objects[0];
+    // First choice object.
+    const choice = switch (choices[0]) {
+        .object => |o| o,
+        else => return api.errResp(
+            "invalid choice object",
+            false,
+        ),
+    };
 
-    // Extract finish_reason → stop_reason.
-    const raw_reason = api.extractJsonString(
+    // finish_reason → stop_reason.
+    const raw_reason = getStr(
         choice,
-        "\"finish_reason\":\"",
-    ) orelse api.extractJsonString(
-        choice,
-        "\"finish_reason\": \"",
+        "finish_reason",
     ) orelse "unknown";
-
-    // Map OpenAI reasons to Anthropic equivalents so
-    // the engine_agent loop logic works unchanged.
     const stop_reason = mapFinishReason(raw_reason);
 
-    // Extract the message object.
-    const message_obj = api.extractRawObject(
-        choice,
-        "\"message\"",
-    ) orelse {
+    // Message object.
+    const message = getObj(choice, "message") orelse
         return api.errResp(
             "no message in first choice",
             false,
         );
-    };
 
-    // Extract text content.  In OpenAI format, content
-    // is a plain string (or null when tool_calls present).
-    // Reasoning models (e.g. Qwen reasoning-distilled)
-    // may put all output in reasoning_content and leave
-    // content empty — fall back to reasoning_content so
-    // the executor's thinking is not silently lost.
-    const raw_text = api.extractJsonString(
-        message_obj,
-        "\"content\":\"",
-    ) orelse api.extractJsonString(
-        message_obj,
-        "\"content\": \"",
-    ) orelse "";
+    const text = extractMessageText(message);
+    const tool_calls = parseToolCalls(arena, message);
 
-    const text = if (raw_text.len == 0)
-        api.extractJsonString(
-            message_obj,
-            "\"reasoning_content\":\"",
-        ) orelse api.extractJsonString(
-            message_obj,
-            "\"reasoning_content\": \"",
-        ) orelse ""
-    else
-        raw_text;
-
-    // Extract tool_calls if present.
-    const tool_calls = parseToolCalls(
-        arena,
-        message_obj,
-    );
-
-    // Extract token usage.
+    // Token usage.
+    const usage = getObj(obj, "usage");
     const input_tokens = parseTokenField(
-        raw,
-        "\"prompt_tokens\":",
+        usage,
+        "prompt_tokens",
     );
     const output_tokens = parseTokenField(
-        raw,
-        "\"completion_tokens\":",
+        usage,
+        "completion_tokens",
     );
 
-    // Build content_json as an Anthropic-style content
-    // array for compatibility with saveRunLog.  This is
-    // a best-effort reconstruction — the run log is for
-    // debugging, not round-tripping.
+    // Build Anthropic-style content_json for run log.
     const content_json = buildContentJson(
         arena,
         text,
         tool_calls,
     );
+    std.debug.assert(stop_reason.len > 0);
 
     return .{
         .success = true,
@@ -500,6 +701,25 @@ pub fn parseApiResponse(
         .input_tokens = input_tokens,
         .output_tokens = output_tokens,
     };
+}
+
+/// Extract text content from an OpenAI message object.
+/// Falls back to reasoning_content for reasoning models
+/// like Qwen that put all output there and leave content
+/// empty.
+fn extractMessageText(
+    message: json.ObjectMap,
+) []const u8 {
+    const content = getStr(message, "content");
+    if (content) |text| {
+        if (text.len > 0) return text;
+    }
+
+    // Reasoning models may use reasoning_content instead.
+    return getStr(
+        message,
+        "reasoning_content",
+    ) orelse "";
 }
 
 /// Map OpenAI finish reasons to the Anthropic equivalents
@@ -519,62 +739,36 @@ fn mapFinishReason(reason: []const u8) []const u8 {
 ///           "function":{"name":"...","arguments":"{}"}}]
 fn parseToolCalls(
     arena: Allocator,
-    message_json: []const u8,
+    message: json.ObjectMap,
 ) []const api.ToolCall {
-    std.debug.assert(message_json.len > 0);
-
-    const tc_array = api.extractRawArray(
-        message_json,
-        "\"tool_calls\"",
+    const tc_items = getArr(
+        message,
+        "tool_calls",
     ) orelse return &.{};
-
-    const tc_objects = api.splitTopLevelObjects(
-        arena,
-        tc_array,
-    ) catch return &.{};
-
-    if (tc_objects.len == 0) return &.{};
+    if (tc_items.len == 0) return &.{};
 
     var calls: [MAX_TOOL_CALLS]api.ToolCall = undefined;
     var count: u32 = 0;
 
-    for (tc_objects) |tc| {
+    for (tc_items) |tc_val| {
         if (count >= MAX_TOOL_CALLS) break;
+        const tc = switch (tc_val) {
+            .object => |o| o,
+            else => continue,
+        };
 
-        // Extract id.
-        const id = api.extractJsonString(
+        const id = getStr(tc, "id") orelse continue;
+        const func = getObj(
             tc,
-            "\"id\":\"",
-        ) orelse api.extractJsonString(
-            tc,
-            "\"id\": \"",
+            "function",
         ) orelse continue;
-
-        // Extract function object.  Search for
-        // "function": (with colon) to avoid matching
-        // the value in "type": "function".
-        const func_obj = api.extractRawObject(
-            tc,
-            "\"function\":",
-        ) orelse api.extractRawObject(
-            tc,
-            "\"function\" :",
+        const name = getStr(
+            func,
+            "name",
         ) orelse continue;
-
-        // Extract name and arguments from function.
-        const name = api.extractJsonString(
-            func_obj,
-            "\"name\":\"",
-        ) orelse api.extractJsonString(
-            func_obj,
-            "\"name\": \"",
-        ) orelse continue;
-
-        // Arguments is a JSON string containing the
-        // tool input.  In OpenAI format it's a string
-        // value, but we need to extract the raw JSON.
         const args = extractArgumentsJson(
-            func_obj,
+            arena,
+            func,
         ) orelse "{}";
 
         calls[count] = .{
@@ -585,54 +779,56 @@ fn parseToolCalls(
         count += 1;
     }
 
+    std.debug.assert(count <= MAX_TOOL_CALLS);
+
     const result = arena.alloc(
         api.ToolCall,
         count,
     ) catch return &.{};
     @memcpy(result, calls[0..count]);
+    std.debug.assert(result.len == count);
     return result;
 }
 
 /// Extract the "arguments" field from a function object.
 /// OpenAI serialises arguments as a JSON string (escaped),
 /// e.g. `"arguments":"{\"path\":\"nn/src/metal.zig\"}"`.
-/// We need to extract and unescape it to get raw JSON.
 /// Some Ollama models also emit arguments as a raw object,
-/// so we try both.
+/// so we handle both.
 fn extractArgumentsJson(
-    func_json: []const u8,
+    arena: Allocator,
+    func: json.ObjectMap,
 ) ?[]const u8 {
-    std.debug.assert(func_json.len > 0);
-
-    // First try: raw object (some local models do this).
-    if (api.extractRawObject(
-        func_json,
-        "\"arguments\"",
-    )) |obj| {
-        return obj;
-    }
-
-    // Second try: JSON string value.
-    return api.extractJsonString(
-        func_json,
-        "\"arguments\":\"",
-    ) orelse api.extractJsonString(
-        func_json,
-        "\"arguments\": \"",
-    );
+    const val = func.get("arguments") orelse
+        return null;
+    return switch (val) {
+        // String value: the unescaped content IS the
+        // raw JSON arguments.
+        .string => |s| s,
+        // Object value: re-serialize to a JSON string.
+        .object => json.Stringify.valueAlloc(
+            arena,
+            val,
+            .{},
+        ) catch null,
+        else => null,
+    };
 }
 
-/// Parse a token count field from the usage object.
+/// Parse a token count from the usage object.
 fn parseTokenField(
-    raw: []const u8,
-    needle: []const u8,
+    usage: ?json.ObjectMap,
+    key: []const u8,
 ) u32 {
-    const str = api.extractJsonNumber(
-        raw,
-        needle,
-    ) orelse return 0;
-    return std.fmt.parseInt(u32, str, 10) catch 0;
+    std.debug.assert(key.len > 0);
+    const obj = usage orelse return 0;
+    const val = getInt(obj, key);
+    return if (val >= 0) @intCast(val) else 0;
 }
+
+// ============================================================
+// Content JSON building
+// ============================================================
 
 /// Build an Anthropic-style content JSON array from text
 /// and tool calls.  Used for run log compatibility.
@@ -641,53 +837,69 @@ fn buildContentJson(
     text: []const u8,
     tool_calls: []const api.ToolCall,
 ) []const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    buf.append(arena, '[') catch return "[]";
+    return buildContentJsonInner(
+        arena,
+        text,
+        tool_calls,
+    ) catch "[]";
+}
 
-    var has_item = false;
+/// Inner builder that can propagate errors.
+fn buildContentJsonInner(
+    arena: Allocator,
+    text: []const u8,
+    tool_calls: []const api.ToolCall,
+) ![]const u8 {
+    var out: std.io.Writer.Allocating = .init(arena);
+    var w: json.Stringify = .{
+        .writer = &out.writer,
+    };
+
+    try w.beginArray();
 
     if (text.len > 0) {
-        buf.appendSlice(
-            arena,
-            "{\"type\":\"text\",\"text\":",
-        ) catch return "[]";
-        api.appendJsonString(
-            arena,
-            &buf,
-            text,
-        ) catch return "[]";
-        buf.append(arena, '}') catch return "[]";
-        has_item = true;
+        try w.beginObject();
+        try w.objectField("type");
+        try w.write("text");
+        try w.objectField("text");
+        try w.write(text);
+        try w.endObject();
     }
 
     for (tool_calls) |tc| {
-        if (has_item) {
-            buf.append(arena, ',') catch continue;
-        }
-        buf.appendSlice(
-            arena,
-            "{\"type\":\"tool_use\",\"id\":\"",
-        ) catch continue;
-        buf.appendSlice(arena, tc.id) catch continue;
-        buf.appendSlice(
-            arena,
-            "\",\"name\":\"",
-        ) catch continue;
-        buf.appendSlice(arena, tc.name) catch continue;
-        buf.appendSlice(
-            arena,
-            "\",\"input\":",
-        ) catch continue;
-        buf.appendSlice(
-            arena,
-            tc.input_json,
-        ) catch continue;
-        buf.append(arena, '}') catch continue;
-        has_item = true;
+        try writeToolUseBlock(&w, &out, tc);
     }
 
-    buf.append(arena, ']') catch return "[]";
-    return buf.items;
+    try w.endArray();
+
+    const result = out.written();
+    std.debug.assert(result.len >= 2); // At least "[]".
+    std.debug.assert(result[0] == '[');
+    return result;
+}
+
+/// Write a single tool_use content block.
+fn writeToolUseBlock(
+    w: *json.Stringify,
+    out: *std.io.Writer.Allocating,
+    tc: api.ToolCall,
+) !void {
+    std.debug.assert(tc.id.len > 0);
+    std.debug.assert(tc.name.len > 0);
+
+    try w.beginObject();
+    try w.objectField("type");
+    try w.write("tool_use");
+    try w.objectField("id");
+    try w.write(tc.id);
+    try w.objectField("name");
+    try w.write(tc.name);
+    try w.objectField("input");
+    // input_json is already valid JSON — write raw.
+    try w.beginWriteRaw();
+    try out.writer.writeAll(tc.input_json);
+    w.endWriteRaw();
+    try w.endObject();
 }
 
 // ============================================================
@@ -701,66 +913,79 @@ pub fn buildAssistantMsg(
     resp: api.ApiResponse,
 ) []const u8 {
     std.debug.assert(resp.success);
-
-    var buf: std.ArrayList(u8) = .empty;
-    buf.appendSlice(
+    return buildAssistantMsgInner(
         arena,
-        "{\"role\":\"assistant\"",
-    ) catch return "{}";
+        resp,
+    ) catch "{}";
+}
+
+/// Inner builder for buildAssistantMsg.
+fn buildAssistantMsgInner(
+    arena: Allocator,
+    resp: api.ApiResponse,
+) ![]const u8 {
+    std.debug.assert(resp.success);
+
+    var out: std.io.Writer.Allocating = .init(arena);
+    var w: json.Stringify = .{
+        .writer = &out.writer,
+    };
+
+    try w.beginObject();
+    try w.objectField("role");
+    try w.write("assistant");
 
     // Content field — null when only tool calls.
+    try w.objectField("content");
     if (resp.text.len > 0) {
-        buf.appendSlice(arena, ",\"content\":") catch
-            return "{}";
-        api.appendJsonString(
-            arena,
-            &buf,
-            resp.text,
-        ) catch return "{}";
+        try w.write(resp.text);
     } else {
-        buf.appendSlice(
-            arena,
-            ",\"content\":null",
-        ) catch return "{}";
+        try w.beginWriteRaw();
+        try out.writer.writeAll("null");
+        w.endWriteRaw();
     }
 
     // Tool calls array if present.
     if (resp.tool_calls.len > 0) {
-        buf.appendSlice(
-            arena,
-            ",\"tool_calls\":[",
-        ) catch return "{}";
-
-        for (resp.tool_calls, 0..) |tc, i| {
-            if (i > 0) buf.append(arena, ',') catch {};
-            buf.appendSlice(
-                arena,
-                "{\"id\":\"",
-            ) catch continue;
-            buf.appendSlice(arena, tc.id) catch continue;
-            buf.appendSlice(
-                arena,
-                "\",\"type\":\"function\"," ++
-                    "\"function\":{\"name\":\"",
-            ) catch continue;
-            buf.appendSlice(arena, tc.name) catch continue;
-            buf.appendSlice(
-                arena,
-                "\",\"arguments\":",
-            ) catch continue;
-            api.appendJsonString(
-                arena,
-                &buf,
-                tc.input_json,
-            ) catch continue;
-            buf.appendSlice(arena, "}}") catch continue;
+        try w.objectField("tool_calls");
+        try w.beginArray();
+        for (resp.tool_calls) |tc| {
+            try writeAssistantToolCall(&w, tc);
         }
-
-        buf.append(arena, ']') catch {};
+        try w.endArray();
     }
 
-    buf.append(arena, '}') catch return "{}";
-    return buf.items;
+    try w.endObject();
+
+    const result = out.written();
+    std.debug.assert(result.len > 2);
+    return result;
+}
+
+/// Write a single tool call in an assistant message.
+/// In OpenAI format, arguments is a JSON string (the
+/// raw JSON is escaped inside a quoted string value).
+fn writeAssistantToolCall(
+    w: *json.Stringify,
+    tc: api.ToolCall,
+) !void {
+    std.debug.assert(tc.id.len > 0);
+    std.debug.assert(tc.name.len > 0);
+
+    try w.beginObject();
+    try w.objectField("id");
+    try w.write(tc.id);
+    try w.objectField("type");
+    try w.write("function");
+    try w.objectField("function");
+    try w.beginObject();
+    try w.objectField("name");
+    try w.write(tc.name);
+    try w.objectField("arguments");
+    // Stringify quotes and escapes the inner JSON string.
+    try w.write(tc.input_json);
+    try w.endObject(); // Close function.
+    try w.endObject(); // Close tool call.
 }
 
 /// Build an OpenAI-format tool result message.
@@ -771,25 +996,36 @@ pub fn buildToolResultMsg(
     result: api.ToolResult,
 ) []const u8 {
     std.debug.assert(result.tool_use_id.len > 0);
+    return buildToolResultMsgInner(
+        arena,
+        result,
+    ) catch "{}";
+}
 
-    var buf: std.ArrayList(u8) = .empty;
-    buf.appendSlice(
-        arena,
-        "{\"role\":\"tool\",\"tool_call_id\":\"",
-    ) catch return "{}";
-    buf.appendSlice(
-        arena,
-        result.tool_use_id,
-    ) catch return "{}";
-    buf.appendSlice(arena, "\",\"content\":") catch
-        return "{}";
-    api.appendJsonString(
-        arena,
-        &buf,
-        result.content,
-    ) catch return "{}";
-    buf.append(arena, '}') catch return "{}";
-    return buf.items;
+/// Inner builder for buildToolResultMsg.
+fn buildToolResultMsgInner(
+    arena: Allocator,
+    result: api.ToolResult,
+) ![]const u8 {
+    std.debug.assert(result.tool_use_id.len > 0);
+
+    var out: std.io.Writer.Allocating = .init(arena);
+    var w: json.Stringify = .{
+        .writer = &out.writer,
+    };
+
+    try w.beginObject();
+    try w.objectField("role");
+    try w.write("tool");
+    try w.objectField("tool_call_id");
+    try w.write(result.tool_use_id);
+    try w.objectField("content");
+    try w.write(result.content);
+    try w.endObject();
+
+    const written = out.written();
+    std.debug.assert(written.len > 0);
+    return written;
 }
 
 /// Build a simple user text message.
@@ -798,17 +1034,32 @@ pub fn buildUserTextMsg(
     text: []const u8,
 ) []const u8 {
     std.debug.assert(text.len > 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    buf.appendSlice(
+    return buildUserTextMsgInner(
         arena,
-        "{\"role\":\"user\",\"content\":",
-    ) catch return "{}";
-    api.appendJsonString(
-        arena,
-        &buf,
         text,
-    ) catch return "{}";
-    buf.append(arena, '}') catch return "{}";
-    return buf.items;
+    ) catch "{}";
+}
+
+/// Inner builder for buildUserTextMsg.
+fn buildUserTextMsgInner(
+    arena: Allocator,
+    text: []const u8,
+) ![]const u8 {
+    std.debug.assert(text.len > 0);
+
+    var out: std.io.Writer.Allocating = .init(arena);
+    var w: json.Stringify = .{
+        .writer = &out.writer,
+    };
+
+    try w.beginObject();
+    try w.objectField("role");
+    try w.write("user");
+    try w.objectField("content");
+    try w.write(text);
+    try w.endObject();
+
+    const result = out.written();
+    std.debug.assert(result.len > text.len);
+    return result;
 }

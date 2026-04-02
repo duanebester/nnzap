@@ -89,6 +89,15 @@ pub fn main() !void {
     var pipelines: nn.TransformerPipelines = undefined;
     try pipelines.init(device.obj);
 
+    // Compile specialized QMV kernels with model dimensions
+    // baked in as constexpr for full loop unrolling.
+    try nn.specialized_qmv.initOnDevice(
+        &device,
+        Config.hidden_size,
+        Config.intermediate_size,
+        Config.group_size,
+    );
+
     // ── Model allocation and weight loading ──────────
     std.debug.print("Allocating model buffers...\n", .{});
 

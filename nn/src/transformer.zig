@@ -17,6 +17,7 @@ const std = @import("std");
 const objc = @import("objc");
 const metal = @import("metal.zig");
 const layout = @import("layout.zig");
+const specialized_qmv = @import("specialized_qmv.zig");
 
 const log = std.log.scoped(.transformer);
 const divCeil = layout.divCeil;
@@ -307,6 +308,34 @@ pub const KVUpdateDims = extern struct {
     max_context_length: u32,
 };
 
+/// Fused RoPE K + KV cache update dimensions.
+pub const FusedRoPEKVDims = extern struct {
+    num_kv_heads: u32,
+    head_dim: u32,
+    position: u32,
+    max_context_length: u32,
+    rope_theta: f32,
+};
+
+/// Fused per-head RMSNorm + RoPE dimensions.
+pub const FusedNormRoPEDims = extern struct {
+    num_heads: u32,
+    head_dim: u32,
+    position: u32,
+    eps: f32,
+    rope_theta: f32,
+};
+
+/// Fused K-norm + RoPE K + KV cache dimensions.
+pub const FusedKNormRoPEKVDims = extern struct {
+    num_kv_heads: u32,
+    head_dim: u32,
+    position: u32,
+    max_context_length: u32,
+    eps: f32,
+    rope_theta: f32,
+};
+
 /// Grouped query attention dimensions.
 pub const GQADims = extern struct {
     num_query_heads: u32,
@@ -354,9 +383,13 @@ pub const TransformerPipelines = struct {
     rms_norm_f16: metal.ComputePipeline,
     rope_f16: metal.ComputePipeline,
     kv_cache_update_f16in: metal.ComputePipeline,
+    fused_rope_k_kv_cache_f16: metal.ComputePipeline,
+    fused_norm_rope_f16: metal.ComputePipeline,
+    fused_k_norm_rope_kv_cache_f16: metal.ComputePipeline,
     gqa_attention_f16io: metal.ComputePipeline,
     silu_elementwise_mul_f16: metal.ComputePipeline,
     residual_add_f16: metal.ComputePipeline,
+    set_completion_flag: metal.ComputePipeline,
     library: objc.Object,
 
     /// Compile the transformer shader library and create all
@@ -433,6 +466,21 @@ pub const TransformerPipelines = struct {
                 lib,
                 "kv_cache_update_f16in",
             ),
+            .fused_rope_k_kv_cache_f16 = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "fused_rope_k_kv_cache_update_f16",
+            ),
+            .fused_norm_rope_f16 = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "fused_norm_rope_f16",
+            ),
+            .fused_k_norm_rope_kv_cache_f16 = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "fused_k_norm_rope_kv_cache_f16",
+            ),
             .gqa_attention_f16io = try metal.ComputePipeline.init(
                 device_obj,
                 lib,
@@ -447,6 +495,11 @@ pub const TransformerPipelines = struct {
                 device_obj,
                 lib,
                 "residual_add_f16",
+            ),
+            .set_completion_flag = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "set_completion_flag",
             ),
         };
     }
@@ -588,6 +641,129 @@ pub fn dispatchKVCacheUpdate(
 
     const count = dims.num_kv_heads * dims.head_dim;
     device.dispatch1D(encoder, pipeline, count);
+}
+
+/// Dispatch fused RoPE K + KV cache update.
+/// Applies RoPE to K and writes both K and V directly to
+/// their caches in a single dispatch.  K is NOT written
+/// back to the k_proj buffer — only to k_cache.
+/// Saves 1 dispatch + 1 barrier per block vs separate
+/// rope_k + kv_cache_update.
+fn dispatchFusedRoPEKVCache(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    pipeline: metal.ComputePipeline,
+    k_proj_buffer: objc.Object,
+    v_proj_buffer: objc.Object,
+    k_cache_buffer: objc.Object,
+    v_cache_buffer: objc.Object,
+    dims: FusedRoPEKVDims,
+) void {
+    std.debug.assert(dims.num_kv_heads > 0);
+    std.debug.assert(dims.head_dim >= 2);
+    std.debug.assert(dims.head_dim % 2 == 0);
+    std.debug.assert(
+        dims.position < dims.max_context_length,
+    );
+
+    setRawBuffer(encoder, k_proj_buffer, 0, 0);
+    setRawBuffer(encoder, v_proj_buffer, 0, 1);
+    setRawBuffer(encoder, k_cache_buffer, 0, 2);
+    setRawBuffer(encoder, v_cache_buffer, 0, 3);
+    metal.setBytes(
+        encoder,
+        FusedRoPEKVDims,
+        &dims,
+        4,
+    );
+
+    // One thread per RoPE pair; each thread also copies
+    // the corresponding 2 V elements.
+    const count = dims.num_kv_heads * (dims.head_dim / 2);
+    device.dispatch1D(encoder, pipeline, count);
+}
+
+/// Dispatch fused per-head RMSNorm + RoPE (f16 in-place).
+/// One threadgroup per head, 256 threads per group.
+/// Replaces separate Q norm + RoPE Q dispatches.
+fn dispatchFusedNormRoPE(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    pipeline: metal.ComputePipeline,
+    data_buffer: objc.Object,
+    scale_buffer: objc.Object,
+    dims: FusedNormRoPEDims,
+) void {
+    std.debug.assert(dims.num_heads > 0);
+    std.debug.assert(dims.head_dim >= 2);
+    std.debug.assert(dims.head_dim % 2 == 0);
+
+    setRawBuffer(encoder, data_buffer, 0, 0);
+    setRawBuffer(encoder, scale_buffer, 0, 1);
+    metal.setBytes(
+        encoder,
+        FusedNormRoPEDims,
+        &dims,
+        2,
+    );
+
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, dims.num_heads),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 256,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch fused K-norm + RoPE K + KV cache update.
+/// One threadgroup per KV head, 256 threads per group.
+/// Replaces separate K norm + RoPE K + KV cache dispatches.
+fn dispatchFusedKNormRoPEKVCache(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    pipeline: metal.ComputePipeline,
+    k_proj_buffer: objc.Object,
+    v_proj_buffer: objc.Object,
+    k_cache_buffer: objc.Object,
+    v_cache_buffer: objc.Object,
+    k_scale_buffer: objc.Object,
+    dims: FusedKNormRoPEKVDims,
+) void {
+    std.debug.assert(dims.num_kv_heads > 0);
+    std.debug.assert(dims.head_dim >= 2);
+    std.debug.assert(dims.head_dim % 2 == 0);
+    std.debug.assert(
+        dims.position < dims.max_context_length,
+    );
+
+    setRawBuffer(encoder, k_proj_buffer, 0, 0);
+    setRawBuffer(encoder, v_proj_buffer, 0, 1);
+    setRawBuffer(encoder, k_cache_buffer, 0, 2);
+    setRawBuffer(encoder, v_cache_buffer, 0, 3);
+    setRawBuffer(encoder, k_scale_buffer, 0, 4);
+    metal.setBytes(
+        encoder,
+        FusedKNormRoPEKVDims,
+        &dims,
+        5,
+    );
+
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, dims.num_kv_heads),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 256,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
 }
 
 /// Dispatch grouped query attention (decode path, M=1).
@@ -835,7 +1011,16 @@ fn dispatchQMVFusedPairf16io(
     metal.setBytes(encoder, QMVDims, &dims, 7);
 
     const use_const = dims.K <= 2048;
-    const rows_per_tg: u32 = if (use_const) 32 else 16;
+    const use_spec =
+        if (device.spec_qmv_fused_pair_f16io) |s|
+            s.max_threads_per_group >= 512 and
+                dims.K == device.spec_hidden_K
+        else
+            false;
+    const rows_per_tg: u32 = if (use_spec or use_const)
+        32
+    else
+        16;
     const threadgroups = (dims.M + rows_per_tg - 1) /
         rows_per_tg;
     const grid = metal.MTLSize{
@@ -848,7 +1033,9 @@ fn dispatchQMVFusedPairf16io(
         .height = 1,
         .depth = 1,
     };
-    const pipeline = if (use_const)
+    const pipeline = if (use_spec)
+        device.spec_qmv_fused_pair_f16io.?
+    else if (use_const)
         device.qmv_fused_pair_const_f16io
     else
         device.qmv_fused_pair;
@@ -972,7 +1159,14 @@ fn dispatchQMVf16in(
         fits_const;
     const use_const_mg = aligned and !single_group and
         fits_const;
-    const actual_pipeline = if (use_const_sg)
+    const use_spec = if (device.spec_qmv_f16in) |s|
+        s.max_threads_per_group >= 512 and
+            dims.K == device.spec_hidden_K
+    else
+        false;
+    const actual_pipeline = if (use_spec)
+        device.spec_qmv_f16in.?
+    else if (use_const_sg)
         device.qmv_const_f16in
     else if (use_const_mg)
         device.qmv_const_multigroup_f16in
@@ -988,14 +1182,17 @@ fn dispatchQMVf16in(
     // buffer(4): QMVDims.
     metal.setBytes(encoder, QMVDims, &dims, 4);
 
-    const use_const = use_const_sg or use_const_mg;
+    const use_const = use_spec or use_const_sg or use_const_mg;
     const rows_per_tg: u32 = if (use_const)
         32
     else if (aligned)
         16
     else
         2;
-    const threads_per_tg: u32 = if (aligned) 512 else 64;
+    const threads_per_tg: u32 = if (use_spec or aligned)
+        512
+    else
+        64;
     const threadgroups = (dims.M + rows_per_tg - 1) /
         rows_per_tg;
     const grid = metal.MTLSize{
@@ -1037,7 +1234,15 @@ fn dispatchQMVf16io(
         fits_const;
     const use_const_mg = aligned and !single_group and
         fits_const;
-    const actual_pipeline = if (use_const_sg)
+    // Prefer specialized pipeline when available and K matches.
+    const use_spec = if (device.spec_qmv_f16io) |s|
+        s.max_threads_per_group >= 512 and
+            dims.K == device.spec_hidden_K
+    else
+        false;
+    const actual_pipeline = if (use_spec)
+        device.spec_qmv_f16io.?
+    else if (use_const_sg)
         device.qmv_const_f16io
     else if (use_const_mg)
         device.qmv_const_multigroup_f16io
@@ -1053,14 +1258,17 @@ fn dispatchQMVf16io(
     // buffer(4): QMVDims.
     metal.setBytes(encoder, QMVDims, &dims, 4);
 
-    const use_const = use_const_sg or use_const_mg;
+    const use_const = use_spec or use_const_sg or use_const_mg;
     const rows_per_tg: u32 = if (use_const)
         32
     else if (aligned)
         16
     else
         2;
-    const threads_per_tg: u32 = if (aligned) 512 else 64;
+    const threads_per_tg: u32 = if (use_spec or aligned)
+        512
+    else
+        64;
     const threadgroups = (dims.M + rows_per_tg - 1) /
         rows_per_tg;
     const grid = metal.MTLSize{
@@ -1074,6 +1282,101 @@ fn dispatchQMVf16io(
         .depth = 1,
     };
     device.dispatchCustom(encoder, actual_pipeline, grid, group);
+}
+
+/// Dispatch a 1-bit QMV with fused f32 residual accumulate.
+/// Instead of writing f16 to an intermediate buffer, the kernel
+/// adds its f32 result directly to the residual: residual[row] += acc.
+/// Eliminates one dispatch (residual_add_f16) and one barrier per
+/// call site.  Buffer layout matches qmv_f16io except buffer(3) is
+/// the f32 residual instead of an f16 output.
+fn dispatchQMVf16ioResadd(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_buffer: metal.PackedBuffer,
+    input_buffer: objc.Object,
+    residual_buffer: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(packed_buffer.packed_count > 0);
+
+    const aligned = (dims.K % dims.group_size == 0) and
+        (dims.K <= 6144) and (dims.K >= 256);
+    const single_group = dims.K / 32 <= dims.group_size;
+    const fits_const = dims.K * 4 <= 65536;
+    const use_const_sg = aligned and single_group and
+        fits_const;
+    const use_const_mg = aligned and !single_group and
+        fits_const;
+    // Prefer specialized pipelines when K matches.
+    const use_spec_sg =
+        if (device.spec_qmv_f16io_resadd) |s|
+            s.max_threads_per_group >= 512 and
+                use_const_sg and
+                dims.K == device.spec_hidden_K
+        else
+            false;
+    const use_spec_mg =
+        if (device.spec_qmv_mg_f16io_resadd) |s|
+            s.max_threads_per_group >= 512 and
+                use_const_mg and
+                dims.K == device.spec_inter_K
+        else
+            false;
+    const actual_pipeline = if (use_spec_sg)
+        device.spec_qmv_f16io_resadd.?
+    else if (use_spec_mg)
+        device.spec_qmv_mg_f16io_resadd.?
+    else if (use_const_sg)
+        device.qmv_const_f16io_resadd
+    else if (use_const_mg)
+        device.qmv_const_multigroup_f16io_resadd
+    else
+        device.qmv_f16io_resadd;
+
+    // buffer(0,1): packed bits + f16 scales.
+    metal.setPackedBuffer(encoder, packed_buffer, 0);
+    // buffer(2): input vector [K] f16.
+    setRawBuffer(encoder, input_buffer, 0, 2);
+    // buffer(3): residual vector [M] f32 (accumulated in-place).
+    setRawBuffer(encoder, residual_buffer, 0, 3);
+    // buffer(4): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 4);
+
+    const use_spec = use_spec_sg or use_spec_mg;
+    const use_const = use_spec or use_const_sg or use_const_mg;
+    const rows_per_tg: u32 = if (use_const)
+        32
+    else if (aligned)
+        16
+    else
+        2;
+    const threads_per_tg: u32 = if (use_spec or aligned)
+        512
+    else
+        64;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(
+        encoder,
+        actual_pipeline,
+        grid,
+        group,
+    );
 }
 
 // ============================================================================
@@ -1218,6 +1521,12 @@ pub const ForwardDecodeArgs = struct {
     // Forward pass I/O.
     token_ids: objc.Object, // u32 buffer — written by CPU.
     logits: objc.Object, // [vocab_size] f32 output.
+
+    // GPU completion flag for spin-wait (Rule 26).
+    // The GPU writes 1 here when done; the CPU spin-reads
+    // it to avoid waitUntilCompleted Mach kernel trap.
+    flag_buf: objc.Object,
+    flag_ptr: *volatile u32,
 
     // Sequence state.
     token_id: u32,
@@ -1462,6 +1771,40 @@ fn bufferBarrier(encoder: objc.Object) void {
     );
 }
 
+/// Dispatch the GPU completion flag kernel: atomic-write 1
+/// to flag[0].  Must be the last dispatch before endEncoding
+/// so the CPU can spin-wait on the flag instead of calling
+/// waitUntilCompleted (~100-150 us Mach trap saved).
+///
+/// A bufferBarrier must precede this dispatch to ensure all
+/// preceding kernel writes are visible before the flag is
+/// set.
+///
+/// Dispatch: 1 threadgroup, 1 thread.
+fn dispatchCompletionFlag(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    pipeline: metal.ComputePipeline,
+    flag_buf: objc.Object,
+) void {
+    std.debug.assert(encoder.value != null);
+    std.debug.assert(flag_buf.value != null);
+
+    setRawBuffer(encoder, flag_buf, 0, 0);
+
+    const one = metal.MTLSize{
+        .width = 1,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(
+        encoder,
+        pipeline,
+        one,
+        one,
+    );
+}
+
 /// Encode the attention half of a decoder block:
 /// RMSNorm → Q/K/V proj → RoPE → KV cache → GQA
 /// attention → O proj → residual add.
@@ -1545,27 +1888,46 @@ fn encodeAttentionProjections(
         dispatchQMVf16io(device, encoder, a.v_proj, a.norm_out, a.v, kv_qmv);
     }
     bufferBarrier(encoder);
-    // QK norms: per-head RMSNorm on Q and K before RoPE.
-    // Reuses rms_norm with hidden_size = head_dim, treating
-    // each head as a separate "token" row.
-    dispatchRMSNorm(device, encoder, pipelines.rms_norm_f16, a.q, a.q_norm_scale, a.q, .{
-        .hidden_size = Config.head_dim,
-        .num_tokens = Config.num_query_heads,
-        .eps = 1e-6,
-    });
-    dispatchRMSNorm(device, encoder, pipelines.rms_norm_f16, a.k, a.k_norm_scale, a.k, .{
-        .hidden_size = Config.head_dim,
-        .num_tokens = Config.num_kv_heads,
-        .eps = 1e-6,
-    });
-    bufferBarrier(encoder);
-    encodeRoPEAndKVCache(
-        Config,
+    // Fused Q norm + RoPE Q: per-head RMSNorm then RoPE
+    // in a single dispatch.  Saves 1 dispatch vs separate.
+    dispatchFusedNormRoPE(
         device,
         encoder,
-        pipelines,
-        a,
+        pipelines.fused_norm_rope_f16,
+        a.q,
+        a.q_norm_scale,
+        .{
+            .num_heads = Config.num_query_heads,
+            .head_dim = Config.head_dim,
+            .position = a.position,
+            .eps = 1e-6,
+            .rope_theta = Config.rope_theta,
+        },
     );
+    // Fused K norm + RoPE K + KV cache: per-head RMSNorm,
+    // then RoPE, then write to k_cache + copy V to v_cache.
+    // Saves 2 dispatches + 2 barriers vs separate path.
+    dispatchFusedKNormRoPEKVCache(
+        device,
+        encoder,
+        pipelines.fused_k_norm_rope_kv_cache_f16,
+        a.k,
+        a.v,
+        a.k_cache,
+        a.v_cache,
+        a.k_norm_scale,
+        .{
+            .num_kv_heads = Config.num_kv_heads,
+            .head_dim = Config.head_dim,
+            .position = a.position,
+            .max_context_length = Config.max_context_length,
+            .eps = 1e-6,
+            .rope_theta = Config.rope_theta,
+        },
+    );
+    // Single barrier: wait for both fused dispatches before
+    // GQA attention reads Q and k/v caches.
+    bufferBarrier(encoder);
 }
 
 /// Encode RoPE on Q and K, then write K/V to the cache.
@@ -1580,23 +1942,20 @@ fn encodeRoPEAndKVCache(
         a.position < Config.max_context_length,
     );
     std.debug.assert(Config.head_dim % 2 == 0);
+    // Q RoPE: applied in-place (Q is read by GQA attention).
     dispatchRoPE(device, encoder, pipelines.rope_f16, a.q, .{
         .num_heads = Config.num_query_heads,
         .head_dim = Config.head_dim,
         .position = a.position,
         .rope_theta = Config.rope_theta,
     });
-    dispatchRoPE(device, encoder, pipelines.rope_f16, a.k, .{
-        .num_heads = Config.num_kv_heads,
-        .head_dim = Config.head_dim,
-        .position = a.position,
-        .rope_theta = Config.rope_theta,
-    });
-    bufferBarrier(encoder);
-    dispatchKVCacheUpdate(
+    // Fused RoPE K + KV cache update: applies RoPE to K and
+    // writes both K and V directly to their caches.  Saves
+    // 1 dispatch + 1 barrier vs separate rope_k + cache_update.
+    dispatchFusedRoPEKVCache(
         device,
         encoder,
-        pipelines.kv_cache_update_f16in,
+        pipelines.fused_rope_k_kv_cache_f16,
         a.k,
         a.v,
         a.k_cache,
@@ -1606,8 +1965,11 @@ fn encodeRoPEAndKVCache(
             .head_dim = Config.head_dim,
             .position = a.position,
             .max_context_length = Config.max_context_length,
+            .rope_theta = Config.rope_theta,
         },
     );
+    // Single barrier: wait for both Q RoPE and fused K/V
+    // cache write before GQA attention reads Q and k/v caches.
     bufferBarrier(encoder);
 }
 
@@ -1640,26 +2002,21 @@ fn encodeAttentionGather(
         },
     );
     bufferBarrier(encoder);
-    dispatchQMVf16io(
+    // Fused QMV + residual accumulate: the O-projection result
+    // is added directly to the f32 residual (residual[row] += acc)
+    // instead of writing f16 to proj_out then dispatching
+    // residual_add_f16.  Saves one dispatch + one barrier.
+    dispatchQMVf16ioResadd(
         device,
         encoder,
         a.o_proj,
         a.attn_out,
-        a.proj_out,
+        a.residual,
         .{
             .M = Config.hidden_size,
             .K = Config.query_dim,
             .group_size = Config.group_size,
         },
-    );
-    bufferBarrier(encoder);
-    dispatchResidualAdd(
-        device,
-        encoder,
-        pipelines.residual_add_f16,
-        a.residual,
-        a.proj_out,
-        Config.hidden_size,
     );
     bufferBarrier(encoder);
 }
@@ -1726,19 +2083,21 @@ fn encodeMLPHalf(
         Config.intermediate_size,
     );
     bufferBarrier(encoder);
-    dispatchQMVf16io(device, encoder, a.down_proj, a.mlp_out, a.proj_out, .{
-        .M = Config.hidden_size,
-        .K = Config.intermediate_size,
-        .group_size = Config.group_size,
-    });
-    bufferBarrier(encoder);
-    dispatchResidualAdd(
+    // Fused QMV + residual accumulate: the down-projection
+    // result is added directly to the f32 residual instead of
+    // writing f16 to proj_out then dispatching residual_add_f16.
+    // Saves one dispatch + one barrier.
+    dispatchQMVf16ioResadd(
         device,
         encoder,
-        pipelines.residual_add_f16,
+        a.down_proj,
+        a.mlp_out,
         a.residual,
-        a.proj_out,
-        Config.hidden_size,
+        .{
+            .M = Config.hidden_size,
+            .K = Config.intermediate_size,
+            .group_size = Config.group_size,
+        },
     );
     bufferBarrier(encoder);
 }
@@ -1778,6 +2137,13 @@ pub const GenerateOpts = struct {
     /// Index scratch for top-p sorting.  Same length
     /// requirement as `scratch`.
     indices: []u32,
+    /// Optional buffer for per-token decode latencies
+    /// (nanoseconds).  When non-null, must be at least as
+    /// long as `output_tokens`.  Element [i] receives the
+    /// wall-clock time for the decode step that runs while
+    /// output_tokens[i] is the current token (GPU forward
+    /// pass + CPU sampling).
+    per_token_ns: ?[]u64 = null,
 };
 
 /// Find the index of the maximum value in a logits slice.
@@ -2042,6 +2408,9 @@ pub fn generate(
     std.debug.assert(
         opts.prompt_ids.len < Config.max_context_length,
     );
+    if (opts.per_token_ns) |buf| {
+        std.debug.assert(buf.len >= opts.output_tokens.len);
+    }
 
     var prng = std.Random.DefaultPrng.init(
         opts.params.seed,
@@ -2081,8 +2450,8 @@ pub fn generate(
         if (position >= Config.max_context_length) break;
 
         opts.output_tokens[count] = next_token;
-        count += 1;
 
+        const t_start = std.time.nanoTimestamp();
         next_token = decodeOneToken(
             Config,
             device,
@@ -2095,6 +2464,14 @@ pub fn generate(
             opts.indices,
             rng,
         );
+        const t_end = std.time.nanoTimestamp();
+
+        // Record per-token timing if buffer provided.
+        if (opts.per_token_ns) |buf| {
+            buf[count] = @intCast(t_end - t_start);
+        }
+
+        count += 1;
         position += 1;
     }
     const t2 = std.time.nanoTimestamp();
@@ -2120,12 +2497,13 @@ fn chunkedPrefill(
     std.debug.assert(
         prompt_ids.len < Config.max_context_length,
     );
+    std.debug.assert(args.flag_buf.value != null);
 
     for (prompt_ids, 0..) |token_id, i| {
         args.token_id = token_id;
         args.position = @intCast(i);
 
-        const cmd = device.beginCommandBuffer();
+        const cmd = device.beginCommandBufferUnretained();
         const enc = device.beginCompute(cmd);
         forwardDecode(
             Config,
@@ -2134,8 +2512,15 @@ fn chunkedPrefill(
             pipelines,
             args.*,
         );
+        bufferBarrier(enc);
+        dispatchCompletionFlag(
+            device,
+            enc,
+            pipelines.set_completion_flag,
+            args.flag_buf,
+        );
         enc.msgSend(void, "endEncoding", .{});
-        device.commitAndWait(cmd);
+        device.commitAndSpinOnFlag(cmd, args.flag_ptr);
     }
 }
 
@@ -2157,11 +2542,12 @@ fn decodeOneToken(
         position < Config.max_context_length,
     );
     std.debug.assert(token_id < Config.vocab_size);
+    std.debug.assert(args.flag_buf.value != null);
 
     args.token_id = token_id;
     args.position = position;
 
-    const cmd = device.beginCommandBuffer();
+    const cmd = device.beginCommandBufferUnretained();
     const enc = device.beginCompute(cmd);
     forwardDecode(
         Config,
@@ -2170,8 +2556,15 @@ fn decodeOneToken(
         pipelines,
         args.*,
     );
+    bufferBarrier(enc);
+    dispatchCompletionFlag(
+        device,
+        enc,
+        pipelines.set_completion_flag,
+        args.flag_buf,
+    );
     enc.msgSend(void, "endEncoding", .{});
-    device.commitAndWait(cmd);
+    device.commitAndSpinOnFlag(cmd, args.flag_ptr);
 
     const logits = readLogitsSlice(
         args.logits,
@@ -4538,6 +4931,10 @@ test "forwardDecode full path matches CPU reference" {
     );
     defer logits_buf.deinit();
 
+    var flag_buf = try metal.Buffer.init(device.obj, 1);
+    defer flag_buf.deinit();
+    flag_buf.asSlice()[0] = 0;
+
     // ── GPU: forwardDecode at position 0, token 1 ────
     const token_id: u32 = 1;
     const position: u32 = 0;
@@ -4573,6 +4970,8 @@ test "forwardDecode full path matches CPU reference" {
         .mlp_out = mlp_out_buf.obj,
         .token_ids = token_ids_buf.obj,
         .logits = logits_buf.obj,
+        .flag_buf = flag_buf.obj,
+        .flag_ptr = @ptrCast(&flag_buf.asSlice()[0]),
         .token_id = token_id,
         .position = position,
     };
@@ -5112,6 +5511,10 @@ test "generate loop produces tokens and respects EOS" {
     var logits_buf = try metal.Buffer.init(device.obj, V);
     defer logits_buf.deinit();
 
+    var flag_buf = try metal.Buffer.init(device.obj, 1);
+    defer flag_buf.deinit();
+    flag_buf.asSlice()[0] = 0;
+
     // ── Build ForwardDecodeArgs ──────────────────────
 
     var decode_args = ForwardDecodeArgs{
@@ -5144,6 +5547,8 @@ test "generate loop produces tokens and respects EOS" {
         .mlp_out = mlp_out_buf.obj,
         .token_ids = token_ids_buf.obj,
         .logits = logits_buf.obj,
+        .flag_buf = flag_buf.obj,
+        .flag_ptr = @ptrCast(&flag_buf.asSlice()[0]),
         .token_id = 0,
         .position = 0,
     };
@@ -5380,6 +5785,10 @@ test "generate stops on EOS token" {
     var logits_buf = try metal.Buffer.init(device.obj, V);
     defer logits_buf.deinit();
 
+    var flag_buf = try metal.Buffer.init(device.obj, 1);
+    defer flag_buf.deinit();
+    flag_buf.asSlice()[0] = 0;
+
     // ── First pass: discover what token greedy produces ──
 
     var decode_args = ForwardDecodeArgs{
@@ -5412,6 +5821,8 @@ test "generate stops on EOS token" {
         .mlp_out = mlp_out_buf.obj,
         .token_ids = token_ids_buf.obj,
         .logits = logits_buf.obj,
+        .flag_buf = flag_buf.obj,
+        .flag_ptr = @ptrCast(&flag_buf.asSlice()[0]),
         .token_id = 0,
         .position = 0,
     };

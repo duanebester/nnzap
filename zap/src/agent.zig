@@ -612,11 +612,39 @@ fn extractSettings(
     arena: Allocator,
     input_json: []const u8,
 ) ?[]const []const u8 {
-    const arr = api.extractRawArray(
+    const root = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
         input_json,
-        "\"settings\"",
-    ) orelse return null;
-    return api.parseJsonStringArray(arena, arr) catch null;
+        .{},
+    ) catch return null;
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return null,
+    };
+    const arr_val = obj.get("settings") orelse return null;
+    const arr = switch (arr_val) {
+        .array => |a| a.items,
+        else => return null,
+    };
+    if (arr.len == 0) return null;
+
+    var result = arena.alloc(
+        []const u8,
+        arr.len,
+    ) catch return null;
+    var count: usize = 0;
+    for (arr) |item| {
+        switch (item) {
+            .string => |s| {
+                result[count] = s;
+                count += 1;
+            },
+            else => {},
+        }
+    }
+    if (count == 0) return null;
+    return result[0..count];
 }
 
 // ============================================================

@@ -1033,34 +1033,11 @@ fn mainInner() !void {
                         MAX_API_RESPONSE,
                     ) catch "";
                 if (usage_raw.len > 0) {
-                    const in_str =
-                        api.extractJsonNumber(
+                    const in_tok, const out_tok =
+                        parseTokenUsage(
+                            arena,
                             usage_raw,
-                            "\"input_tokens\":",
                         );
-                    const out_str =
-                        api.extractJsonNumber(
-                            usage_raw,
-                            "\"output_tokens\":",
-                        );
-                    const in_tok: u64 =
-                        if (in_str) |s|
-                            std.fmt.parseInt(
-                                u64,
-                                s,
-                                10,
-                            ) catch 0
-                        else
-                            0;
-                    const out_tok: u64 =
-                        if (out_str) |s|
-                            std.fmt.parseInt(
-                                u64,
-                                s,
-                                10,
-                            ) catch 0
-                        else
-                            0;
                     total_input_tokens += in_tok;
                     total_output_tokens += out_tok;
                     api.log(
@@ -2216,13 +2193,31 @@ fn handleNonOkStatus(
     body: []const u8,
 ) ApiResponse {
     // Extract the API error message if present.
-    const api_msg = api.extractJsonString(
-        body,
-        "\"message\":\"",
-    ) orelse api.extractJsonString(
-        body,
-        "\"message\": \"",
-    ) orelse "";
+    const api_msg = blk: {
+        const parsed = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena,
+            body,
+            .{},
+        ) catch break :blk "";
+        const obj = switch (parsed) {
+            .object => |o| o,
+            else => break :blk "",
+        };
+        // Try error.message first, then top-level.
+        if (obj.get("error")) |err_val| {
+            if (err_val == .object) {
+                if (err_val.object.get("message")) |m| {
+                    if (m == .string)
+                        break :blk m.string;
+                }
+            }
+        }
+        if (obj.get("message")) |m| {
+            if (m == .string) break :blk m.string;
+        }
+        break :blk "";
+    };
 
     const detail = if (api_msg.len > 0)
         api_msg
@@ -2463,14 +2458,22 @@ fn executeHistory(
     arena: Allocator,
     input: []const u8,
 ) ToolOutput {
-    const count_str = api.extractJsonNumber(
-        input,
-        "\"count\":",
-    ) orelse "5";
-    const count = @min(
-        std.fmt.parseInt(u32, count_str, 10) catch 5,
-        20,
-    );
+    const count: u32 = blk: {
+        const parsed = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena,
+            input,
+            .{},
+        ) catch break :blk 5;
+        const obj = switch (parsed) {
+            .object => |o| o,
+            else => break :blk 5,
+        };
+        break :blk switch (obj.get("count") orelse .null) {
+            .integer => |i| @intCast(@max(0, @min(i, 20))),
+            else => 5,
+        };
+    };
     if (count == 0) {
         return .{ .stdout = "[]", .success = true };
     }
@@ -3029,7 +3032,8 @@ fn executeEditFile(
     };
 
     // Find the old text.
-    const pos = api.indexOf(
+    const pos = std.mem.indexOf(
+        u8,
         current,
         old_text,
     ) orelse {
@@ -3050,7 +3054,8 @@ fn executeEditFile(
     // Check for ambiguous matches.
     const after_first = pos + old_text.len;
     if (after_first < current.len) {
-        if (api.indexOf(
+        if (std.mem.indexOf(
+            u8,
             current[after_first..],
             old_text,
         ) != null) {
@@ -3482,8 +3487,8 @@ fn resolveToFs(
     std.debug.assert(path.len > 0);
 
     // Paths local to the zap/ directory need no prefix.
-    if (api.startsWith(path, "src/") or
-        api.startsWith(path, "programs/") or
+    if (std.mem.startsWith(u8, path, "src/") or
+        std.mem.startsWith(u8, path, "programs/") or
         api.eql(path, "build.zig") or
         api.eql(path, "build.zig.zon"))
     {
@@ -3505,7 +3510,7 @@ fn isAllowedReadPath(path: []const u8) bool {
     std.debug.assert(path.len > 0);
 
     // Reject path traversal.
-    if (api.indexOf(path, "..") != null) return false;
+    if (std.mem.indexOf(u8, path, "..") != null) return false;
 
     // Reject absolute paths.
     if (path.len > 0 and path[0] == '/') return false;
@@ -3517,7 +3522,7 @@ fn isAllowedReadPath(path: []const u8) bool {
 
     // Allow paths under allowed prefixes.
     for (&ALLOWED_READ_PREFIXES) |prefix| {
-        if (api.startsWith(path, prefix)) return true;
+        if (std.mem.startsWith(u8, path, prefix)) return true;
     }
 
     // Also allow any write-allowed file to be read.
@@ -3533,7 +3538,7 @@ fn isAllowedWritePath(path: []const u8) bool {
     std.debug.assert(path.len > 0);
 
     // Reject path traversal.
-    if (api.indexOf(path, "..") != null) return false;
+    if (std.mem.indexOf(u8, path, "..") != null) return false;
 
     // Reject absolute paths.
     if (path.len > 0 and path[0] == '/') return false;
@@ -3559,13 +3564,30 @@ fn extractRequiredField(
     }
     if (input_json.len == 0) return null;
 
-    return api.extractJsonString(
-        input_json,
+    // Search for "field":"value" or "field": "value".
+    const patterns = [_][]const u8{
         "\"" ++ field ++ "\":\"",
-    ) orelse api.extractJsonString(
-        input_json,
         "\"" ++ field ++ "\": \"",
-    );
+    };
+    for (&patterns) |pattern| {
+        const start = std.mem.indexOf(
+            u8,
+            input_json,
+            pattern,
+        ) orelse continue;
+        const val_start = start + pattern.len;
+        var i = val_start;
+        while (i < input_json.len) : (i += 1) {
+            if (input_json[i] == '\\') {
+                i += 1; // Skip escaped character.
+                continue;
+            }
+            if (input_json[i] == '"') {
+                return input_json[val_start..i];
+            }
+        }
+    }
+    return null;
 }
 
 /// Read a file's contents into an arena-allocated slice.
@@ -3824,25 +3846,33 @@ fn formatHistoryLine(
     std.debug.assert(line.len > 0);
     std.debug.assert(index > 0);
 
-    const ts = api.extractJsonString(
+    const root = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
         line,
-        "\"timestamp_utc\":\"",
-    ) orelse api.extractJsonString(
-        line,
-        "\"timestamp_utc\": \"",
-    ) orelse "?";
-    const throughput = api.extractJsonNumber(
-        line,
-        "\"throughput_images_per_sec\":",
-    ) orelse "?";
-    const accuracy = api.extractJsonNumber(
-        line,
-        "\"final_test_accuracy_pct\":",
-    ) orelse "?";
-    const train_ms = api.extractJsonNumber(
-        line,
-        "\"total_training_ms\":",
-    ) orelse "?";
+        .{},
+    ) catch return null;
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return null,
+    };
+
+    const ts = getStrOr(obj, "timestamp_utc", "?");
+    const throughput = getNumStr(
+        arena,
+        obj,
+        "throughput_images_per_sec",
+    );
+    const accuracy = getNumStr(
+        arena,
+        obj,
+        "final_test_accuracy_pct",
+    );
+    const train_ms = getNumStr(
+        arena,
+        obj,
+        "total_training_ms",
+    );
 
     return std.fmt.allocPrint(
         arena,
@@ -3979,14 +4009,25 @@ fn buildSummariesSection(
     while (iter.next()) |line| {
         if (line.len < 2) continue;
 
-        const exp_num = api.extractJsonNumber(
+        const root = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena,
             line,
-            "\"experiment\":",
-        ) orelse "?";
-        const summary = api.extractJsonString(
-            line,
-            "\"summary\":\"",
-        ) orelse continue;
+            .{},
+        ) catch continue;
+        const obj = switch (root) {
+            .object => |o| o,
+            else => continue,
+        };
+        const exp_num = getNumStr(
+            arena,
+            obj,
+            "experiment",
+        );
+        const summary = switch (obj.get("summary") orelse continue) {
+            .string => |s| s,
+            else => continue,
+        };
 
         const row = std.fmt.allocPrint(
             arena,
@@ -4001,6 +4042,82 @@ fn buildSummariesSection(
 
     std.debug.assert(buf.items.len > 0);
     return buf.items;
+}
+
+// ============================================================
+// JSON field extraction helpers
+// ============================================================
+
+/// Parse token counts from a saved API response JSON.
+/// Looks for input_tokens/output_tokens under a "usage"
+/// sub-object or at the top level.
+fn parseTokenUsage(
+    arena: Allocator,
+    raw: []const u8,
+) struct { u64, u64 } {
+    std.debug.assert(raw.len > 0);
+    const root = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        raw,
+        .{},
+    ) catch return .{ 0, 0 };
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return .{ 0, 0 },
+    };
+    // Try "usage" sub-object first, then top level.
+    const usage = switch (obj.get("usage") orelse .null) {
+        .object => |u| u,
+        else => obj,
+    };
+    const in_val: u64 = switch (usage.get("input_tokens") orelse .null) {
+        .integer => |i| @intCast(@max(0, i)),
+        else => 0,
+    };
+    const out_val: u64 = switch (usage.get("output_tokens") orelse .null) {
+        .integer => |i| @intCast(@max(0, i)),
+        else => 0,
+    };
+    return .{ in_val, out_val };
+}
+
+/// Extract a string field from a JSON object, returning
+/// a default if missing or not a string.
+fn getStrOr(
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    default: []const u8,
+) []const u8 {
+    const val = obj.get(key) orelse return default;
+    return switch (val) {
+        .string => |s| s,
+        else => default,
+    };
+}
+
+/// Extract a numeric field from a JSON object and return
+/// it as a printable string. Returns "?" if missing.
+fn getNumStr(
+    arena: Allocator,
+    obj: std.json.ObjectMap,
+    key: []const u8,
+) []const u8 {
+    const val = obj.get(key) orelse return "?";
+    return switch (val) {
+        .integer => |i| std.fmt.allocPrint(
+            arena,
+            "{d}",
+            .{i},
+        ) catch "?",
+        .float => |f| std.fmt.allocPrint(
+            arena,
+            "{d:.2}",
+            .{f},
+        ) catch "?",
+        .number_string => |s| s,
+        else => "?",
+    };
 }
 
 /// Append a bench result to the history JSONL file.

@@ -670,6 +670,295 @@ kernel void rope_f16(
 }
 
 // ============================================================================
+// Fused RMSNorm + RoPE (f16)
+// ============================================================================
+
+/// Dimensions for fused per-head RMSNorm + RoPE kernel.
+struct FusedNormRoPEDims {
+    uint  num_heads;     // Number of heads to process.
+    uint  head_dim;      // Elements per head (must be even).
+    uint  position;      // Sequence position for this token.
+    float eps;           // RMSNorm epsilon (1e-6).
+    float rope_theta;    // Base frequency (e.g. 1000000.0).
+};
+
+/// Fused per-head RMSNorm + RoPE, in-place on f16 data.
+///
+/// For each head: compute RMSNorm (sum-of-squares reduction,
+/// normalize, scale), then immediately apply RoPE rotation.
+/// All internal computation stays f32; loads/stores are f16.
+///
+/// One threadgroup per head, 256 threads each.  Threads beyond
+/// head_dim are idle but participate in the reduction via zero.
+///
+/// Dispatch: threadgroups = num_heads, threads = 256.
+kernel void fused_norm_rope_f16(
+    device half*                data   [[buffer(0)]],
+    device const half*          scale  [[buffer(1)]],
+    constant FusedNormRoPEDims& dims   [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    const uint THREADS = 256;
+    const uint head = tgid;
+    const uint head_dim = dims.head_dim;
+
+    if (head >= dims.num_heads) return;
+
+    device half* x = data + head * head_dim;
+
+    // ── Step 1: Load and compute partial sum of squares ──────
+    float val = 0.0f;
+    if (tid < head_dim) {
+        val = float(x[tid]);
+    }
+    const float partial_sq = val * val;
+
+    // ── Step 2: Threadgroup reduction for sum of squares ─────
+    threadgroup float shared[256];
+    shared[tid] = partial_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = THREADS / 2; stride > 0;
+         stride /= 2) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float rms = rsqrt(
+        shared[0] / float(head_dim) + dims.eps
+    );
+
+    // ── Step 3: Normalize, scale, and apply RoPE ─────────────
+    // Each pair of consecutive elements gets rotated.
+    // Thread tid handles element tid (if tid < head_dim).
+    // We need both elements of a pair to rotate, so we load
+    // the normalized pair into threadgroup memory first.
+    float normed = 0.0f;
+    if (tid < head_dim) {
+        normed = val * rms * float(scale[tid]);
+    }
+
+    // Store normalized values in shared memory for pair access.
+    shared[tid] = normed;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Apply RoPE: each even-indexed thread handles a pair.
+    if (tid < head_dim && (tid % 2 == 0)) {
+        const uint pair = tid / 2;
+        const float exponent =
+            float(2 * pair) / float(head_dim);
+        const float theta_i =
+            exp2(-exponent * log2(dims.rope_theta));
+        const float angle =
+            float(dims.position) * theta_i;
+
+        const float cos_val = cos(angle);
+        const float sin_val = sin(angle);
+
+        const float x0 = shared[tid];
+        const float x1 = shared[tid + 1];
+
+        x[tid]     = half(x0 * cos_val - x1 * sin_val);
+        x[tid + 1] = half(x0 * sin_val + x1 * cos_val);
+    }
+}
+
+// ============================================================================
+// Fused K-Norm + RoPE K + KV Cache Update (f16)
+// ============================================================================
+
+/// Dimensions for fused K-norm + RoPE K + KV cache update.
+struct FusedKNormRoPEKVDims {
+    uint  num_kv_heads;         // Number of KV heads.
+    uint  head_dim;             // Elements per head (must be even).
+    uint  position;             // Sequence position for this token.
+    uint  max_context_length;   // Cache capacity (time dimension).
+    float eps;                  // RMSNorm epsilon (1e-6).
+    float rope_theta;           // Base frequency (e.g. 1000000.0).
+};
+
+/// Fused K RMSNorm + RoPE + KV cache write.
+///
+/// For each KV head:
+///   1. RMSNorm on K projection (cooperative reduction)
+///   2. Apply RoPE rotation
+///   3. Write result to k_cache
+///   4. Copy V projection to v_cache (no norm/rotation)
+///
+/// K projection is NOT modified — result goes directly to cache.
+/// One threadgroup per KV head, 256 threads each.
+///
+/// Dispatch: threadgroups = num_kv_heads, threads = 256.
+kernel void fused_k_norm_rope_kv_cache_f16(
+    device const half*            k_proj   [[buffer(0)]],
+    device const half*            v_proj   [[buffer(1)]],
+    device half*                  k_cache  [[buffer(2)]],
+    device half*                  v_cache  [[buffer(3)]],
+    device const half*            k_scale  [[buffer(4)]],
+    constant FusedKNormRoPEKVDims& dims    [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    const uint THREADS = 256;
+    const uint head = tgid;
+    const uint head_dim = dims.head_dim;
+
+    if (head >= dims.num_kv_heads) return;
+
+    device const half* k_in = k_proj + head * head_dim;
+    device const half* v_in = v_proj + head * head_dim;
+
+    // Cache layout: [head][time][d].
+    const uint cache_stride =
+        dims.max_context_length * head_dim;
+    const uint cache_base =
+        head * cache_stride
+        + dims.position * head_dim;
+
+    // ── Step 1: Load K and compute partial sum of squares ────
+    float k_val = 0.0f;
+    if (tid < head_dim) {
+        k_val = float(k_in[tid]);
+    }
+    const float partial_sq = k_val * k_val;
+
+    // ── Step 2: Threadgroup reduction for sum of squares ─────
+    threadgroup float shared[256];
+    shared[tid] = partial_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = THREADS / 2; stride > 0;
+         stride /= 2) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float rms = rsqrt(
+        shared[0] / float(head_dim) + dims.eps
+    );
+
+    // ── Step 3: Normalize K with scale ───────────────────────
+    float k_normed = 0.0f;
+    if (tid < head_dim) {
+        k_normed = k_val * rms * float(k_scale[tid]);
+    }
+
+    // Store normalized K in shared memory for RoPE pair access.
+    shared[tid] = k_normed;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Step 4: Apply RoPE and write K to cache ──────────────
+    if (tid < head_dim && (tid % 2 == 0)) {
+        const uint pair = tid / 2;
+        const float exponent =
+            float(2 * pair) / float(head_dim);
+        const float theta_i =
+            exp2(-exponent * log2(dims.rope_theta));
+        const float angle =
+            float(dims.position) * theta_i;
+
+        const float cos_val = cos(angle);
+        const float sin_val = sin(angle);
+
+        const float x0 = shared[tid];
+        const float x1 = shared[tid + 1];
+
+        k_cache[cache_base + tid] =
+            half(x0 * cos_val - x1 * sin_val);
+        k_cache[cache_base + tid + 1] =
+            half(x0 * sin_val + x1 * cos_val);
+    }
+
+    // ── Step 5: Copy V to cache (no norm/rotation) ───────────
+    if (tid < head_dim) {
+        v_cache[cache_base + tid] = v_in[tid];
+    }
+}
+
+// ============================================================================
+// Fused RoPE K + KV Cache Update (f16)
+// ============================================================================
+
+/// Combined dimensions for fused rope_k + kv_cache_update.
+struct FusedRoPEKVDims {
+    uint  num_kv_heads;         // Number of KV heads.
+    uint  head_dim;             // Elements per head (must be even).
+    uint  position;             // Sequence position for this token.
+    uint  max_context_length;   // Cache capacity (time dimension).
+    float rope_theta;           // Base frequency (e.g. 1000000.0).
+};
+
+/// Fused RoPE K + KV cache update.
+///
+/// Each thread handles one RoPE pair for K (2 elements) and copies
+/// the corresponding 2 V elements to the V cache.  This eliminates
+/// the separate rope_k dispatch and the barrier between RoPE and
+/// KV cache update, saving 1 dispatch + 1 barrier per block
+/// (28 dispatches + 28 barriers for Bonsai's 28 layers).
+///
+/// K is read from k_proj, RoPE is applied, and the result is
+/// written DIRECTLY to k_cache (k_proj buffer is NOT modified).
+/// V is copied from v_proj to v_cache unchanged.
+///
+/// Internal trig computation stays f32 for precision.
+///
+/// Dispatch: 1D, count = num_kv_heads * (head_dim / 2).
+kernel void fused_rope_k_kv_cache_update_f16(
+    device const half*        k_proj  [[buffer(0)]],
+    device const half*        v_proj  [[buffer(1)]],
+    device half*              k_cache [[buffer(2)]],
+    device half*              v_cache [[buffer(3)]],
+    constant FusedRoPEKVDims& dims    [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint half_dim = dims.head_dim / 2;
+    const uint total_pairs = dims.num_kv_heads * half_dim;
+
+    if (gid >= total_pairs) return;
+
+    const uint head = gid / half_dim;
+    const uint pair = gid % half_dim;
+    const uint pos = dims.position;
+
+    // ── RoPE rotation for K ──────────────────────────────────
+    const float exponent =
+        float(2 * pair) / float(dims.head_dim);
+    const float theta_i =
+        exp2(-exponent * log2(dims.rope_theta));
+    const float angle = float(pos) * theta_i;
+
+    const float cos_val = cos(angle);
+    const float sin_val = sin(angle);
+
+    // Source indices in flat k_proj buffer.
+    const uint src_base = head * dims.head_dim + pair * 2;
+    const float x0 = float(k_proj[src_base]);
+    const float x1 = float(k_proj[src_base + 1]);
+
+    // Cache layout: [head][time][d].
+    const uint cache_stride =
+        dims.max_context_length * dims.head_dim;
+    const uint cache_base =
+        head * cache_stride + pos * dims.head_dim
+        + pair * 2;
+
+    // Write RoPE-rotated K directly to cache.
+    k_cache[cache_base]     =
+        half(x0 * cos_val - x1 * sin_val);
+    k_cache[cache_base + 1] =
+        half(x0 * sin_val + x1 * cos_val);
+
+    // ── V copy (no rotation) ─────────────────────────────────
+    v_cache[cache_base]     = v_proj[src_base];
+    v_cache[cache_base + 1] = v_proj[src_base + 1];
+}
+
+// ============================================================================
 // KV Cache Update with f16 Input
 // ============================================================================
 
@@ -894,4 +1183,24 @@ kernel void residual_add_f16(
     if (gid >= count) return;
 
     residual[gid] += float(addition[gid]);
+}
+
+// ============================================================================
+// GPU completion flag — single-thread atomic write
+// ============================================================================
+
+/// Write 1 to flag[0] via atomic store.  Dispatched as the
+/// last kernel in a compute encoder so the CPU can spin-wait
+/// on the flag instead of calling waitUntilCompleted (avoids
+/// ~100-150 us Mach kernel trap overhead).
+///
+/// Dispatch: 1 threadgroup, 1 thread.
+kernel void set_completion_flag(
+    device atomic_uint* flag [[buffer(0)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid == 0) {
+        atomic_store_explicit(
+            flag, 1u, memory_order_relaxed);
+    }
 }

@@ -684,6 +684,18 @@ const pipeline_specs = [_]PipelineSpec{
         .field_name = "qmv_const_multigroup_f16io",
         .shader_name = "qmv_const_multigroup_f16io",
     },
+    .{
+        .field_name = "qmv_f16io_resadd",
+        .shader_name = "qmv_f16io_resadd",
+    },
+    .{
+        .field_name = "qmv_const_f16io_resadd",
+        .shader_name = "qmv_const_f16io_resadd",
+    },
+    .{
+        .field_name = "qmv_const_multigroup_f16io_resadd",
+        .shader_name = "qmv_const_multigroup_f16io_resadd",
+    },
 };
 
 // ============================================================================
@@ -767,6 +779,25 @@ pub const Device = struct {
     qmv_const_f16io: ComputePipeline,
     qmv_fused_pair_const_f16io: ComputePipeline,
     qmv_const_multigroup_f16io: ComputePipeline,
+    // QMV + fused residual accumulate (f16 in, f32 += out).
+    qmv_f16io_resadd: ComputePipeline,
+    qmv_const_f16io_resadd: ComputePipeline,
+    qmv_const_multigroup_f16io_resadd: ComputePipeline,
+
+    // Specialized QMV pipelines — compiled at init for the
+    // specific model dimensions. Set by transformer init
+    // via initSpecializedQMV(). Null when not initialized.
+    spec_qmv_f16io: ?ComputePipeline = null,
+    spec_qmv_f16io_resadd: ?ComputePipeline = null,
+    spec_qmv_fused_pair_f16io: ?ComputePipeline = null,
+    spec_qmv_f16in: ?ComputePipeline = null,
+    spec_qmv_mg_f16io_resadd: ?ComputePipeline = null,
+
+    // K values the specialized pipelines target.
+    // Used by dispatch functions to verify dims.K matches
+    // before selecting a specialized pipeline.
+    spec_hidden_K: u32 = 0,
+    spec_inter_K: u32 = 0,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(
@@ -1475,6 +1506,58 @@ fn compileLibrary(device: objc.Object) !objc.Object {
             );
             log.err(
                 "Shader compilation failed: {s}",
+                .{c_str},
+            );
+        }
+        return error.MetalShaderCompilationFailed;
+    };
+
+    return objc.Object.fromId(lib_raw);
+}
+
+/// Compile a Metal shader library from a runtime-provided
+/// source string.  Unlike `compileLibrary`, this does not
+/// use `@embedFile` — the caller supplies the shader text,
+/// which may be generated at init time with concrete model
+/// dimensions baked in as constants.
+pub fn compileLibraryFromSource(
+    device: objc.Object,
+    source: [*:0]const u8,
+) !objc.Object {
+    std.debug.assert(device.value != null);
+
+    const NSString = objc.getClass("NSString") orelse
+        return error.ClassNotFound;
+    const source_ns = NSString.msgSend(
+        objc.Object,
+        "stringWithUTF8String:",
+        .{source},
+    );
+
+    var error_ptr: ?*anyopaque = null;
+    const lib_raw = device.msgSend(
+        ?*anyopaque,
+        "newLibraryWithSource:options:error:",
+        .{
+            source_ns.value,
+            @as(?*anyopaque, null),
+            &error_ptr,
+        },
+    ) orelse {
+        if (error_ptr) |err| {
+            const err_obj = objc.Object.fromId(err);
+            const desc = err_obj.msgSend(
+                objc.Object,
+                "localizedDescription",
+                .{},
+            );
+            const c_str = desc.msgSend(
+                [*:0]const u8,
+                "UTF8String",
+                .{},
+            );
+            log.err(
+                "Specialized shader compilation " ++ "failed: {s}",
                 .{c_str},
             );
         }

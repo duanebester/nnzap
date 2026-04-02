@@ -3794,6 +3794,100 @@ kernel void qmv_f16io(
 }
 
 // ============================================================================
+// qmv_f16io_resadd — QMV with fused f32 residual accumulate
+// ============================================================================
+/// Variant of qmv_f16io that accumulates the f32 result
+/// directly into the residual buffer (residual[row] += acc)
+/// instead of writing f16 to an intermediate buffer.  Eliminates
+/// one dispatch + one barrier per call site by fusing the
+/// residual_add_f16 step into the QMV output write.
+///
+/// Dispatch: threadgroups = ceil(M / 2), threads_per_group = 64.
+kernel void qmv_f16io_resadd(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    device const half*    input        [[buffer(2)]],
+    device float*         residual     [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint                  tgid         [[threadgroup_position_in_grid]],
+    uint                  tid_in_tg    [[thread_index_in_threadgroup]])
+{
+    // Two simdgroups per threadgroup: threads 0–31 handle one
+    // row, threads 32–63 handle the next.
+    const uint simdgroup_idx = tid_in_tg / 32;
+    const uint lane = tid_in_tg % 32;
+    const uint row = tgid * 2 + simdgroup_idx;
+
+    // Bounds check: last threadgroup may have only one valid row.
+    if (row >= dims.M) return;
+
+    const uint K = dims.K;
+    const uint group_size = dims.group_size;
+    const uint groups_per_row =
+        (K + group_size - 1) / group_size;
+
+    // Each of 32 lanes processes K/32 columns.
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+
+    // Byte offset for this row's packed bits.
+    const uint row_bit_offset = row * (K / 8);
+    // Scale offset for this row.
+    const uint row_scale_offset = row * groups_per_row;
+
+    float accum = 0.0f;
+
+    // Track group boundaries for per-group scale application.
+    uint cur_group = col_start / group_size;
+    float set_accum = 0.0f;   // Sum of input where bit=1.
+    float group_sum = 0.0f;   // Sum of all input in group.
+
+    // Iterate over the columns assigned to this lane.
+    for (uint c = 0; c < cols_per_lane; c++) {
+        const uint col = col_start + c;
+        const uint group_idx = col / group_size;
+
+        // When we cross a group boundary, flush.
+        if (group_idx != cur_group) {
+            const float scale = float(
+                scales[row_scale_offset + cur_group]
+            );
+            accum += scale * (2.0f * set_accum - group_sum);
+            set_accum = 0.0f;
+            group_sum = 0.0f;
+            cur_group = group_idx;
+        }
+
+        // Which byte and bit within the packed row.
+        const uint byte_idx = row_bit_offset + col / 8;
+        const uint bit_pos = col % 8;
+        const bool bit_set =
+            (packed_bits[byte_idx] >> bit_pos) & 1;
+
+        // Widen f16 → f32 before accumulation.
+        const float x_val = float(input[col]);
+        group_sum += x_val;
+        set_accum += select(0.0f, x_val, bit_set);
+    }
+
+    // Flush the final group.
+    {
+        const float scale = float(
+            scales[row_scale_offset + cur_group]
+        );
+        accum += scale * (2.0f * set_accum - group_sum);
+    }
+
+    // Reduce across the 32 lanes in the simdgroup.
+    accum = simd_sum(accum);
+
+    // Lane 0 accumulates the f32 result into the residual.
+    if (lane == 0) {
+        residual[row] += accum;
+    }
+}
+
+// ============================================================================
 // qmv_const_f16io — constant-cache input, half-precision I/O
 // ============================================================================
 
@@ -3939,6 +4033,157 @@ kernel void qmv_const_f16io(
         float acc1 = float(scales[scale_off1]) * sig1;
         acc1 = simd_sum(acc1);
         if (lane == 0) output[row1] = half(acc1);
+    }
+}
+
+// ============================================================================
+// qmv_const_f16io_resadd — QMV with fused f32 residual accumulate
+// ============================================================================
+/// Variant of qmv_const_f16io that accumulates the f32 result
+/// directly into the residual buffer (residual[row] += acc)
+/// instead of writing f16 to an intermediate buffer.  Eliminates
+/// one dispatch + one barrier per call site by fusing the
+/// residual_add_f16 step into the QMV output write.
+///
+/// Dispatch: threadgroups = ceil(M / 32), threads = 512.
+kernel void qmv_const_f16io_resadd(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    constant half*        input        [[buffer(2)]],
+    device float*         residual     [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    // Each simdgroup handles 2 adjacent rows.
+    const uint row0 = tgid * 32 + simdgroup_idx * 2;
+    const uint row1 = row0 + 1;
+
+    // Precompute column layout — identical for both rows.
+    const uint groups_per_row = K / group_size;
+    const uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    const uint bytes_per_lane = cols_per_lane / 8;
+    const uint col_byte_off = col_start / 8;
+    const uint grp = col_start / group_size;
+    const uint bytes_per_row = K / 8;
+
+    float sig0 = 0.0f;
+    float sig1 = 0.0f;
+    const bool row0_valid = row0 < M;
+    const bool row1_valid = row1 < M;
+    const uint base0 =
+        row0 * bytes_per_row + col_byte_off;
+    const uint base1 =
+        row1 * bytes_per_row + col_byte_off;
+
+    // Load weights as uint32 (4 bytes = 32 elements per load).
+    const uint words_per_lane = bytes_per_lane / 4;
+    const uint tail_bytes = bytes_per_lane % 4;
+    device const uint32_t* bits32_r0 =
+        (device const uint32_t*)(packed_bits + base0);
+    device const uint32_t* bits32_r1 =
+        (device const uint32_t*)(packed_bits + base1);
+
+    for (uint w = 0; w < words_per_lane; w++) {
+        const uint32_t w0 =
+            row0_valid ? bits32_r0[w] : 0;
+        const uint32_t w1 =
+            row1_valid ? bits32_r1[w] : 0;
+
+        // Process 4 bytes from each uint32.
+        for (uint bi = 0; bi < 4; bi++) {
+            const uint ci =
+                col_start + w * 32 + bi * 8;
+            // Widen f16 → f32 before accumulation.
+            const float x0 = float(input[ci]);
+            const float x1 = float(input[ci + 1]);
+            const float x2 = float(input[ci + 2]);
+            const float x3 = float(input[ci + 3]);
+            const float x4 = float(input[ci + 4]);
+            const float x5 = float(input[ci + 5]);
+            const float x6 = float(input[ci + 6]);
+            const float x7 = float(input[ci + 7]);
+            const uint bv0 =
+                (w0 >> (bi * 8)) & 0xFFu;
+            const uint bv1 =
+                (w1 >> (bi * 8)) & 0xFFu;
+            sig0 += select(-x0, x0, bool(bv0 & 1));
+            sig0 += select(-x1, x1, bool(bv0 & 2));
+            sig0 += select(-x2, x2, bool(bv0 & 4));
+            sig0 += select(-x3, x3, bool(bv0 & 8));
+            sig0 += select(-x4, x4, bool(bv0 & 16));
+            sig0 += select(-x5, x5, bool(bv0 & 32));
+            sig0 += select(-x6, x6, bool(bv0 & 64));
+            sig0 += select(-x7, x7, bool(bv0 & 128));
+            sig1 += select(-x0, x0, bool(bv1 & 1));
+            sig1 += select(-x1, x1, bool(bv1 & 2));
+            sig1 += select(-x2, x2, bool(bv1 & 4));
+            sig1 += select(-x3, x3, bool(bv1 & 8));
+            sig1 += select(-x4, x4, bool(bv1 & 16));
+            sig1 += select(-x5, x5, bool(bv1 & 32));
+            sig1 += select(-x6, x6, bool(bv1 & 64));
+            sig1 += select(-x7, x7, bool(bv1 & 128));
+        }
+    }
+
+    // Tail: remaining bytes when bytes_per_lane % 4 != 0.
+    for (uint b = words_per_lane * 4;
+         b < bytes_per_lane; b++) {
+        const uint ci = col_start + b * 8;
+        // Widen f16 → f32 before accumulation.
+        const float x0 = float(input[ci]);
+        const float x1 = float(input[ci + 1]);
+        const float x2 = float(input[ci + 2]);
+        const float x3 = float(input[ci + 3]);
+        const float x4 = float(input[ci + 4]);
+        const float x5 = float(input[ci + 5]);
+        const float x6 = float(input[ci + 6]);
+        const float x7 = float(input[ci + 7]);
+        if (row0_valid) {
+            const uint bv0 = packed_bits[base0 + b];
+            sig0 += select(-x0, x0, bool(bv0 & 1));
+            sig0 += select(-x1, x1, bool(bv0 & 2));
+            sig0 += select(-x2, x2, bool(bv0 & 4));
+            sig0 += select(-x3, x3, bool(bv0 & 8));
+            sig0 += select(-x4, x4, bool(bv0 & 16));
+            sig0 += select(-x5, x5, bool(bv0 & 32));
+            sig0 += select(-x6, x6, bool(bv0 & 64));
+            sig0 += select(-x7, x7, bool(bv0 & 128));
+        }
+        if (row1_valid) {
+            const uint bv1 = packed_bits[base1 + b];
+            sig1 += select(-x0, x0, bool(bv1 & 1));
+            sig1 += select(-x1, x1, bool(bv1 & 2));
+            sig1 += select(-x2, x2, bool(bv1 & 4));
+            sig1 += select(-x3, x3, bool(bv1 & 8));
+            sig1 += select(-x4, x4, bool(bv1 & 16));
+            sig1 += select(-x5, x5, bool(bv1 & 32));
+            sig1 += select(-x6, x6, bool(bv1 & 64));
+            sig1 += select(-x7, x7, bool(bv1 & 128));
+        }
+    }
+
+    const uint scale_off0 = row0 * groups_per_row + grp;
+    const uint scale_off1 = row1 * groups_per_row + grp;
+
+    // Lane 0 accumulates the f32 result into the residual.
+    if (row0_valid) {
+        float acc0 = float(scales[scale_off0]) * sig0;
+        acc0 = simd_sum(acc0);
+        if (lane == 0) residual[row0] += acc0;
+    }
+
+    if (row1_valid) {
+        float acc1 = float(scales[scale_off1]) * sig1;
+        acc1 = simd_sum(acc1);
+        if (lane == 0) residual[row1] += acc1;
     }
 }
 
@@ -4289,5 +4534,142 @@ kernel void qmv_const_multigroup_f16io(
     if (lane == 0) {
         if (row0_valid) output[row0] = half(accum0);
         if (row1_valid) output[row1] = half(accum1);
+    }
+}
+
+// ============================================================================
+// qmv_const_multigroup_f16io_resadd — QMV with fused f32 residual accumulate
+// ============================================================================
+/// Variant of qmv_const_multigroup_f16io that accumulates the f32
+/// result directly into the residual buffer (residual[row] += acc)
+/// instead of writing f16 to an intermediate buffer.  Eliminates
+/// one dispatch + one barrier per call site by fusing the
+/// residual_add_f16 step into the QMV output write.
+///
+/// Dispatch: threadgroups = ceil(M / 32), threads = 512.
+kernel void qmv_const_multigroup_f16io_resadd(
+    device const uint8_t* packed_bits  [[buffer(0)]],
+    device const half*    scales       [[buffer(1)]],
+    constant half*        input        [[buffer(2)]],
+    device float*         residual     [[buffer(3)]],
+    constant QMVDims&     dims         [[buffer(4)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint tid     [[thread_index_in_threadgroup]])
+{
+    const uint K = dims.K;
+    const uint M = dims.M;
+    const uint group_size = dims.group_size;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    // Each simdgroup handles 2 adjacent rows.
+    const uint row0 = tgid * 32 + simdgroup_idx * 2;
+    const uint row1 = row0 + 1;
+
+    const bool row0_valid = row0 < M;
+    const bool row1_valid = row1 < M;
+
+    const uint groups_per_row = K / group_size;
+
+    // Byte-aligned lane assignment (same as multigroup).
+    const uint total_row_bytes = K / 8;
+    const uint base_bytes = total_row_bytes / 32;
+    const uint extra_lanes = total_row_bytes % 32;
+    const uint my_bytes = base_bytes +
+        ((lane < extra_lanes) ? 1u : 0u);
+    const uint byte_start = lane * base_bytes +
+        min(lane, extra_lanes);
+    const uint col_start = byte_start * 8;
+
+    const uint row_byte_base0 =
+        row0 * total_row_bytes + byte_start;
+    const uint row_byte_base1 =
+        row1 * total_row_bytes + byte_start;
+    const uint row_scale_off0 = row0 * groups_per_row;
+    const uint row_scale_off1 = row1 * groups_per_row;
+
+    // Bytes per group (group_size always multiple of 8).
+    const uint bytes_per_group = group_size / 8;
+
+    // Dual-row signed accumulation with group tracking.
+    float accum0 = 0.0f, signed0 = 0.0f;
+    float accum1 = 0.0f, signed1 = 0.0f;
+    uint cur_group = col_start / group_size;
+    uint byte_in_group = (col_start % group_size) / 8;
+
+    for (uint b = 0; b < my_bytes; b++) {
+        const uint base_col = col_start + b * 8;
+
+        // Widen f16 → f32 before accumulation.
+        float x0 = float(input[base_col + 0]);
+        float x1 = float(input[base_col + 1]);
+        float x2 = float(input[base_col + 2]);
+        float x3 = float(input[base_col + 3]);
+        float x4 = float(input[base_col + 4]);
+        float x5 = float(input[base_col + 5]);
+        float x6 = float(input[base_col + 6]);
+        float x7 = float(input[base_col + 7]);
+
+        if (row0_valid) {
+            const uint bv0 =
+                packed_bits[row_byte_base0 + b];
+            signed0 += select(-x0, x0, bool(bv0 & 1));
+            signed0 += select(-x1, x1, bool(bv0 & 2));
+            signed0 += select(-x2, x2, bool(bv0 & 4));
+            signed0 += select(-x3, x3, bool(bv0 & 8));
+            signed0 += select(-x4, x4, bool(bv0 & 16));
+            signed0 += select(-x5, x5, bool(bv0 & 32));
+            signed0 += select(-x6, x6, bool(bv0 & 64));
+            signed0 += select(-x7, x7, bool(bv0 & 128));
+        }
+
+        if (row1_valid) {
+            const uint bv1 =
+                packed_bits[row_byte_base1 + b];
+            signed1 += select(-x0, x0, bool(bv1 & 1));
+            signed1 += select(-x1, x1, bool(bv1 & 2));
+            signed1 += select(-x2, x2, bool(bv1 & 4));
+            signed1 += select(-x3, x3, bool(bv1 & 8));
+            signed1 += select(-x4, x4, bool(bv1 & 16));
+            signed1 += select(-x5, x5, bool(bv1 & 32));
+            signed1 += select(-x6, x6, bool(bv1 & 64));
+            signed1 += select(-x7, x7, bool(bv1 & 128));
+        }
+
+        // Flush at group boundary.
+        byte_in_group++;
+        if (byte_in_group == bytes_per_group) {
+            const float s = float(
+                scales[row_scale_off0 + cur_group]
+            );
+            accum0 += s * signed0;
+            signed0 = 0.0f;
+            const float t = float(
+                scales[row_scale_off1 + cur_group]
+            );
+            accum1 += t * signed1;
+            signed1 = 0.0f;
+            cur_group++;
+            byte_in_group = 0;
+        }
+    }
+
+    // Flush remaining partial group.
+    if (byte_in_group > 0) {
+        accum0 += float(
+            scales[row_scale_off0 + cur_group]
+        ) * signed0;
+        accum1 += float(
+            scales[row_scale_off1 + cur_group]
+        ) * signed1;
+    }
+
+    accum0 = simd_sum(accum0);
+    accum1 = simd_sum(accum1);
+
+    // Lane 0 accumulates the f32 results into the residual.
+    if (lane == 0) {
+        if (row0_valid) residual[row0] += accum0;
+        if (row1_valid) residual[row1] += accum1;
     }
 }

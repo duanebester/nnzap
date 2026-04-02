@@ -3,6 +3,10 @@
 //! Measures prefill and decode throughput, per-token latency percentiles,
 //! and writes structured JSON results to nn/benchmarks/.
 //!
+//! Uses the library's `generate` API so the benchmark automatically
+//! benefits from all engine optimisations (spin-wait, fused kernels,
+//! unretained command buffers, etc.) without reimplementing dispatch.
+//!
 //! Usage:
 //!   zig build run-bonsai-bench -- [model_dir]
 //!
@@ -22,7 +26,7 @@ const MAX_PATH_LEN: u32 = 4096;
 const MAX_PROMPT_TOKENS: u32 = 8192;
 const WARMUP_TOKENS: u32 = 8;
 const MEASURE_TOKENS: u32 = 64;
-const MAX_TIMINGS: u32 = WARMUP_TOKENS + MEASURE_TOKENS + 256;
+const TOTAL_DECODE_TOKENS: u32 = WARMUP_TOKENS + MEASURE_TOKENS;
 
 const BENCH_PROMPT =
     "Explain the theory of general relativity in detail.";
@@ -50,6 +54,15 @@ pub fn main() !void {
 
     var pipelines: nn.TransformerPipelines = undefined;
     try pipelines.init(device.obj);
+
+    // Compile specialized QMV kernels with model dimensions
+    // baked in as constexpr for full loop unrolling.
+    try nn.specialized_qmv.initOnDevice(
+        &device,
+        Config.hidden_size,
+        Config.intermediate_size,
+        Config.group_size,
+    );
 
     // ── Model allocation and weight loading ──────────
     std.debug.print("Allocating model buffers...\n", .{});
@@ -136,89 +149,67 @@ pub fn main() !void {
         .top_p = 1.0,
         .seed = 42,
     };
-    var prng = std.Random.DefaultPrng.init(
-        sampling.seed,
-    );
-    const rng = prng.random();
 
-    // ── Prefill ──────────────────────────────────────
-    std.debug.print("Running prefill...\n", .{});
-    const t_prefill_start = std.time.nanoTimestamp();
-    for (prompt_ids[0..prompt_len], 0..) |tok, pos| {
-        dispatchOneDecode(
-            &device,
-            &pipelines,
-            &model,
-            tok,
-            @intCast(pos),
-        );
-    }
-    const t_prefill_end = std.time.nanoTimestamp();
-    const prefill_ns: u64 =
-        @intCast(t_prefill_end - t_prefill_start);
-
-    // Sample first token from prefill logits.
-    const logits_slice = model.logits.asSlice();
-    var next_token = transformer.sampleToken(
-        logits_slice,
-        sampling,
-        scratch,
-        indices,
-        rng,
-    );
-
-    // ── Decode: warmup + measurement ─────────────────
-    std.debug.print(
-        "Warming up ({d} tokens)...\n",
-        .{WARMUP_TOKENS},
-    );
-    var position: u32 = @intCast(prompt_len);
-    next_token = runDecodePhase(
-        &device,
-        &pipelines,
-        &model,
-        next_token,
-        &position,
-        WARMUP_TOKENS,
-        &eos_ids,
-        sampling,
-        scratch,
-        indices,
-        rng,
-        null, // No timing collection during warmup.
-    );
+    // ── Generate (prefill + warmup + measurement) ────
+    // A single `generate` call handles chunked prefill,
+    // warmup decode, and measured decode.  Per-token
+    // timings are collected by the library itself, so
+    // we get latency data without reimplementing GPU
+    // dispatch.
+    var output_tokens: [TOTAL_DECODE_TOKENS]u32 =
+        undefined;
+    var per_token_ns: [TOTAL_DECODE_TOKENS]u64 =
+        undefined;
+    var args = model.forwardDecodeArgs(0, 0);
 
     std.debug.print(
-        "Measuring ({d} tokens)...\n",
-        .{MEASURE_TOKENS},
+        "Running generate ({d} warmup + {d} measure)...\n",
+        .{ WARMUP_TOKENS, MEASURE_TOKENS },
     );
-    var timings_ns: [MAX_TIMINGS]u64 = undefined;
-    var timing_count: u32 = 0;
-    _ = runDecodePhase(
+
+    const result = transformer.generate(
+        Config,
         &device,
         &pipelines,
-        &model,
-        next_token,
-        &position,
-        MEASURE_TOKENS,
-        &eos_ids,
-        sampling,
-        scratch,
-        indices,
-        rng,
-        &.{
-            .buf = &timings_ns,
-            .count = &timing_count,
+        &args,
+        .{
+            .prompt_ids = prompt_ids[0..prompt_len],
+            .params = sampling,
+            .eos_ids = &eos_ids,
+            .output_tokens = &output_tokens,
+            .scratch = scratch,
+            .indices = indices,
+            .per_token_ns = &per_token_ns,
         },
     );
 
     // ── Compute statistics ───────────────────────────
+    // Skip the first WARMUP_TOKENS timings; use the
+    // remaining entries for latency percentiles.
+    const generated = result.tokens_generated;
+    const warmup_count = @min(WARMUP_TOKENS, generated);
+    const measure_count: u32 =
+        if (generated > warmup_count)
+            generated - warmup_count
+        else
+            0;
+
+    if (measure_count == 0) {
+        std.debug.print(
+            "error: not enough tokens generated " ++
+                "({d}) for measurement\n",
+            .{generated},
+        );
+        return;
+    }
+
     const results = computeResults(
         load_ns,
-        prefill_ns,
+        result.prefill_ns,
         prompt_len,
-        &timings_ns,
-        timing_count,
+        &per_token_ns,
+        warmup_count,
+        measure_count,
     );
 
     // ── Print summary to stderr ──────────────────────
@@ -226,126 +217,6 @@ pub fn main() !void {
 
     // ── Write JSON to benchmarks/ ────────────────────
     try writeJsonResults(&results, prompt_len);
-}
-
-// ============================================================
-// Decode phase runner
-// ============================================================
-
-/// Timing collection context passed into the decode loop.
-const TimingCtx = struct {
-    buf: *[MAX_TIMINGS]u64,
-    count: *u32,
-};
-
-/// Run `token_count` decode steps, optionally collecting
-/// per-token nanosecond timings.  Returns the last sampled
-/// token so the caller can continue generation.
-fn runDecodePhase(
-    device: *const nn.Device,
-    pipelines: *const nn.TransformerPipelines,
-    model: *const BonsaiModel,
-    first_token: u32,
-    position: *u32,
-    token_count: u32,
-    eos_ids: []const u32,
-    sampling: transformer.SamplingParams,
-    scratch: []f32,
-    sort_indices: []u32,
-    rng: std.Random,
-    timing: ?*const TimingCtx,
-) u32 {
-    std.debug.assert(token_count > 0);
-    std.debug.assert(position.* < Config.max_context_length);
-
-    var current_token = first_token;
-    var generated: u32 = 0;
-
-    while (generated < token_count) {
-        // Stop on EOS or context exhaustion.
-        if (isEos(current_token, eos_ids)) break;
-        if (position.* >= Config.max_context_length) break;
-
-        const t_start = std.time.nanoTimestamp();
-        dispatchOneDecode(
-            device,
-            pipelines,
-            model,
-            current_token,
-            position.*,
-        );
-        const t_end = std.time.nanoTimestamp();
-
-        position.* += 1;
-        generated += 1;
-
-        // Record timing if collecting.
-        if (timing) |ctx| {
-            if (ctx.count.* < MAX_TIMINGS) {
-                ctx.buf[ctx.count.*] =
-                    @intCast(t_end - t_start);
-                ctx.count.* += 1;
-            }
-        }
-
-        // Sample next token.
-        const logits_slice = model.logits.asSlice();
-        current_token = transformer.sampleToken(
-            logits_slice,
-            sampling,
-            scratch,
-            sort_indices,
-            rng,
-        );
-    }
-
-    return current_token;
-}
-
-fn isEos(token: u32, eos_ids: []const u32) bool {
-    std.debug.assert(eos_ids.len > 0);
-    for (eos_ids) |eid| {
-        if (token == eid) return true;
-    }
-    return false;
-}
-
-// ============================================================
-// GPU dispatch helper
-// ============================================================
-
-/// Run a single-token forward decode pass (embedding →
-/// N blocks → final norm → LM head) and wait for the
-/// GPU to finish.  After this returns, `model.logits`
-/// contains valid [vocab_size] f32 values.
-fn dispatchOneDecode(
-    device: *const nn.Device,
-    pipelines: *const nn.TransformerPipelines,
-    model_ptr: *const BonsaiModel,
-    token_id: u32,
-    position: u32,
-) void {
-    std.debug.assert(token_id < Config.vocab_size);
-    std.debug.assert(
-        position < Config.max_context_length,
-    );
-
-    const args = model_ptr.forwardDecodeArgs(
-        token_id,
-        position,
-    );
-
-    const cmd = device.beginCommandBufferUnretained();
-    const enc = device.beginCompute(cmd);
-    nn.transformer.forwardDecode(
-        Config,
-        device,
-        enc,
-        pipelines,
-        args,
-    );
-    enc.msgSend(void, "endEncoding", .{});
-    device.commitAndWait(cmd);
 }
 
 // ============================================================
@@ -363,17 +234,22 @@ const BenchResults = struct {
 };
 
 /// Compute aggregate statistics from raw per-token
-/// nanosecond timings.  Sorts the timing array in place
-/// for percentile extraction.
+/// nanosecond timings.  The timing array contains both
+/// warmup and measurement entries; `warmup_count` entries
+/// are skipped before extracting percentiles.
 fn computeResults(
     load_ns: u64,
     prefill_ns: u64,
     prompt_len: u32,
-    timings_ns: *[MAX_TIMINGS]u64,
-    timing_count: u32,
+    all_timings: *[TOTAL_DECODE_TOKENS]u64,
+    warmup_count: u32,
+    measure_count: u32,
 ) BenchResults {
     std.debug.assert(prompt_len > 0);
-    std.debug.assert(timing_count > 0);
+    std.debug.assert(measure_count > 0);
+    std.debug.assert(
+        warmup_count + measure_count <= TOTAL_DECODE_TOKENS,
+    );
 
     const load_ms = nanosToMs(load_ns);
     const prefill_ms = nanosToMs(prefill_ns);
@@ -384,29 +260,37 @@ fn computeResults(
     else
         0.0;
 
-    // Sort timings for percentile calculation.
-    const slice = timings_ns[0..timing_count];
-    std.sort.pdq(u64, slice, {}, std.sort.asc(u64));
+    // Extract measurement slice (skip warmup entries).
+    const measure_slice =
+        all_timings[warmup_count..][0..measure_count];
 
-    // Total decode time is the sum of all individual
-    // token timings (not wall clock across the phase).
+    // Sort measurement timings for percentile extraction.
+    std.sort.pdq(
+        u64,
+        measure_slice,
+        {},
+        std.sort.asc(u64),
+    );
+
+    // Total decode time is the sum of all measured token
+    // timings (not wall clock across the phase).
     var total_decode_ns: u64 = 0;
-    for (slice) |t| {
+    for (measure_slice) |t| {
         total_decode_ns += t;
     }
     const decode_ms = nanosToMs(total_decode_ns);
 
     const decode_tps: f64 = if (decode_ms > 0.0)
-        @as(f64, @floatFromInt(timing_count)) /
+        @as(f64, @floatFromInt(measure_count)) /
             (decode_ms / 1000.0)
     else
         0.0;
 
     // p50 = sorted[len/2], p99 = sorted[len*99/100].
-    const p50_idx = timing_count / 2;
-    const p99_idx = (timing_count * 99) / 100;
-    const p50_us = slice[p50_idx] / 1000;
-    const p99_us = slice[p99_idx] / 1000;
+    const p50_idx = measure_count / 2;
+    const p99_idx = (measure_count * 99) / 100;
+    const p50_us = measure_slice[p50_idx] / 1000;
+    const p99_us = measure_slice[p99_idx] / 1000;
 
     return BenchResults{
         .load_ms = load_ms,
@@ -414,7 +298,7 @@ fn computeResults(
         .decode_tok_per_sec = decode_tps,
         .decode_p50_us = p50_us,
         .decode_p99_us = p99_us,
-        .measured_tokens = timing_count,
+        .measured_tokens = measure_count,
         .timestamp_ns = std.time.nanoTimestamp(),
     };
 }
