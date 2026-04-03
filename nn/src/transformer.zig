@@ -387,6 +387,7 @@ pub const TransformerPipelines = struct {
     fused_norm_rope_f16: metal.ComputePipeline,
     fused_k_norm_rope_kv_cache_f16: metal.ComputePipeline,
     gqa_attention_f16io: metal.ComputePipeline,
+    gqa_attention_f16io_tg: metal.ComputePipeline,
     silu_elementwise_mul_f16: metal.ComputePipeline,
     residual_add_f16: metal.ComputePipeline,
     set_completion_flag: metal.ComputePipeline,
@@ -485,6 +486,11 @@ pub const TransformerPipelines = struct {
                 device_obj,
                 lib,
                 "gqa_attention_f16io",
+            ),
+            .gqa_attention_f16io_tg = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "gqa_attention_f16io_tg",
             ),
             .silu_elementwise_mul_f16 = try metal.ComputePipeline.init(
                 device_obj,
@@ -768,6 +774,53 @@ fn dispatchFusedKNormRoPEKVCache(
 
 /// Dispatch grouped query attention (decode path, M=1).
 /// One threadgroup (256 threads) per query head.
+/// Dispatch the threadgroup-scores GQA attention kernel.
+/// Same buffer layout as dispatchGQAAttention but buffer(4)
+/// (scratch) is skipped — the kernel stores scores in
+/// threadgroup memory instead.  Valid when seq_len <= 7168.
+fn dispatchGQAAttentionTG(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    pipeline: metal.ComputePipeline,
+    q_buffer: objc.Object,
+    k_cache_buffer: objc.Object,
+    v_cache_buffer: objc.Object,
+    output_buffer: objc.Object,
+    dims: GQADims,
+) void {
+    std.debug.assert(dims.num_query_heads > 0);
+    std.debug.assert(dims.seq_len > 0);
+    std.debug.assert(
+        dims.seq_len <= dims.max_context_length,
+    );
+    std.debug.assert(
+        dims.heads_per_kv_group ==
+            dims.num_query_heads / dims.num_kv_heads,
+    );
+    // The TG variant only works when seq_len fits in
+    // threadgroup memory (7168 floats for scores).
+    std.debug.assert(dims.seq_len <= 7168);
+
+    setRawBuffer(encoder, q_buffer, 0, 0);
+    setRawBuffer(encoder, k_cache_buffer, 0, 1);
+    setRawBuffer(encoder, v_cache_buffer, 0, 2);
+    setRawBuffer(encoder, output_buffer, 0, 3);
+    // Skip buffer(4) — no scratch needed.
+    metal.setBytes(encoder, GQADims, &dims, 5);
+
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, dims.num_query_heads),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 256,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
 pub fn dispatchGQAAttention(
     device: *const metal.Device,
     encoder: objc.Object,
@@ -1983,24 +2036,48 @@ fn encodeAttentionGather(
     pipelines: *const TransformerPipelines,
     a: ForwardBlockArgs,
 ) void {
-    dispatchGQAAttention(
-        device,
-        encoder,
-        pipelines.gqa_attention_f16io,
-        a.q,
-        a.k_cache,
-        a.v_cache,
-        a.attn_out,
-        a.attn_scratch,
-        .{
-            .num_query_heads = Config.num_query_heads,
-            .num_kv_heads = Config.num_kv_heads,
-            .head_dim = Config.head_dim,
-            .seq_len = a.seq_len,
-            .max_context_length = Config.max_context_length,
-            .heads_per_kv_group = Config.heads_per_kv_group,
-        },
-    );
+    const dims = GQADims{
+        .num_query_heads = Config.num_query_heads,
+        .num_kv_heads = Config.num_kv_heads,
+        .head_dim = Config.head_dim,
+        .seq_len = a.seq_len,
+        .max_context_length = Config.max_context_length,
+        .heads_per_kv_group = Config.heads_per_kv_group,
+    };
+
+    // Use threadgroup-scores kernel when seq_len fits in
+    // threadgroup memory (avoids the scratch buffer
+    // round-trip).  Fall back to the scratch-based kernel
+    // for longer sequences.
+    // Use threadgroup-scores kernel when seq_len fits in
+    // threadgroup memory (avoids the scratch buffer
+    // round-trip).  Fall back to the scratch-based kernel
+    // for longer sequences.
+    const TG_SEQ_LIMIT: u32 = 1024;
+    if (a.seq_len <= TG_SEQ_LIMIT) {
+        dispatchGQAAttentionTG(
+            device,
+            encoder,
+            pipelines.gqa_attention_f16io_tg,
+            a.q,
+            a.k_cache,
+            a.v_cache,
+            a.attn_out,
+            dims,
+        );
+    } else {
+        dispatchGQAAttention(
+            device,
+            encoder,
+            pipelines.gqa_attention_f16io,
+            a.q,
+            a.k_cache,
+            a.v_cache,
+            a.attn_out,
+            a.attn_scratch,
+            dims,
+        );
+    }
     bufferBarrier(encoder);
     // Fused QMV + residual accumulate: the O-projection result
     // is added directly to the f32 residual (residual[row] += acc)

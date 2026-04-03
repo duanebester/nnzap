@@ -1,16 +1,14 @@
-//! nnzap engine_research — AI agent toolbox for engine code.
+//! nnzap bonsai_research — AI agent toolbox for engine code.
 //!
 //! A CLI binary that outputs JSON on stdout, designed for
 //! AI coding agents to safely modify and benchmark the core
 //! nnzap library code (Metal GPU dispatch, shader code,
 //! buffer management, network forward/backward passes).
 //!
-//! Unlike autoresearch (which only modifies hyperparameters
-//! in main.zig), this tool targets the engine itself:
-//!   src/metal.zig, src/network.zig, src/layout.zig,
-//!   src/shaders/compute.metal, src/main.zig
+//! Extends engine_research with file I/O, shell commands,
+//! git commit, and experiment history tracking.
 //!
-//! Tools:
+//! Tools (inherited from engine_research):
 //!   help                         Show available tools
 //!   snapshot                     Save engine source files
 //!   snapshot-list                List all snapshots
@@ -24,6 +22,17 @@
 //!   show <file>                  Show source file contents
 //!   show-function <file> <fn>    Extract a function body
 //!
+//! Tools (bonsai-specific):
+//!   read-file <path>             Read a project file
+//!   write-file -f <json>         Write file (JSON input)
+//!   edit-file -f <json>          Edit file (JSON input)
+//!   list-dir <path>              List directory contents
+//!   cwd                          Print working directory
+//!   run-cmd -f <json>            Run a shell command
+//!   commit -f <json>             Git add -A and commit
+//!   add-summary -f <json>        Record experiment summary
+//!   history [count]              Show recent experiments
+//!
 //! Output contract:
 //!   stdout  → JSON (parsed by agent)
 //!   stderr  → human-readable diagnostics
@@ -34,7 +43,7 @@
 //!   Add to build.zig, then: zig build
 //!
 //! Run:
-//!   ./zig-out/bin/engine_research <tool> [args...]
+//!   ./zig-out/bin/bonsai_research <tool> [args...]
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -65,6 +74,49 @@ const MAX_FUNCTION_NAME: u32 = 256;
 const MAX_PATH_LEN: u32 = 512;
 const TIMESTAMP_LEN: u32 = 19; // "2025-01-15T14-30-00"
 
+const HISTORY_DIR = ".bonsai_history";
+const HISTORY_PATH = ".bonsai_history/experiments.jsonl";
+const SUMMARIES_PATH = ".bonsai_history/summaries.jsonl";
+const MAX_HISTORY_SIZE: usize = 2 * 1024 * 1024;
+const MAX_COMMAND_OUTPUT: usize = 1 * 1024 * 1024;
+
+// Allowed paths for write_file / edit_file (safety guard).
+const ALLOWED_WRITE_FILES = [_][]const u8{
+    "nn/src/transformer.zig",
+    "nn/src/network.zig",
+    "nn/src/layout.zig",
+    "nn/src/model.zig",
+    "nn/src/metal.zig",
+    "nn/src/safetensors.zig",
+    "nn/src/tokenizer.zig",
+    "nn/src/shaders/transformer.metal",
+    "nn/src/shaders/compute.metal",
+    "nn/examples/bonsai.zig",
+    "nn/examples/bonsai_bench.zig",
+};
+
+// Allowed path prefixes for read_file / list_directory.
+const ALLOWED_READ_PREFIXES = [_][]const u8{
+    "nn/src/",
+    "nn/examples/",
+    "src/",
+    "programs/",
+    "docs/",
+    "data/",
+    "benchmarks/",
+    ".bonsai_history/",
+    ".engine_snapshots/",
+};
+
+const ALLOWED_READ_FILES = [_][]const u8{
+    "README.md",
+    "CLAUDE.md",
+    "nn/build.zig",
+    "nn/build.zig.zon",
+    "build.zig",
+    "build.zig.zon",
+};
+
 // Compile-time validation (Rule 14 — comptime all the things).
 comptime {
     std.debug.assert(ENGINE_FILES.len > 0);
@@ -74,6 +126,11 @@ comptime {
     // covering the transformer inference stack, the dense
     // network training path, and the comptime layout.
     std.debug.assert(ENGINE_FILES.len == 11);
+    std.debug.assert(ALLOWED_WRITE_FILES.len > 0);
+    std.debug.assert(ALLOWED_READ_PREFIXES.len > 0);
+    std.debug.assert(ALLOWED_READ_FILES.len > 0);
+    std.debug.assert(MAX_HISTORY_SIZE > 0);
+    std.debug.assert(MAX_COMMAND_OUTPUT > 0);
 }
 
 // ============================================================
@@ -90,6 +147,52 @@ const FunctionBounds = struct {
     start_line: u32,
     end_line: u32,
 };
+
+// ============================================================
+// JSON input helpers (for -f flag subcommands)
+// ============================================================
+
+/// Read and parse a JSON input file passed via -f flag.
+/// Returns the parsed JSON object, or null on failure.
+/// Deletes the input file after reading (cleanup).
+fn readJsonInput(
+    arena: Allocator,
+    args: []const []const u8,
+) ?std.json.ObjectMap {
+    if (args.len < 2) return null;
+    if (!tools.eql(args[0], "-f")) return null;
+
+    const path = args[1];
+    const content = tools.readFile(arena, path) catch
+        return null;
+
+    // Clean up the temp file after reading.
+    std.fs.cwd().deleteFile(path) catch {};
+
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        content,
+        .{},
+    ) catch return null;
+
+    return switch (parsed) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
+/// Extract a string field from a JSON object.
+fn getJsonString(
+    obj: std.json.ObjectMap,
+    key: []const u8,
+) ?[]const u8 {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .string => |s| s,
+        else => null,
+    };
+}
 
 // ============================================================
 // Entry point
@@ -160,6 +263,33 @@ fn dispatch(
     }
     if (tools.eql(cmd, "show-function")) {
         return toolShowFunction(arena, args);
+    }
+    if (tools.eql(cmd, "read-file")) {
+        return toolReadFile(arena, args);
+    }
+    if (tools.eql(cmd, "write-file")) {
+        return toolWriteFile(arena, args);
+    }
+    if (tools.eql(cmd, "edit-file")) {
+        return toolEditFile(arena, args);
+    }
+    if (tools.eql(cmd, "list-dir")) {
+        return toolListDir(arena, args);
+    }
+    if (tools.eql(cmd, "cwd")) {
+        return toolCwd(arena);
+    }
+    if (tools.eql(cmd, "run-cmd")) {
+        return toolRunCmd(arena, args);
+    }
+    if (tools.eql(cmd, "commit")) {
+        return toolCommit(arena, args);
+    }
+    if (tools.eql(cmd, "add-summary")) {
+        return toolAddSummary(arena, args);
+    }
+    if (tools.eql(cmd, "history")) {
+        return toolHistory(arena, args);
     }
 
     try toolHelp();
@@ -233,6 +363,51 @@ fn toolHelp() !void {
         \\      "name": "show-function",
         \\      "description": "Extract a function body",
         \\      "args": ["<file>", "<function_name>"]
+        \\    },
+        \\    {
+        \\      "name": "read-file",
+        \\      "description": "Read a project file",
+        \\      "args": ["<path>"]
+        \\    },
+        \\    {
+        \\      "name": "write-file",
+        \\      "description": "Write content to a file (JSON input via -f)",
+        \\      "args": ["-f", "<json_file>"]
+        \\    },
+        \\    {
+        \\      "name": "edit-file",
+        \\      "description": "Edit file with search/replace (JSON input via -f)",
+        \\      "args": ["-f", "<json_file>"]
+        \\    },
+        \\    {
+        \\      "name": "list-dir",
+        \\      "description": "List directory contents",
+        \\      "args": ["<path>"]
+        \\    },
+        \\    {
+        \\      "name": "cwd",
+        \\      "description": "Print working directory",
+        \\      "args": []
+        \\    },
+        \\    {
+        \\      "name": "run-cmd",
+        \\      "description": "Run a shell command (JSON input via -f)",
+        \\      "args": ["-f", "<json_file>"]
+        \\    },
+        \\    {
+        \\      "name": "commit",
+        \\      "description": "Git add -A and commit (JSON input via -f)",
+        \\      "args": ["-f", "<json_file>"]
+        \\    },
+        \\    {
+        \\      "name": "add-summary",
+        \\      "description": "Record experiment summary (JSON input via -f)",
+        \\      "args": ["-f", "<json_file>"]
+        \\    },
+        \\    {
+        \\      "name": "history",
+        \\      "description": "Show recent experiment history",
+        \\      "args": ["[count]"]
         \\    }
         \\  ]
         \\}
@@ -1336,4 +1511,671 @@ fn countLines(content: []const u8) u32 {
     }
     std.debug.assert(count > 0);
     return count;
+}
+
+// ============================================================
+// Tool: read-file — read a project file by relative path
+// ============================================================
+
+fn toolReadFile(
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    if (args.len < 1) {
+        try tools.writeJsonError(error.MissingArgument);
+        std.process.exit(1);
+    }
+    const path = args[0];
+    std.debug.assert(path.len > 0);
+    if (!isAllowedReadPath(path)) {
+        const msg = try std.fmt.allocPrint(
+            arena,
+            "Error: read not allowed for '{s}'. " ++
+                "Only project files are accessible.",
+            .{path},
+        );
+        try tools.writeStdout(msg);
+        std.process.exit(1);
+    }
+    const fs_path = try tools.resolveToFs(arena, path);
+    const content = tools.readFile(arena, fs_path) catch {
+        const msg = try std.fmt.allocPrint(
+            arena,
+            "Error: cannot read '{s}'",
+            .{path},
+        );
+        try tools.writeStdout(msg);
+        std.process.exit(1);
+    };
+    try tools.writeStdout(content);
+}
+
+// ============================================================
+// Tool: write-file — write content to a project file
+// ============================================================
+
+fn toolWriteFile(
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    const obj = readJsonInput(arena, args) orelse {
+        try tools.writeJsonError(error.InvalidInput);
+        std.process.exit(1);
+    };
+    const path = getJsonString(obj, "path") orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'path' field",
+        );
+        std.process.exit(1);
+    };
+    const content = getJsonString(
+        obj,
+        "content",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'content' field",
+        );
+        std.process.exit(1);
+    };
+    std.debug.assert(path.len > 0);
+    if (!isAllowedWritePath(path)) {
+        const err_msg = try std.fmt.allocPrint(
+            arena,
+            "Error: write not allowed to '{s}'",
+            .{path},
+        );
+        try tools.writeStdout(err_msg);
+        std.process.exit(1);
+    }
+    const fs_path = try tools.resolveToFs(arena, path);
+    const file = try std.fs.cwd().createFile(
+        fs_path,
+        .{},
+    );
+    defer file.close();
+    try file.writeAll(content);
+    const ok_msg = try std.fmt.allocPrint(
+        arena,
+        "OK: wrote {d} bytes to {s}",
+        .{ content.len, path },
+    );
+    try tools.writeStdout(ok_msg);
+}
+
+// ============================================================
+// Tool: edit-file — search/replace edit on a project file
+// ============================================================
+
+fn toolEditFile(
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    const obj = readJsonInput(arena, args) orelse {
+        try tools.writeJsonError(error.InvalidInput);
+        std.process.exit(1);
+    };
+    const path = getJsonString(obj, "path") orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'path' field",
+        );
+        std.process.exit(1);
+    };
+    const old_text = getJsonString(
+        obj,
+        "old_content",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'old_content'",
+        );
+        std.process.exit(1);
+    };
+    const new_text = getJsonString(
+        obj,
+        "new_content",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'new_content'",
+        );
+        std.process.exit(1);
+    };
+    std.debug.assert(path.len > 0);
+    if (!isAllowedWritePath(path)) {
+        const err_msg = try std.fmt.allocPrint(
+            arena,
+            "Error: edit not allowed for '{s}'",
+            .{path},
+        );
+        try tools.writeStdout(err_msg);
+        std.process.exit(1);
+    }
+    if (old_text.len == 0) {
+        try tools.stdout_file.writeAll(
+            "Error: old_content is empty",
+        );
+        std.process.exit(1);
+    }
+    try applyEdit(arena, path, old_text, new_text);
+}
+
+/// Apply a search/replace edit: find old_text in the file
+/// at path, verify it is unique, and replace with new_text.
+fn applyEdit(
+    arena: Allocator,
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+) !void {
+    std.debug.assert(path.len > 0);
+    std.debug.assert(old_text.len > 0);
+
+    const fs_path = try tools.resolveToFs(arena, path);
+    const current = try tools.readFile(arena, fs_path);
+    const pos = std.mem.indexOf(
+        u8,
+        current,
+        old_text,
+    ) orelse {
+        const preview = tools.truncate(old_text, 100);
+        const err_msg = try std.fmt.allocPrint(
+            arena,
+            "Error: old_content not found in {s}. " ++
+                "Searched for: \"{s}...\" ({d} chars).",
+            .{ path, preview, old_text.len },
+        );
+        try tools.writeStdout(err_msg);
+        std.process.exit(1);
+    };
+    // Check for ambiguous matches.
+    const after_first = pos + old_text.len;
+    if (after_first < current.len) {
+        if (std.mem.indexOf(
+            u8,
+            current[after_first..],
+            old_text,
+        ) != null) {
+            try tools.stdout_file.writeAll(
+                "Error: old_content matches multiple " ++
+                    "locations. Make it more specific.",
+            );
+            std.process.exit(1);
+        }
+    }
+    const new_file = try std.fmt.allocPrint(
+        arena,
+        "{s}{s}{s}",
+        .{
+            current[0..pos],
+            new_text,
+            current[after_first..],
+        },
+    );
+    const file = try std.fs.cwd().createFile(
+        fs_path,
+        .{},
+    );
+    defer file.close();
+    try file.writeAll(new_file);
+    const ok_msg = try std.fmt.allocPrint(
+        arena,
+        "OK: edited {s} (-{d} +{d} chars, " ++
+            "{d} bytes total)",
+        .{
+            path,
+            old_text.len,
+            new_text.len,
+            new_file.len,
+        },
+    );
+    try tools.writeStdout(ok_msg);
+}
+
+// ============================================================
+// Tool: list-dir — list directory contents
+// ============================================================
+
+fn toolListDir(
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    if (args.len < 1) {
+        try tools.writeJsonError(error.MissingArgument);
+        std.process.exit(1);
+    }
+    const path = args[0];
+    std.debug.assert(path.len > 0);
+    if (!isAllowedReadPath(path)) {
+        const err_msg = try std.fmt.allocPrint(
+            arena,
+            "Error: listing not allowed for '{s}'",
+            .{path},
+        );
+        try tools.writeStdout(err_msg);
+        std.process.exit(1);
+    }
+    const fs_path = try tools.resolveToFs(arena, path);
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &.{ "/bin/ls", "-la", fs_path },
+        .max_output_bytes = MAX_COMMAND_OUTPUT,
+    }) catch |err| {
+        const err_msg = try std.fmt.allocPrint(
+            arena,
+            "Error: ls failed: {s}",
+            .{@errorName(err)},
+        );
+        try tools.writeStdout(err_msg);
+        std.process.exit(1);
+    };
+    const ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (result.stdout.len > 0) {
+        try tools.writeStdout(result.stdout);
+    }
+    if (!ok) std.process.exit(1);
+}
+
+// ============================================================
+// Tool: cwd — print working directory
+// ============================================================
+
+fn toolCwd(arena: Allocator) !void {
+    const abs = try tools.cwdAbsolute(arena);
+    try tools.writeStdout(abs);
+}
+
+// ============================================================
+// Tool: run-cmd — run a shell command
+// ============================================================
+
+fn toolRunCmd(
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    const obj = readJsonInput(arena, args) orelse {
+        try tools.writeJsonError(error.InvalidInput);
+        std.process.exit(1);
+    };
+    const command = getJsonString(
+        obj,
+        "command",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'command' field",
+        );
+        std.process.exit(1);
+    };
+    if (command.len == 0) {
+        try tools.stdout_file.writeAll(
+            "Error: empty command",
+        );
+        std.process.exit(1);
+    }
+    try runShellCommand(arena, command);
+}
+
+/// Execute a shell command via /bin/sh -c and write
+/// combined stdout/stderr to our stdout.
+fn runShellCommand(
+    arena: Allocator,
+    command: []const u8,
+) !void {
+    std.debug.assert(command.len > 0);
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &.{ "/bin/sh", "-c", command },
+        .max_output_bytes = MAX_COMMAND_OUTPUT,
+    }) catch |err| {
+        const err_msg = try std.fmt.allocPrint(
+            arena,
+            "Error: spawn failed: {s}",
+            .{@errorName(err)},
+        );
+        try tools.writeStdout(err_msg);
+        std.process.exit(1);
+    };
+    const exit_code: ?u32 = switch (result.term) {
+        .Exited => |code| @as(?u32, code),
+        else => null,
+    };
+    if (result.stdout.len > 0) {
+        try tools.stdout_file.writeAll(result.stdout);
+    }
+    if (result.stderr.len > 0) {
+        if (result.stdout.len > 0) {
+            try tools.stdout_file.writeAll(
+                "\n--- stderr ---\n",
+            );
+        }
+        try tools.stdout_file.writeAll(result.stderr);
+    }
+    if (exit_code) |code| {
+        if (code != 0) {
+            const exit_msg = try std.fmt.allocPrint(
+                arena,
+                "\n(exit code {d})",
+                .{code},
+            );
+            try tools.writeStdout(exit_msg);
+        }
+    }
+}
+
+// ============================================================
+// Tool: commit — git add -A and commit
+// ============================================================
+
+fn toolCommit(
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    const obj = readJsonInput(arena, args) orelse {
+        try tools.writeJsonError(error.InvalidInput);
+        std.process.exit(1);
+    };
+    const msg = getJsonString(
+        obj,
+        "message",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'message' field",
+        );
+        std.process.exit(1);
+    };
+    if (msg.len == 0) {
+        try tools.stdout_file.writeAll(
+            "Error: empty commit message",
+        );
+        std.process.exit(1);
+    }
+    // Write commit message to temp file to avoid
+    // shell quoting issues.
+    const msg_path = try tools.resolveToFs(
+        arena,
+        HISTORY_DIR ++ "/_commit_msg.txt",
+    );
+    const msg_file = try std.fs.cwd().createFile(
+        msg_path,
+        .{},
+    );
+    try msg_file.writeAll(msg);
+    msg_file.close();
+
+    const cmd = try std.fmt.allocPrint(
+        arena,
+        "git add -A && git commit -F '{s}' " ++
+            "&& rm -f '{s}'",
+        .{ msg_path, msg_path },
+    );
+    try runShellCommand(arena, cmd);
+}
+
+// ============================================================
+// Tool: add-summary — record an experiment summary
+// ============================================================
+
+fn toolAddSummary(
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    const obj = readJsonInput(arena, args) orelse {
+        try tools.writeJsonError(error.InvalidInput);
+        std.process.exit(1);
+    };
+    const summary = getJsonString(
+        obj,
+        "summary",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'summary' field",
+        );
+        std.process.exit(1);
+    };
+    if (summary.len == 0) {
+        try tools.stdout_file.writeAll(
+            "Error: empty summary",
+        );
+        std.process.exit(1);
+    }
+    const next_id = countSummaryLines(arena) + 1;
+    try appendSummary(arena, next_id, summary);
+    const out = try std.fmt.allocPrint(
+        arena,
+        "Summary #{d} recorded.",
+        .{next_id},
+    );
+    try tools.writeStdout(out);
+}
+
+/// Count existing summary lines in the summaries file.
+fn countSummaryLines(arena: Allocator) u32 {
+    const fs_path = tools.resolveToFs(
+        arena,
+        SUMMARIES_PATH,
+    ) catch return 0;
+    const file = std.fs.cwd().openFile(
+        fs_path,
+        .{},
+    ) catch return 0;
+    defer file.close();
+    const content = file.readToEndAlloc(
+        arena,
+        MAX_HISTORY_SIZE,
+    ) catch return 0;
+    var count: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        if (line.len >= 2) count += 1;
+    }
+    return count;
+}
+
+/// Append a JSON summary line to the summaries file.
+fn appendSummary(
+    arena: Allocator,
+    experiment_number: u32,
+    text: []const u8,
+) !void {
+    std.debug.assert(text.len > 0);
+    std.debug.assert(experiment_number > 0);
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = formatTimestamp(&ts_buf);
+
+    // Truncate at sentence boundary (max 500 chars).
+    const trimmed = truncateAtSentence(text, 500);
+
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(arena, "{\"experiment\":");
+    const num_str = try std.fmt.allocPrint(
+        arena,
+        "{d}",
+        .{experiment_number},
+    );
+    try buf.appendSlice(arena, num_str);
+    try buf.appendSlice(arena, ",\"timestamp\":\"");
+    try buf.appendSlice(arena, ts);
+    try buf.appendSlice(arena, "\",\"summary\":\"");
+    for (trimmed) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(arena, "\\\""),
+            '\\' => try buf.appendSlice(arena, "\\\\"),
+            '\n' => try buf.append(arena, ' '),
+            '\r' => {},
+            else => try buf.append(arena, c),
+        }
+    }
+    try buf.appendSlice(arena, "\"}\n");
+
+    const fs_path = try tools.resolveToFs(
+        arena,
+        SUMMARIES_PATH,
+    );
+    const file = std.fs.cwd().createFile(
+        fs_path,
+        .{ .truncate = false },
+    ) catch return;
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(buf.items) catch return;
+}
+
+/// Truncate text at a sentence boundary (. ! ? or ))
+/// within max_len characters.  Falls back to hard cut.
+fn truncateAtSentence(
+    text: []const u8,
+    max_len: usize,
+) []const u8 {
+    std.debug.assert(max_len > 0);
+    if (text.len <= max_len) return text;
+    var pos: usize = max_len;
+    while (pos > 0) {
+        pos -= 1;
+        const c = text[pos];
+        const is_ender = c == '.' or c == '!' or
+            c == '?' or c == ')';
+        if (!is_ender) continue;
+        if (pos + 1 >= max_len) {
+            return text[0 .. pos + 1];
+        }
+        const next = text[pos + 1];
+        if (next == ' ' or next == '\n' or
+            next == '\r')
+        {
+            return text[0 .. pos + 1];
+        }
+    }
+    return text[0..max_len];
+}
+
+// ============================================================
+// Tool: history — show recent experiment entries
+// ============================================================
+
+fn toolHistory(
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    const count: u32 = blk: {
+        if (args.len > 0) {
+            break :blk std.fmt.parseInt(
+                u32,
+                args[0],
+                10,
+            ) catch 5;
+        }
+        break :blk 5;
+    };
+    const capped = @min(count, 20);
+    if (capped == 0) {
+        try tools.writeStdout("[]");
+        return;
+    }
+    try emitHistoryJson(arena, capped);
+}
+
+/// Read the history file and emit the last N entries as
+/// a JSON array.
+fn emitHistoryJson(
+    arena: Allocator,
+    max_entries: u32,
+) !void {
+    std.debug.assert(max_entries > 0);
+    std.debug.assert(max_entries <= 20);
+
+    const fs_path = tools.resolveToFs(
+        arena,
+        HISTORY_PATH,
+    ) catch {
+        try tools.writeStdout("[]");
+        return;
+    };
+    const file = std.fs.cwd().openFile(
+        fs_path,
+        .{},
+    ) catch {
+        try tools.writeStdout("[]");
+        return;
+    };
+    defer file.close();
+    const content = file.readToEndAlloc(
+        arena,
+        MAX_HISTORY_SIZE,
+    ) catch {
+        try tools.writeStdout("[]");
+        return;
+    };
+    if (content.len == 0) {
+        try tools.writeStdout("[]");
+        return;
+    }
+    var lines: [512][]const u8 = undefined;
+    var line_count: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        if (line.len < 2) continue;
+        if (line_count < 512) {
+            lines[line_count] = line;
+            line_count += 1;
+        }
+    }
+    if (line_count == 0) {
+        try tools.writeStdout("[]");
+        return;
+    }
+    const start = if (line_count > max_entries)
+        line_count - max_entries
+    else
+        0;
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.append(arena, '[');
+    for (lines[start..line_count], 0..) |line, i| {
+        if (i > 0) try buf.appendSlice(arena, ",\n");
+        try buf.appendSlice(arena, line);
+    }
+    try buf.append(arena, ']');
+    try tools.writeStdout(buf.items);
+}
+
+// ============================================================
+// Path permission guards
+// ============================================================
+
+fn isAllowedReadPath(path: []const u8) bool {
+    std.debug.assert(path.len > 0);
+    if (std.mem.indexOf(u8, path, "..") != null) {
+        return false;
+    }
+    if (path[0] == '/') return false;
+    for (&ALLOWED_READ_FILES) |file| {
+        if (tools.eql(path, file)) return true;
+    }
+    for (&ALLOWED_READ_PREFIXES) |prefix| {
+        if (tools.startsWith(path, prefix)) return true;
+    }
+    for (&ALLOWED_WRITE_FILES) |file| {
+        if (tools.eql(path, file)) return true;
+    }
+    return false;
+}
+
+fn isAllowedWritePath(path: []const u8) bool {
+    std.debug.assert(path.len > 0);
+    if (std.mem.indexOf(u8, path, "..") != null) {
+        return false;
+    }
+    if (path[0] == '/') return false;
+    for (&ALLOWED_WRITE_FILES) |allowed| {
+        if (tools.eql(path, allowed)) return true;
+    }
+    return false;
 }

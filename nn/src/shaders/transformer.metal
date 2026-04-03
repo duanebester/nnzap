@@ -1137,6 +1137,143 @@ kernel void gqa_attention_f16io(
 }
 
 // ============================================================================
+// GQA Attention f16 I/O — Threadgroup Scores (short sequences)
+// ============================================================================
+
+/// Identical to gqa_attention_f16io but stores attention scores in
+/// threadgroup memory instead of a device-memory scratch buffer.
+/// This eliminates buffer(4) and replaces mem_device barriers with
+/// cheaper mem_threadgroup barriers.
+///
+/// Threadgroup memory budget:
+///   shared_buf = 256 × 4 B = 1 024 B
+///   tg_scores  = 1024 × 4 B = 4 096 B
+///   total      =              5 120 B  (< 32 KB limit)
+///
+/// Dispatch: 1 threadgroup per query head, 256 threads each.
+kernel void gqa_attention_f16io_tg(
+    device const half*   Q       [[buffer(0)]],
+    device const half*   k_cache [[buffer(1)]],
+    device const half*   v_cache [[buffer(2)]],
+    device half*         output  [[buffer(3)]],
+    constant GQADims&    dims    [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    const uint THREADS = 256;
+    const uint SIMD_SIZE = 32;
+    const uint NUM_SIMD_GROUPS = THREADS / SIMD_SIZE;
+    const uint TG_SEQ_MAX = 1024;
+    const uint head = tgid;
+
+    if (head >= dims.num_query_heads) return;
+
+    const uint kv_head = head / dims.heads_per_kv_group;
+    const uint head_dim = dims.head_dim;
+    const uint seq_len = dims.seq_len;
+    const uint max_ctx = dims.max_context_length;
+
+    // Guard: dispatch side must route long sequences to the
+    // device-memory variant.
+    if (seq_len > TG_SEQ_MAX) return;
+
+    const uint simd_group = tid / SIMD_SIZE;
+    const uint simd_lane = tid % SIMD_SIZE;
+
+    // Pointers for this head.
+    device const half* q = Q + head * head_dim;
+    const uint kv_stride = max_ctx * head_dim;
+    device const half* k = k_cache + kv_head * kv_stride;
+    device const half* v = v_cache + kv_head * kv_stride;
+
+    // Scaling factor: 1 / sqrt(head_dim).
+    const float inv_sqrt_d = rsqrt(float(head_dim));
+
+    // Threadgroup allocations.
+    threadgroup float shared_buf[256];
+    threadgroup float tg_scores[TG_SEQ_MAX];
+
+    // ── Load Q into threadgroup memory (f16 → f32) ──────────
+    if (tid < head_dim) {
+        shared_buf[tid] = float(q[tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Step 1: Compute attention scores ─────────────────────
+    for (uint t = tid; t < seq_len; t += THREADS) {
+        float dot_product = 0.0f;
+        for (uint d = 0; d < head_dim; d++) {
+            dot_product +=
+                shared_buf[d]
+                * float(k[t * head_dim + d]);
+        }
+        tg_scores[t] = dot_product * inv_sqrt_d;
+    }
+
+    // Ensure all scores are written before reading them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Step 2: Softmax — find max (numerical stability) ─────
+    float local_max = -INFINITY;
+    for (uint t = tid; t < seq_len; t += THREADS) {
+        local_max = max(local_max, tg_scores[t]);
+    }
+
+    // Intra-SIMD reduction: 32 → 1, no barrier needed.
+    const float warp_max = simd_max(local_max);
+
+    // Inter-SIMD reduction.
+    if (simd_lane == 0) {
+        shared_buf[simd_group] = warp_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float max_score = shared_buf[0];
+    for (uint i = 1; i < NUM_SIMD_GROUPS; i++) {
+        max_score = max(max_score, shared_buf[i]);
+    }
+
+    // ── Step 3: Compute exp(score − max) and sum ─────────────
+    float local_sum = 0.0f;
+    for (uint t = tid; t < seq_len; t += THREADS) {
+        const float e = exp(tg_scores[t] - max_score);
+        tg_scores[t] = e;
+        local_sum += e;
+    }
+
+    // Intra-SIMD reduction: 32 → 1, no barrier needed.
+    const float warp_sum = simd_sum(local_sum);
+
+    if (simd_lane == 0) {
+        shared_buf[simd_group] = warp_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sum_exp = shared_buf[0];
+    for (uint i = 1; i < NUM_SIMD_GROUPS; i++) {
+        sum_exp += shared_buf[i];
+    }
+
+    // ── Step 4: Normalize scores to attention weights ────────
+    for (uint t = tid; t < seq_len; t += THREADS) {
+        tg_scores[t] /= sum_exp;
+    }
+
+    // Ensure all weights are visible before V summation.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Step 5: Weighted sum of V, write f16 output ──────────
+    for (uint d = tid; d < head_dim; d += THREADS) {
+        float accum = 0.0f;
+        for (uint t = 0; t < seq_len; t++) {
+            accum +=
+                tg_scores[t] * float(v[t * head_dim + d]);
+        }
+        output[head * head_dim + d] = half(accum);
+    }
+}
+
+// ============================================================================
 // Fused SiLU + Elementwise Mul f16
 // ============================================================================
 

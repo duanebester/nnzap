@@ -26,11 +26,21 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // ── Autoresearch CLI ──────────────────────────────────────────────
-    const autoresearch = b.addExecutable(.{
-        .name = "autoresearch",
+    const agent_core_module = b.createModule(.{
+        .root_source_file = b.path("src/agent_core.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "api_client.zig", .module = api_client_module },
+            .{ .name = "tools.zig", .module = tools_module },
+        },
+    });
+
+    // ── MNIST research CLI ────────────────────────────────────────────
+    const mnist_research = b.addExecutable(.{
+        .name = "mnist_research",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/autoresearch.zig"),
+            .root_source_file = b.path("src/mnist_research.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -38,21 +48,21 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(autoresearch);
+    b.installArtifact(mnist_research);
 
-    const ar_step = b.step("autoresearch", "Benchmark comparison and sweep");
-    const ar_cmd = b.addRunArtifact(autoresearch);
-    ar_step.dependOn(&ar_cmd.step);
-    ar_cmd.step.dependOn(b.getInstallStep());
+    const mr_step = b.step("mnist-research", "MNIST training research and benchmarking");
+    const mr_cmd = b.addRunArtifact(mnist_research);
+    mr_step.dependOn(&mr_cmd.step);
+    mr_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        ar_cmd.addArgs(args);
+        mr_cmd.addArgs(args);
     }
 
-    // ── Engine research CLI ───────────────────────────────────────────
-    const engine_research = b.addExecutable(.{
-        .name = "engine_research",
+    // ── Bonsai research CLI ───────────────────────────────────────────
+    const bonsai_research = b.addExecutable(.{
+        .name = "bonsai_research",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/engine_research.zig"),
+            .root_source_file = b.path("src/bonsai_research.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -60,60 +70,59 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(engine_research);
+    b.installArtifact(bonsai_research);
 
-    const er_step = b.step("engine-research", "Engine code research and benchmarking");
-    const er_cmd = b.addRunArtifact(engine_research);
-    er_step.dependOn(&er_cmd.step);
-    er_cmd.step.dependOn(b.getInstallStep());
+    const br_step = b.step("bonsai-research", "Bonsai inference research and benchmarking");
+    const br_cmd = b.addRunArtifact(bonsai_research);
+    br_step.dependOn(&br_cmd.step);
+    br_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        er_cmd.addArgs(args);
+        br_cmd.addArgs(args);
     }
 
-    // ── Agent (LLM experiment runner) ─────────────────────────────────
-    const agent = b.addExecutable(.{
-        .name = "agent",
+    // ── MNIST agent (LLM experiment runner) ───────────────────────────
+    const mnist_agent = b.addExecutable(.{
+        .name = "mnist_agent",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/agent.zig"),
+            .root_source_file = b.path("src/mnist_agent.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "api_client.zig", .module = api_client_module },
+                .{ .name = "agent_core.zig", .module = agent_core_module },
             },
         }),
     });
-    b.installArtifact(agent);
+    b.installArtifact(mnist_agent);
 
-    const agent_step = b.step("agent", "Autonomous experiment runner");
-    const agent_cmd = b.addRunArtifact(agent);
-    agent_step.dependOn(&agent_cmd.step);
-    agent_cmd.step.dependOn(b.getInstallStep());
+    const ma_step = b.step("mnist-agent", "Autonomous MNIST experiment runner");
+    const ma_cmd = b.addRunArtifact(mnist_agent);
+    ma_step.dependOn(&ma_cmd.step);
+    ma_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        agent_cmd.addArgs(args);
+        ma_cmd.addArgs(args);
     }
 
-    // ── Engine agent (LLM engine optimiser) ───────────────────────────
-    const engine_agent = b.addExecutable(.{
-        .name = "engine_agent",
+    // ── Bonsai agent (LLM engine optimiser) ───────────────────────────
+    const bonsai_agent = b.addExecutable(.{
+        .name = "bonsai_agent",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/engine_agent.zig"),
+            .root_source_file = b.path("src/bonsai_agent.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "tools.zig", .module = tools_module },
-                .{ .name = "api_client.zig", .module = api_client_module },
+                .{ .name = "agent_core.zig", .module = agent_core_module },
                 .{ .name = "ollama_client.zig", .module = ollama_client_module },
             },
         }),
     });
-    b.installArtifact(engine_agent);
+    b.installArtifact(bonsai_agent);
 
-    const ea_step = b.step("engine-agent", "Autonomous engine optimisation runner");
-    const ea_cmd = b.addRunArtifact(engine_agent);
-    ea_step.dependOn(&ea_cmd.step);
-    ea_cmd.step.dependOn(b.getInstallStep());
+    const ba_step = b.step("bonsai-agent", "Autonomous engine optimisation runner");
+    const ba_cmd = b.addRunArtifact(bonsai_agent);
+    ba_step.dependOn(&ba_cmd.step);
+    ba_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        ea_cmd.addArgs(args);
+        ba_cmd.addArgs(args);
     }
 
     // ── Tests ─────────────────────────────────────────────────────────

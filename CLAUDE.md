@@ -32,11 +32,37 @@ nn/
 └── data/mnist/                               MNIST raw dataset
                               ──────
                               22,542 lines total
+
+zap/
+├── build.zig                                 Build config
+├── build.zig.zon                             Package manifest
+├── src/
+│   ├── agent_core.zig        1,940 lines   Shared agent framework
+│   ├── api_client.zig          802 lines   Anthropic HTTP client
+│   ├── bonsai_agent.zig        939 lines   Bonsai profile + two-tier
+│   ├── bonsai_research.zig   2,181 lines   Bonsai toolbox binary
+│   ├── mnist_agent.zig         132 lines   MNIST profile config
+│   ├── mnist_research.zig    1,100 lines   MNIST toolbox binary
+│   ├── ollama_client.zig     1,065 lines   Local LLM client
+│   └── tools.zig               630 lines   Shared CLI/file utilities
+├── programs/
+│   ├── bonsai_executor.md                    Bonsai two-tier executor prompt
+│   ├── bonsai_program.md                     Bonsai skill file
+│   ├── bonsai_strategist.md                  Bonsai two-tier strategist prompt
+│   ├── bonsai_system.md                      Bonsai system prompt
+│   ├── bonsai_tools.json                     Bonsai tool schemas
+│   ├── mnist_program.md                      MNIST skill file
+│   ├── mnist_system.md                       MNIST system prompt
+│   ├── mnist_tools.json                      MNIST tool schemas
+│   └── program.md                            Shared conventions
+├── benchmarks/                               JSON benchmark results
+└── data/mnist/                               MNIST raw dataset
 ```
 
-Heavy hitters: `transformer.zig`, `network.zig`, `compute.metal` (~11k lines, half the codebase).
+Heavy hitters: `transformer.zig`, `network.zig`, `compute.metal` (~11k lines, half the nn codebase).
 Comptime spine: `layout.zig` resolves all buffer shapes at compile time.
 Two shader files: `compute.metal` (general NN kernels) and `transformer.metal` (attention-specific).
+Agent spine: `agent_core.zig` provides the shared experiment loop; profiles (`mnist_agent.zig`, `bonsai_agent.zig`) configure it.
 
 ### 0. **Simplicity and Elegance**
 

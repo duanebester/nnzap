@@ -9,6 +9,8 @@ zap/zig-out/
 zap/zig-cache/
 zap/.zig-cache/
 
+.venv
+
 nn/data/mnist/*
 zap/data/mnist/*
 

@@ -514,13 +514,75 @@ fn formatConfigJson(
 // Tool: config-set
 // ============================================================
 
+/// Read settings from a -f JSON input file.
+/// Falls back to positional args if -f is not present.
+fn resolveConfigArgs(
+    arena: Allocator,
+    args: []const []const u8,
+) []const []const u8 {
+    std.debug.assert(args.len > 0);
+
+    // Check for -f flag.
+    if (args.len >= 2 and tools.eql(args[0], "-f")) {
+        const path = args[1];
+        const content = tools.readFile(
+            arena,
+            path,
+        ) catch return args;
+
+        // Clean up temp file.
+        std.fs.cwd().deleteFile(path) catch {};
+
+        const parsed = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            arena,
+            content,
+            .{},
+        ) catch return args;
+
+        const obj = switch (parsed) {
+            .object => |o| o,
+            else => return args,
+        };
+
+        const arr_val = obj.get("settings") orelse
+            return args;
+        const arr = switch (arr_val) {
+            .array => |a| a.items,
+            else => return args,
+        };
+        if (arr.len == 0) return args;
+
+        const result = arena.alloc(
+            []const u8,
+            arr.len,
+        ) catch return args;
+        var count: usize = 0;
+        for (arr) |item| {
+            switch (item) {
+                .string => |s| {
+                    result[count] = s;
+                    count += 1;
+                },
+                else => {},
+            }
+        }
+        if (count == 0) return args;
+        return result[0..count];
+    }
+
+    // No -f flag — use positional args as-is.
+    return args;
+}
+
 fn toolConfigSet(
     arena: Allocator,
     args: []const []const u8,
 ) !void {
     if (args.len == 0) return error.NoConfigArgs;
 
-    const changes = parseConfigArgs(args);
+    const resolved = resolveConfigArgs(arena, args);
+    const changes = parseConfigArgs(resolved);
     const main_fs = try tools.resolveToFs(
         arena,
         MAIN_PATH,

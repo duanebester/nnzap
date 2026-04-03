@@ -70,14 +70,24 @@ nnzap/
 │   ├── build.zig                  # CLI tools build
 │   ├── build.zig.zon              # Package manifest
 │   ├── src/
-│   │   ├── autoresearch.zig       # Hyperparameter research CLI
-│   │   ├── agent.zig              # LLM-powered hyperparameter agent
-│   │   ├── engine_research.zig    # Engine research CLI (snapshot/rollback/bench)
-│   │   └── engine_agent.zig       # LLM-powered engine optimisation agent
+│   │   ├── agent_core.zig         # Shared agent framework (loop, dispatch, API)
+│   │   ├── mnist_agent.zig        # MNIST training agent (profile config)
+│   │   ├── mnist_research.zig     # MNIST research CLI (config/train/bench)
+│   │   ├── bonsai_agent.zig       # Bonsai inference agent (profile config + two-tier)
+│   │   ├── bonsai_research.zig    # Bonsai research CLI (snapshot/rollback/bench/edit)
+│   │   ├── api_client.zig         # Anthropic HTTP client
+│   │   ├── ollama_client.zig      # Local LLM client (two-tier mode)
+│   │   └── tools.zig              # Shared CLI/file utilities
 │   ├── programs/
-│   │   ├── program.md             # Agent instructions for hyperparameter experiments
-│   │   ├── agent_program.md       # Agent architecture documentation
-│   │   └── engine_program.md      # Agent instructions for engine optimisation
+│   │   ├── program.md             # Shared conventions
+│   │   ├── mnist_program.md       # MNIST agent skill file
+│   │   ├── mnist_system.md        # MNIST system prompt
+│   │   ├── mnist_tools.json       # MNIST tool schemas
+│   │   ├── bonsai_program.md      # Bonsai agent skill file
+│   │   ├── bonsai_system.md       # Bonsai system prompt
+│   │   ├── bonsai_tools.json      # Bonsai tool schemas
+│   │   ├── bonsai_strategist.md   # Two-tier strategist prompt
+│   │   └── bonsai_executor.md     # Two-tier executor prompt
 ├── reference/
 │   ├── mlx_reference.py           # MLX baseline for comparison
 │   └── pytorch_reference.py       # PyTorch baseline for comparison
@@ -214,20 +224,22 @@ try bench.save("mnist");
 
 ## Autoresearch
 
-The `zap/` package contains tools for autonomous ML experiment loops.
+The `zap/` package contains tools for autonomous ML experiment loops,
+built on a shared agent framework (`agent_core.zig`) with pluggable
+research profiles.
 
 ### How it works
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ autoresearch │────>│  nn (build   │────>│  benchmarks/  │
-│ CLI tool     │     │  + run)      │     │  JSON results │
-└──────────────┘     └──────────────┘     └──────────────┘
-      │                                         │
-      └──────── compare / config-set ───────────┘
+┌────────────────┐     ┌──────────────┐     ┌──────────────┐
+│ mnist_research │────>│  nn (build   │────>│  benchmarks/  │
+│ CLI toolbox    │     │  + run)      │     │  JSON results │
+└────────────────┘     └──────────────┘     └──────────────┘
+        │                                         │
+        └──────── compare / config-set ───────────┘
 ```
 
-### Quick start
+### MNIST research (hyperparameter optimisation)
 
 ```bash
 # Build both packages
@@ -236,42 +248,53 @@ cd zap && zig build && cd ..
 
 # Run from zap directory
 cd zap
-./zig-out/bin/autoresearch help
-./zig-out/bin/autoresearch config-show
-./zig-out/bin/autoresearch train
-./zig-out/bin/autoresearch benchmark-compare
+./zig-out/bin/mnist_research help
+./zig-out/bin/mnist_research config-show
+./zig-out/bin/mnist_research train
+./zig-out/bin/mnist_research benchmark-compare
 ```
 
-### Agent mode
+### MNIST agent
 
-The agent wraps autoresearch with an LLM (Claude) that decides what
+The agent wraps mnist_research with an LLM (Claude) that decides what
 experiments to run:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 cd zap
 zig build
-./zig-out/bin/agent
+./zig-out/bin/mnist_agent
 ```
 
-## Engine research
+### Bonsai research (inference optimisation)
 
-Engine research targets the core library code — Metal kernels, dispatch
+Bonsai research targets the core library code — Metal kernels, dispatch
 strategies, buffer layouts:
 
 ```bash
 cd zap
-./zig-out/bin/engine_research help
-./zig-out/bin/engine_research snapshot
-./zig-out/bin/engine_research bench
+./zig-out/bin/bonsai_research help
+./zig-out/bin/bonsai_research snapshot
+./zig-out/bin/bonsai_research bench
 ```
 
-### Engine agent
+### Bonsai agent
+
+Single-tier (Claude drives everything):
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 cd zap
-./zig-out/bin/engine_agent
+./zig-out/bin/bonsai_agent
+```
+
+Two-tier (Opus strategist + local LLM executor):
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+export LOCAL_LLM_MODEL=default
+cd zap
+./zig-out/bin/bonsai_agent
 ```
 
 ## Status
