@@ -1,7 +1,7 @@
 //! nnzap tools — shared utilities for AI agent toolboxes.
 //!
-//! Common infrastructure used by `bonsai_research.zig`
-//! and `mnist_research.zig`: benchmark JSON types, file
+//! Common infrastructure used by `bonsai_researcher.zig`
+//! and `mnist_researcher.zig`: benchmark JSON types, file
 //! I/O, path resolution, JSON/string helpers, and benchmark
 //! comparison logic.
 //!

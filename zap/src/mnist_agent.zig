@@ -2,12 +2,12 @@
 //!
 //! Configures the generic agent loop for MNIST
 //! hyperparameter optimisation.  All tool logic lives
-//! in the mnist_research toolbox binary.
+//! in the mnist_researcher toolbox binary.
 //!
 //! This profile demonstrates extending the standard
 //! toolset with domain-specific tools.  The four
 //! config_* tools are MNIST-specific (implemented via
-//! custom_dispatch in mnist_research.zig); every other
+//! custom_dispatch in mnist_researcher.zig); every other
 //! tool is provided by the generic toolbox.
 //!
 //! Usage:
@@ -36,7 +36,7 @@ const HISTORY_DIR: []const u8 = ".mnist_history";
 //
 // The first four tools (config_*) are MNIST-specific
 // — they manipulate hyperparameters in main.zig via
-// custom_dispatch in mnist_research.zig.  Everything
+// custom_dispatch in mnist_researcher.zig.  Everything
 // else is the standard generic toolset provided by
 // toolbox.zig.
 // ============================================================
@@ -369,7 +369,7 @@ const mnist_tools = [_]core.ToolDef{
 
 const config = core.AgentConfig{
     .name = "mnist",
-    .toolbox_path = "./zig-out/bin/mnist_research",
+    .toolbox_path = "./zig-out/bin/mnist_researcher",
     .history_dir = HISTORY_DIR,
     .system_prompt_path = "programs/mnist_system.md",
     .tool_schemas = core.toolSchemas(&mnist_tools),
@@ -396,7 +396,7 @@ pub fn main() void {
         api.log(
             "Hint: if the agent edited source files " ++
                 "before crashing, run:\n" ++
-                "  ./zig-out/bin/mnist_research " ++
+                "  ./zig-out/bin/mnist_researcher " ++
                 "rollback-latest\n",
             .{},
         );

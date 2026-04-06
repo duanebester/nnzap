@@ -283,7 +283,7 @@ pub const AgentConfig = struct {
     // Limits (Rule 4 — hard caps).
     max_experiments: u32 = 50,
     max_turns_per_experiment: u32 = 80,
-    turn_warning_threshold: u32 = 70,
+
     max_messages: u32 = 512,
     max_tool_calls: u32 = 16,
     max_tool_output: usize = 50_000,
@@ -660,16 +660,14 @@ fn executeAndAppendTools(
         results,
     );
 
-    // Inject turn-limit warning near the end.
-    if (turn + 1 >= config.turn_warning_threshold) {
-        injectTurnWarning(
-            config,
-            arena,
-            messages,
-            count.*,
-            turn,
-        );
-    }
+    // Always tell the LLM which turn it is.
+    injectTurnStatus(
+        config,
+        arena,
+        messages,
+        count.*,
+        turn,
+    );
 
     count.* += 1;
 
@@ -763,36 +761,29 @@ fn logToolResults(
 
 /// Inject a turn-limit warning into the tool results
 /// message so the agent knows to wrap up.
-fn injectTurnWarning(
+fn injectTurnStatus(
     config: *const AgentConfig,
     arena: Allocator,
     messages: *[512][]const u8,
     idx: u32,
     turn: u32,
 ) void {
-    const remaining =
-        config.max_turns_per_experiment - turn - 1;
-    const warn = std.fmt.allocPrint(
+    const status = std.fmt.allocPrint(
         arena,
         ",{{\"type\":\"text\",\"text\":" ++
-            "\"WARNING: {d} turns remaining " ++
-            "out of {d}. Wrap up NOW. " ++
-            "If your current approach is not " ++
-            "working, rollback and add_summary " ++
-            "describing what you tried, then " ++
-            "STOP.\"}}]}}",
-        .{ remaining, config.max_turns_per_experiment },
+            "\"[Turn {d}/{d}]\"}}]}}",
+        .{ turn + 1, config.max_turns_per_experiment },
     ) catch return;
 
     const prev = messages[idx];
     if (prev.len < 2) return;
 
-    // Replace closing "]}" with warning + "]}".
+    // Replace closing "]}" with status + "]}".
     const trimmed = prev[0 .. prev.len - 2];
     messages[idx] = std.fmt.allocPrint(
         arena,
         "{s}{s}",
-        .{ trimmed, warn },
+        .{ trimmed, status },
     ) catch prev;
 }
 

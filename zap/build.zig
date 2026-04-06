@@ -39,11 +39,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // ── MNIST research CLI ────────────────────────────────────────────
-    const mnist_research = b.addExecutable(.{
-        .name = "mnist_research",
+    // ── MNIST researcher CLI ──────────────────────────────────────────
+    const mnist_researcher = b.addExecutable(.{
+        .name = "mnist_researcher",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mnist_research.zig"),
+            .root_source_file = b.path("src/mnist_researcher.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -52,21 +52,21 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(mnist_research);
+    b.installArtifact(mnist_researcher);
 
-    const mr_step = b.step("mnist-research", "MNIST training research and benchmarking");
-    const mr_cmd = b.addRunArtifact(mnist_research);
+    const mr_step = b.step("mnist-researcher", "MNIST training research and benchmarking");
+    const mr_cmd = b.addRunArtifact(mnist_researcher);
     mr_step.dependOn(&mr_cmd.step);
     mr_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         mr_cmd.addArgs(args);
     }
 
-    // ── Bonsai research CLI ───────────────────────────────────────────
-    const bonsai_research = b.addExecutable(.{
-        .name = "bonsai_research",
+    // ── Bonsai researcher CLI ─────────────────────────────────────────
+    const bonsai_researcher = b.addExecutable(.{
+        .name = "bonsai_researcher",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bonsai_research.zig"),
+            .root_source_file = b.path("src/bonsai_researcher.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -75,10 +75,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(bonsai_research);
+    b.installArtifact(bonsai_researcher);
 
-    const br_step = b.step("bonsai-research", "Bonsai inference research and benchmarking");
-    const br_cmd = b.addRunArtifact(bonsai_research);
+    const br_step = b.step("bonsai-researcher", "Bonsai inference research and benchmarking");
+    const br_cmd = b.addRunArtifact(bonsai_researcher);
     br_step.dependOn(&br_cmd.step);
     br_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

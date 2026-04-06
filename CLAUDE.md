@@ -42,18 +42,14 @@ zap/
 │   ├── agent_core.zig        2,271 lines   Shared agent framework
 │   ├── api_client.zig          786 lines   Anthropic HTTP client
 │   ├── bonsai_agent.zig        468 lines   Bonsai agent profile
-│   ├── bonsai_research.zig      93 lines   Bonsai toolbox config
+│   ├── bonsai_researcher.zig    93 lines   Bonsai researcher config
 │   ├── mnist_agent.zig         529 lines   MNIST agent profile
-│   ├── mnist_research.zig      885 lines   MNIST toolbox config + custom tools
+│   ├── mnist_researcher.zig    885 lines   MNIST researcher config + custom tools
 │   ├── toolbox.zig            2,399 lines   Generic toolbox (shared)
 │   └── tools.zig               699 lines   Shared CLI/file utilities
 ├── programs/
-│   ├── autoresearch_framework.md             Autoresearch framework prompt
-│   ├── bonsai_program.md                     Bonsai skill file
 │   ├── bonsai_system.md                      Bonsai system prompt
-│   ├── mnist_program.md                      MNIST skill file
-│   ├── mnist_system.md                       MNIST system prompt
-│   └── program.md                            Shared conventions
+│   └── mnist_system.md                       MNIST system prompt
 ├── benchmarks/                               JSON benchmark results
 └── data/mnist/                               MNIST raw dataset
 ```
@@ -62,7 +58,7 @@ Heavy hitters: `transformer.zig`, `network.zig`, `compute.metal` (~14k lines, ha
 Comptime spine: `layout.zig` resolves all buffer shapes at compile time.
 Three shader files: `compute.metal` (general NN kernels), `transformer.metal` (attention-specific), `qmv_specialized.metal` (quantized matmul).
 Agent spine: `agent_core.zig` provides the shared experiment loop; profiles (`mnist_agent.zig`, `bonsai_agent.zig`) configure it.
-Toolbox spine: `toolbox.zig` provides all generic CLI tools; domain binaries (`bonsai_research.zig`, `mnist_research.zig`) are thin config wrappers.
+Toolbox spine: `toolbox.zig` provides all generic CLI tools; domain binaries (`bonsai_researcher.zig`, `mnist_researcher.zig`) are thin config wrappers.
 
 ### 0. **Simplicity and Elegance**
 

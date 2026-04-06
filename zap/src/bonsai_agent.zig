@@ -3,7 +3,7 @@
 //!
 //! Thin profile on agent_core.  Configures the generic
 //! agent loop for Bonsai inference optimisation.  All
-//! tool logic lives in the bonsai_research toolbox
+//! tool logic lives in the bonsai_researcher toolbox
 //! binary.
 //!
 //! Usage:
@@ -38,7 +38,7 @@ const CODE_CONTEXT_FILES = [_][]const u8{
 // Tool definitions (comptime)
 //
 // Each ToolDef declares the LLM-facing schema and maps
-// to a CLI subcommand on the bonsai_research toolbox
+// to a CLI subcommand on the bonsai_researcher toolbox
 // binary.  toolMappings() and toolSchemas() derive the
 // dispatch table and JSON schemas at comptime.
 // ============================================================
@@ -103,19 +103,11 @@ const bonsai_tools = [_]core.ToolDef{
     .{
         .name = "bench",
         .subcommand = "bench",
-        .description = "Full MNIST training " ++
-            "benchmark (~10s). Returns JSON with " ++
-            "throughput_images_per_sec and " ++
-            "final_test_accuracy_pct.",
-    },
-    .{
-        .name = "bench_infer",
-        .subcommand = "bench-infer",
-        .description = "Inference benchmark (~5s). " ++
-            "Returns JSON with gpu_batched " ++
-            "images/sec, gpu_single_sample p50/p99 " ++
-            "latency, and cpu_single_sample " ++
-            "p50/p99 latency.",
+        .description = "Bonsai 1.7B inference " ++
+            "benchmark (~5s). Returns JSON with " ++
+            "decode_tok_per_sec, " ++
+            "prefill_tok_per_sec, and " ++
+            "decode_p99_us.",
     },
     .{
         .name = "bench_compare",
@@ -309,17 +301,18 @@ const bonsai_tools = [_]core.ToolDef{
 
 const config = core.AgentConfig{
     .name = "bonsai",
-    .toolbox_path = "./zig-out/bin/bonsai_research",
+    .toolbox_path = "./zig-out/bin/bonsai_researcher",
     .history_dir = HISTORY_DIR,
     .system_prompt_path = "programs/bonsai_system.md",
     .tool_schemas = core.toolSchemas(&bonsai_tools),
     .tool_map = core.toolMappings(&bonsai_tools),
-    .persist_tools = &.{ "bench", "bench_infer" },
+    .persist_tools = &.{"bench"},
     .history_fields = &.{
         .{ .json_key = "decode_tok_per_sec", .label = "tok/s" },
         .{ .json_key = "prefill_tok_per_sec", .label = "prefill" },
         .{ .json_key = "decode_p99_us", .label = "p99_us" },
     },
+    .max_turns_per_experiment = 50,
     .build_context_fn = &buildBonsaiContext,
 };
 
@@ -336,7 +329,7 @@ pub fn main() void {
         api.log(
             "Hint: if the agent edited source files " ++
                 "before crashing, run:\n" ++
-                "  ./zig-out/bin/bonsai_research " ++
+                "  ./zig-out/bin/bonsai_researcher " ++
                 "rollback-latest\n",
             .{},
         );

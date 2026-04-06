@@ -1,4 +1,4 @@
-//! MNIST research toolbox — configures the generic
+//! MNIST researcher — configures the generic
 //! toolbox for MNIST hyperparameter optimisation.
 //!
 //! Custom tools (config-show, config-set, config-backup,
@@ -8,7 +8,7 @@
 //!
 //! Usage:
 //!   zig build
-//!   ./zig-out/bin/mnist_research <tool> [args...]
+//!   ./zig-out/bin/mnist_researcher <tool> [args...]
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

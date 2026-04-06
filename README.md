@@ -1,27 +1,206 @@
 # ⚡ nnzap
 
-GPU-accelerated neural network library + autonomous experiment runner for Apple Silicon, written in Zig.
+Give an AI agent a real 1.7B inference engine and let it optimise
+Metal kernels autonomously overnight.
 
-**Zero-copy. Comptime layouts. Metal compute.**
+nnzap is a GPU-accelerated neural network library + autonomous
+experiment runner for Apple Silicon, written in Zig. The neural
+network library (`nn/`) exploits unified memory for zero-copy
+GPU compute. The experiment runner (`zap/`) wraps it in an LLM
+agent loop that reads code, edits shaders, benchmarks, and
+iterates — no human in the loop.
 
-## Packages
+## How it works
 
-| Package        | Description                                                                                    |
-| -------------- | ---------------------------------------------------------------------------------------------- |
-| [`nn/`](nn/)   | GPU-powered neural network library — Metal compute, comptime layouts, zero-copy unified memory |
-| [`zap/`](zap/) | Autonomous experiment runner — LLM-powered research loops with a generic toolbox framework     |
+Two binaries, one loop:
 
-## Why
+- **`bonsai_agent`** — the outer loop. Talks to Claude, decides
+  what to try next, dispatches tool calls.
+- **`bonsai_researcher`** — the toolbox. Executes tool calls in a
+  sandboxed environment: snapshot, edit, compile, test, benchmark,
+  rollback, commit.
 
-On Apple Silicon, CPU and GPU share the same physical memory. Most ML
-frameworks still copy buffers around as if they're talking to a discrete
-GPU over PCIe. nnzap exploits unified memory directly — the `[]f32`
-slice your Zig code writes to _is_ the GPU buffer.
+The agent calls the researcher as a subprocess for every tool
+invocation. The researcher enforces write scope (only engine files),
+read scope (only project files), and timeout limits. The agent
+never touches the filesystem directly.
 
 ```
-Unified Memory  ──[compute]──>  same memory
-   zero copy                    zero copy
+  ┌─────────────────────────────────────────────┐
+  │  bonsai_agent (outer loop)                  │
+  │                                             │
+  │  1. Build context (rules, history,          │
+  │     summaries of prior experiments)         │
+  │  2. Send to Claude                          │
+  │  3. Claude picks a tool                     │
+  │  4. Spawn: bonsai_researcher <tool> [args]  │
+  │  5. Feed output back to Claude              │
+  │  6. Repeat until experiment done            │
+  │  7. Start next experiment                   │
+  └─────────────────────────────────────────────┘
 ```
+
+Each experiment follows a strict protocol:
+
+1. **Snapshot** — save all engine source files as a restore point.
+2. **Read** — study the code and prior experiment summaries.
+3. **Edit** — make ONE targeted change (isolate variables).
+4. **Check** — compile-only validation (~2s). Stop if it fails.
+5. **Test** — run full test suite. Stop if it fails.
+6. **Bench** — measure decode tok/s, prefill tok/s, p99 latency.
+7. **Keep or rollback** — ≥5% improvement → commit. Otherwise
+   rollback and record why it failed.
+8. **Summarise** — write a summary so future experiments don't
+   repeat the same mistake.
+
+## Quick start: Bonsai autoresearch
+
+### 1. Build
+
+```bash
+cd nn && zig build
+cd ../zap && zig build
+```
+
+### 2. Run baseline benchmark
+
+```bash
+./zig-out/bin/bonsai_researcher bench
+```
+
+```
+{
+  "model": "Bonsai-1.7B",
+  "decode_tok_per_sec": 182.8,
+  "prefill_tok_per_sec": 106.1,
+  "decode_p99_us": 6163
+}
+```
+
+### 3. Start the agent
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+./zig-out/bin/bonsai_agent
+```
+
+The agent runs autonomously. Each experiment takes 2–5 minutes.
+You can expect ~12–30 experiments per hour depending on the
+complexity of the changes. Let it run overnight and check
+results in the morning.
+
+### 4. Check results
+
+```bash
+./zig-out/bin/bonsai_researcher bench-compare
+```
+
+This prints every benchmark run side by side so you can see
+the progression of decode tok/s, prefill tok/s, and p99
+latency across experiments.
+
+### 5. Review what was tried
+
+The agent writes a summary after every experiment. These
+summaries accumulate in `.bonsai_history/` and are injected
+into every future experiment so the agent learns from its
+own history.
+
+```bash
+cat .bonsai_history/summaries.txt
+```
+
+```
+Experiment 1: Fused gate/up QMV + SiLU + elementwise multiply
+into single specialised kernel. Saves 1 dispatch + 2 barriers
+per block × 28 blocks = 28 dispatches + 56 barriers per decode
+token. Result: 182.8 → ~190 tok/s (~3-7% improvement).
+
+Experiment 2: Tried concurrent dispatch type. Results noisy,
+not clearly better. Rolled back. The QMV kernels dominate each
+barrier-to-barrier segment so there's little to overlap.
+```
+
+## Quick start: MNIST training
+
+nnzap also trains small networks from scratch. This is the
+pedagogical path — useful for understanding the library before
+diving into transformer inference.
+
+### 1. Download MNIST
+
+```bash
+mkdir -p data/mnist_torch/MNIST/raw && cd data/mnist_torch/MNIST/raw
+curl -O http://yann.lecun.com/exdb/mnist/train-images-idx3-ubyte.gz
+curl -O http://yann.lecun.com/exdb/mnist/train-labels-idx1-ubyte.gz
+curl -O http://yann.lecun.com/exdb/mnist/t10k-images-idx3-ubyte.gz
+curl -O http://yann.lecun.com/exdb/mnist/t10k-labels-idx1-ubyte.gz
+gunzip *.gz
+cd ../../../..
+```
+
+Or use torchvision:
+
+```bash
+python3 -c "from torchvision.datasets import MNIST; MNIST('data/mnist_torch', download=True)"
+```
+
+### 2. Train
+
+```bash
+cd nn && zig build run
+```
+
+```
++-----------------------------------+
+|       nn Network Layout           |
++-----------------------------------+
+|  Layer 0:  784 -> 128   (relu    ) |
+|  Layer 1:  128 -> 64    (relu    ) |
+|  Layer 2:   64 -> 10    (none    ) |
++-----------------------------------+
+|  Total params: 109386             |
+|  Max activation: 128              |
++-----------------------------------+
+
+Epoch  1/20 | loss 0.3508 | val acc 92.68% | 321 ms
+Epoch  2/20 | loss 0.1912 | val acc 94.77% | 270 ms
+...
+Epoch 20/20 | loss 0.0274 | val acc 97.85% | 259 ms
+```
+
+### 3. Run tests
+
+```bash
+cd nn && zig build test
+```
+
+### 4. MNIST autoresearch (optional)
+
+The MNIST agent optimises hyperparameters (learning rate,
+architecture, optimizer, batch size) rather than kernel code:
+
+```bash
+cd zap && zig build
+export ANTHROPIC_API_KEY=sk-ant-...
+./zig-out/bin/mnist_agent
+```
+
+## Why unified memory matters
+
+On Apple Silicon, CPU and GPU share the same physical memory.
+Most ML frameworks still copy buffers around as if they're
+talking to a discrete GPU over PCIe. nnzap exploits unified
+memory directly — the `[]f32` slice your Zig code writes to
+_is_ the GPU buffer.
+
+```
+  CPU writes params  ──>  same physical memory  <──  GPU reads params
+       zero copy              unified DRAM              zero copy
+```
+
+No `memcpy`. No staging buffers. No PCIe transfer. The Metal
+shared buffer IS the Zig slice.
 
 ## Architecture
 
@@ -48,325 +227,134 @@ Unified Memory  ──[compute]──>  same memory
  └─────────────┘     └──────────────┘
 ```
 
-## Project structure
-
-```
-nnzap/
-├── nn/                              # Neural network library
-│   ├── build.zig                    # Library build (links Metal, Foundation, zig-objc)
-│   ├── build.zig.zon                # Package manifest
-│   ├── src/
-│   │   ├── root.zig                 # Library entry point, re-exports
-│   │   ├── metal.zig                # Metal compute backend (Device, Buffer, pipelines)
-│   │   ├── layout.zig               # Comptime network layout (sizes, offsets, shapes)
-│   │   ├── network.zig              # Network struct with forward/backward pass
-│   │   ├── transformer.zig          # Transformer implementation (Bonsai 1.7B)
-│   │   ├── model.zig                # Model loading (safetensors)
-│   │   ├── safetensors.zig          # Safetensors format parser
-│   │   ├── tokenizer.zig            # Tokenizer
-│   │   ├── mnist.zig                # MNIST IDX data loader
-│   │   ├── benchmark.zig            # Benchmark recording + JSON serialisation
-│   │   └── shaders/
-│   │       ├── compute.metal        # General NN GPU kernels (MSL)
-│   │       └── transformer.metal    # Attention-specific GPU kernels
-│   └── examples/
-│       ├── mnist.zig                # MNIST training loop + evaluation
-│       ├── mnist_1bit.zig           # 1-bit MNIST variant
-│       ├── bonsai.zig               # Bonsai tree classifier
-│       ├── bonsai_bench.zig         # Bonsai benchmarking
-│       └── inference_bench.zig      # Inference benchmarking
-├── zap/                             # Autonomous experiment runner
-│   ├── build.zig                    # CLI tools build
-│   ├── build.zig.zon                # Package manifest
-│   ├── src/
-│   │   ├── agent_core.zig           # Generic agent framework (loop, dispatch, API)
-│   │   ├── toolbox.zig              # Generic toolbox (23 tools, ToolboxConfig)
-│   │   ├── tools.zig                # Shared CLI/file utilities
-│   │   ├── api_client.zig           # Anthropic HTTP client
-│   │   ├── bonsai_agent.zig         # Bonsai agent profile (~100 lines)
-│   │   ├── bonsai_research.zig      # Bonsai toolbox config (~90 lines)
-│   │   ├── mnist_agent.zig          # MNIST agent profile (~130 lines)
-│   │   └── mnist_research.zig       # MNIST toolbox config + custom tools
-│   └── programs/
-│       ├── program.md               # Shared conventions
-│       ├── bonsai_program.md        # Bonsai skill file
-│       ├── bonsai_system.md         # Bonsai system prompt
-│       ├── mnist_program.md         # MNIST skill file
-│       └── mnist_system.md          # MNIST system prompt
-├── reference/                       # Baseline implementations for comparison
-│   ├── mlx_reference.py             # MLX MNIST baseline
-│   ├── mlx_inference.py             # MLX inference baseline
-│   ├── mlx_bonsai.py                # MLX Bonsai baseline
-│   ├── pytorch_reference.py         # PyTorch MNIST baseline
-│   └── pytorch_inference.py         # PyTorch inference baseline
-├── docs/
-│   ├── ARCHITECTURE.md              # Detailed technical architecture
-│   ├── STRATEGY.md                  # Strategic positioning (Moreau pattern)
-│   ├── BONSAI.md                    # Bonsai model documentation
-│   └── PERF_PLAN.md                 # Performance roadmap
-├── data/                            # Datasets (downloaded at runtime)
-├── CLAUDE.md                        # Engineering principles
-└── README.md                        # This file
-```
-
-## Quick start
-
-### 1. Download MNIST
-
-Fetch and decompress the four dataset files into `data/mnist_torch/MNIST/raw/`:
-
-```bash
-mkdir -p data/mnist_torch/MNIST/raw && cd data/mnist_torch/MNIST/raw
-curl -O http://yann.lecun.com/exdb/mnist/train-images-idx3-ubyte.gz
-curl -O http://yann.lecun.com/exdb/mnist/train-labels-idx1-ubyte.gz
-curl -O http://yann.lecun.com/exdb/mnist/t10k-images-idx3-ubyte.gz
-curl -O http://yann.lecun.com/exdb/mnist/t10k-labels-idx1-ubyte.gz
-gunzip *.gz
-cd ../../../..
-```
-
-Or use torchvision (auto-downloads):
-
-```bash
-python3 -c "from torchvision.datasets import MNIST; MNIST('data/mnist_torch', download=True)"
-```
-
-### 2. Train
-
-```bash
-cd nn
-zig build run
-```
-
-Output:
-
-```
-+-----------------------------------+
-|       nn Network Layout           |
-+-----------------------------------+
-|  Layer 0:  784 -> 128   (relu    ) |
-|  Layer 1:  128 -> 64    (relu    ) |
-|  Layer 2:   64 -> 10    (none    ) |
-+-----------------------------------+
-|  Total params: 109386             |
-|  Max activation: 128              |
-+-----------------------------------+
-
-Epoch  1/20 | loss 0.3508 | val loss 0.2461 | val acc 92.68% | 321 ms
-Epoch  2/20 | loss 0.1912 | val loss 0.1771 | val acc 94.77% | 270 ms
-...
-Epoch 20/20 | loss 0.0274 | val loss 0.0718 | val acc 97.85% | 259 ms
-```
-
-### 3. Run tests
-
-```bash
-cd nn
-zig build test
-```
-
-## Dataset split
-
-The 60,000 MNIST training images are split:
-
-| Set        | Samples | Usage                            |
-| ---------- | ------- | -------------------------------- |
-| Training   | 50,000  | Weight updates via backprop      |
-| Validation | 10,000  | Per-epoch accuracy & overfitting |
-| Test       | 10,000  | Final evaluation (separate file) |
-
-Validation comes from the last 10k of the training file. The test set
-is the standard MNIST `t10k-*` files, untouched during training.
-
-## Benchmarks
-
-Every training run writes a JSON benchmark file to `benchmarks/`.
-
-### Output location
-
-```
-benchmarks/
-  mnist_20250120_143022.json
-  mnist_20250120_150415.json
-  ...
-```
-
-### Using the benchmark API
-
-```zig
-const nn = @import("nn");
-const Benchmark = nn.Benchmark;
-const nanosToMs = nn.benchmark.nanosToMs;
-
-var bench: Benchmark = undefined;
-bench.init(MyLayout, .{
-    .batch_size = 64,
-    .learning_rate = 0.1,
-    .learning_rate_decay = 0.0,
-    .optimizer = .sgd,
-    .loss_function = .cross_entropy,
-    .num_epochs = 20,
-    .seed = 42,
-    .train_samples = 50_000,
-    .validation_samples = 10_000,
-    .test_samples = 10_000,
-});
-
-// In the training loop:
-const epoch_start = std.time.nanoTimestamp();
-const train_loss = trainEpoch(...);
-const val = evaluate(...);
-const epoch_ms = nanosToMs(std.time.nanoTimestamp() - epoch_start);
-
-bench.recordEpoch(.{
-    .epoch = epoch + 1,
-    .train_loss = train_loss,
-    .duration_ms = epoch_ms,
-    .validation_loss = val.mean_loss,
-    .validation_accuracy_pct = val.accuracy_pct,
-});
-
-// After training:
-bench.setTrainingTime(total_ms);
-bench.recordTest(correct, total, test_ms);
-try bench.save("mnist");
-```
-
-## Autoresearch
-
-The `zap/` package runs autonomous ML experiment loops. An LLM
-(Claude) drives the research — reading code, editing files, running
-benchmarks, and iterating — while a generic toolbox framework handles
-the mechanics.
-
-### Framework
+## Autoresearch framework
 
 Zap is built around two generic engines and thin domain configs:
 
 ```
-                    ┌───────────────────┐
-                    │   agent_core.zig  │  Generic agent loop
-                    │   (API, dispatch, │  (turn management,
-                    │    history)       │   context building)
-                    └────────┬──────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              ▼              ▼              ...
-     ┌────────────┐  ┌──────────────┐
-     │ bonsai     │  │ mnist        │  Agent profiles
-     │ _agent.zig │  │ _agent.zig   │  (~100 lines each)
-     └────────────┘  └──────────────┘
+                   ┌───────────────────┐
+                   │   agent_core.zig  │  Generic agent loop
+                   │   (API, dispatch, │  (turn management,
+                   │    history)       │   context building)
+                   └────────┬──────────┘
+                            │
+             ┌──────────────┼──────────────┐
+             ▼              ▼              ...
+    ┌────────────┐  ┌──────────────┐
+    │  bonsai    │  │  mnist       │  Agent profiles
+    │  _agent    │  │  _agent      │  (~100 lines each)
+    └────────────┘  └──────────────┘
 
 
-                    ┌───────────────────┐
-                    │   toolbox.zig     │  Generic toolbox
-                    │   (23 tools:      │  (snapshot, bench,
-                    │    file I/O,      │   edit, diff,
-                    │    build, ...)    │   commit, ...)
-                    └────────┬──────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              ▼              ▼              ...
-     ┌────────────┐  ┌──────────────┐
-     │ bonsai     │  │ mnist        │  Toolbox configs
-     │ _research  │  │ _research    │  (~90 lines each)
-     └────────────┘  └──────────────┘
+                   ┌───────────────────┐
+                   │   toolbox.zig     │  Generic toolbox
+                   │   (23 tools:      │  (snapshot, bench,
+                   │    file I/O,      │   edit, diff,
+                   │    build, ...)    │   commit, ...)
+                   └────────┬──────────┘
+                            │
+             ┌──────────────┼──────────────┐
+             ▼              ▼              ...
+    ┌────────────┐  ┌──────────────┐
+    │  bonsai    │  │  mnist       │  Researcher configs
+    │_researcher │  │_researcher   │  (~90 lines each)
+    └────────────┘  └──────────────┘
 ```
 
 **Agent profiles** configure the LLM loop: system prompt, tool
 schemas (defined as comptime `ToolDef` structs), history fields,
 and turn limits.
 
-**Toolbox configs** configure the CLI: write scope, read scope,
+**Researcher configs** configure the CLI: write scope, read scope,
 build/test/bench commands, snapshot directory, and an optional
 `custom_dispatch` callback for domain-specific tools.
 
 Adding a new domain means writing ~200 lines of config (one agent
-profile, one toolbox config, one system prompt) — no copy-pasting
-thousands of lines of tool logic.
+profile, one researcher config, one system prompt) — no
+copy-pasting thousands of lines of tool logic.
 
-### MNIST research (hyperparameter optimisation)
+## Project structure
 
-```bash
-cd zap && zig build
-
-./zig-out/bin/mnist_research help
-./zig-out/bin/mnist_research config-show
-./zig-out/bin/mnist_research bench
-./zig-out/bin/mnist_research bench-compare
+```
+nnzap/
+├── nn/                              # Neural network library
+│   ├── src/
+│   │   ├── metal.zig                # Metal compute backend
+│   │   ├── layout.zig               # Comptime network layout
+│   │   ├── network.zig              # Forward/backward pass
+│   │   ├── transformer.zig          # Transformer (Bonsai 1.7B)
+│   │   ├── model.zig                # Safetensors model loading
+│   │   ├── safetensors.zig          # Safetensors format parser
+│   │   ├── tokenizer.zig            # Tokenizer
+│   │   ├── mnist.zig                # MNIST data loader
+│   │   ├── benchmark.zig            # Benchmark recording + JSON
+│   │   └── shaders/
+│   │       ├── compute.metal        # General NN kernels
+│   │       ├── transformer.metal    # Attention kernels
+│   │       └── qmv_specialized.metal # Quantised matmul kernels
+│   └── examples/
+│       ├── mnist.zig                # MNIST training
+│       ├── bonsai.zig               # Bonsai inference
+│       └── bonsai_bench.zig         # Bonsai benchmarking
+├── zap/                             # Autonomous experiment runner
+│   ├── src/
+│   │   ├── agent_core.zig           # Generic agent framework
+│   │   ├── toolbox.zig              # Generic toolbox (23 tools)
+│   │   ├── tools.zig                # Shared CLI utilities
+│   │   ├── api_client.zig           # Anthropic HTTP client
+│   │   ├── bonsai_agent.zig         # Bonsai agent profile
+│   │   ├── bonsai_researcher.zig    # Bonsai researcher config
+│   │   ├── mnist_agent.zig          # MNIST agent profile
+│   │   └── mnist_researcher.zig     # MNIST researcher config
+│   └── programs/
+│       ├── bonsai_system.md         # Bonsai system prompt
+│       └── mnist_system.md          # MNIST system prompt
+├── reference/                       # Baseline implementations
+│   ├── mlx_bonsai.py                # MLX Bonsai baseline
+│   ├── mlx_reference.py             # MLX MNIST baseline
+│   └── pytorch_reference.py         # PyTorch MNIST baseline
+├── CLAUDE.md                        # Engineering principles
+└── README.md
 ```
 
-### MNIST agent
+## Key files
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-cd zap && zig build
-./zig-out/bin/mnist_agent
-```
-
-### Bonsai research (inference optimisation)
-
-```bash
-cd zap && zig build
-
-./zig-out/bin/bonsai_research help
-./zig-out/bin/bonsai_research snapshot
-./zig-out/bin/bonsai_research bench
-```
-
-### Bonsai agent
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-cd zap && zig build
-./zig-out/bin/bonsai_agent
-```
+| File                | Lines | What it does                                        |
+| ------------------- | ----: | --------------------------------------------------- |
+| `transformer.zig`   | 5,982 | Transformer dispatch, decode loop, all QMV variants |
+| `network.zig`       | 3,308 | Core NN forward/backward/train                      |
+| `compute.metal`     | 4,675 | GPU kernels: matmul, activations, loss, QMV         |
+| `transformer.metal` | 1,343 | Attention kernels: RMSNorm, RoPE, GQA, KV cache     |
+| `agent_core.zig`    | 2,271 | Shared agent framework (loop, API, context)         |
+| `toolbox.zig`       | 2,399 | Generic toolbox (23 tools)                          |
 
 ## Status
 
 ### Done
 
 - [x] Metal shared buffers (zero-copy unified memory)
-- [x] Compute pipeline creation and dispatch (1D + 2D)
-- [x] Double-buffered activations for CPU/GPU overlap
 - [x] Comptime network layout with adjacency validation
-- [x] Forward pass (matmul → bias_add → activation per layer)
-- [x] Backward pass (full backpropagation)
-- [x] SGD + Adam optimisers
-- [x] MSE + softmax-cross-entropy loss
-- [x] MNIST data loader with one-hot encoding
-- [x] Benchmark recording + JSON serialisation
-- [x] Fused matmul+bias+relu kernel
-- [x] Tiled matmul kernel (16×16 tiles, shared memory, forward + backward)
-- [x] Multi-batch command buffer encoding
+- [x] Forward + backward pass, SGD + Adam optimisers
+- [x] Tiled matmul kernels (16×16, shared memory)
+- [x] Double-buffered activations for CPU/GPU overlap
 - [x] Transformer implementation (Bonsai 1.7B inference)
-- [x] Safetensors model loading
-- [x] Tokenizer
-- [x] Generic autoresearch toolbox framework
-- [x] Comptime tool definitions (schemas + dispatch)
-- [x] LLM agents (hyperparameter + engine optimisation)
+- [x] 1-bit quantised matrix-vector multiply (Q1_0_g128)
+- [x] Safetensors model loading + tokenizer
+- [x] Generic autoresearch framework (agent + toolbox)
+- [x] LLM agents (kernel optimisation + hyperparameter search)
 
 ### Next
 
-- [ ] Conv2D layer
-- [ ] Batched prefill (quantised matrix-matrix multiply for multi-token prefill)
+- [ ] Batched prefill (quantised matrix-matrix multiply)
 - [ ] Flash attention (tiled attention for long contexts)
 - [ ] Transformer training / backward pass
-- [ ] Save trained weights to safetensors
-- [ ] Training checkpoints (periodic weight snapshots mid-training)
+- [ ] Conv2D layer
+- [ ] Save/load trained weights (safetensors)
 - [ ] CoreML export
-
-## Docs
-
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — detailed technical architecture
-- [`docs/STRATEGY.md`](docs/STRATEGY.md) — strategic positioning and target domains
-- [`docs/BONSAI.md`](docs/BONSAI.md) — Bonsai model documentation
-- [`docs/PERF_PLAN.md`](docs/PERF_PLAN.md) — performance roadmap
-- [`zap/docs/framework_design.md`](zap/docs/framework_design.md) — toolbox framework design
-- [`CLAUDE.md`](CLAUDE.md) — engineering principles and coding rules
 
 ## Dependencies
 
 - **Zig ≥ 0.15.2**
 - **macOS** with Metal support (Apple Silicon recommended)
-- [`zig-objc`](https://github.com/mitchellh/zig-objc) — Zig bindings for Objective-C runtime (for Metal API)
+- [`zig-objc`](https://github.com/mitchellh/zig-objc) — Zig
+  bindings for Objective-C runtime (for Metal API)

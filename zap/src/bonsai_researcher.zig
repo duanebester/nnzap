@@ -1,11 +1,11 @@
-//! Bonsai research toolbox — configures the generic
+//! Bonsai researcher — configures the generic
 //! toolbox for engine code optimisation.
 //!
 //! Thin wrapper: all tool logic lives in toolbox.zig.
 //!
 //! Usage:
 //!   zig build
-//!   ./zig-out/bin/bonsai_research <tool> [args...]
+//!   ./zig-out/bin/bonsai_researcher <tool> [args...]
 
 const toolbox = @import("toolbox.zig");
 
@@ -69,17 +69,9 @@ const config = toolbox.ToolboxConfig{
         "run-bonsai-bench",
         "-Doptimize=ReleaseFast",
     },
-    .extra_bench = &.{.{
-        .tool_name = "bench-infer",
-        .command = &.{
-            "zig",
-            "build",
-            "run-bonsai-bench",
-            "-Doptimize=ReleaseFast",
-        },
-    }},
+    .extra_bench = &.{},
     .bench_dir = "nn/benchmarks",
-    .bench_prefixes = &.{ "mnist_", "inference_" },
+    .bench_prefixes = &.{"bonsai_bench_"},
     .history_dir = ".bonsai_history",
     .snapshot_dir = ".engine_snapshots",
 };
