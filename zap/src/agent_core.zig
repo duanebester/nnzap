@@ -23,9 +23,9 @@ const tools = @import("tools.zig");
 
 const MAX_TOOL_ARGS: u32 = 16;
 const MAX_API_RESPONSE: usize = 8 * 1024 * 1024;
-const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OUTPUT_BYTES = tools.MAX_OUTPUT_BYTES;
 const MAX_HISTORY_SIZE: usize = 2 * 1024 * 1024;
-const MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
+const MAX_FILE_SIZE = tools.MAX_FILE_SIZE;
 const TOOL_INPUT_PATH: []const u8 = "_tool_input.json";
 
 const MAX_RETRY_ATTEMPTS: u32 = 3;
@@ -117,7 +117,6 @@ const RunStats = struct {
     experiments: u32 = 0,
     turns: u32 = 0,
     tool_calls: u32 = 0,
-    bench_count: u32 = 0,
     api_errors: u32 = 0,
     api_ms: i64 = 0,
     tool_ms: i64 = 0,
@@ -135,6 +134,18 @@ const ExperimentResult = struct {
     tool_ms: i64,
     input_tokens: u64,
     output_tokens: u64,
+};
+
+/// Bundles per-experiment state threaded through
+/// every turn of the conversation loop.
+const TurnContext = struct {
+    config: *const AgentConfig,
+    api_key: []const u8,
+    model: []const u8,
+    system_prompt: []const u8,
+    tool_schemas: []const u8,
+    messages: *[512][]const u8,
+    count: *u32,
 };
 
 // ============================================================
@@ -303,17 +314,21 @@ fn runSingleExperiment(
         .output_tokens = 0,
     };
 
+    const ctx = TurnContext{
+        .config = config,
+        .api_key = api_key,
+        .model = model,
+        .system_prompt = system_prompt,
+        .tool_schemas = tool_schemas,
+        .messages = &messages,
+        .count = &count,
+    };
+
     var turn: u32 = 0;
     while (turn < config.max_turns_per_experiment) : (turn += 1) {
         const should_break = runOneTurn(
-            config,
+            &ctx,
             arena,
-            api_key,
-            model,
-            system_prompt,
-            tool_schemas,
-            &messages,
-            &count,
             turn,
             &result,
         );
@@ -332,45 +347,25 @@ fn runSingleExperiment(
     return result;
 }
 
-/// Execute one turn: call API, process response,
-/// execute tools.  Returns true if the loop should
-/// break.
-fn runOneTurn(
-    config: *const AgentConfig,
+/// Call the API and process the initial response.
+/// Returns null if the API call failed (result.api_failed
+/// is set).
+fn callApiAndProcess(
+    ctx: *const TurnContext,
     arena: Allocator,
-    api_key: []const u8,
-    model: []const u8,
-    system_prompt: []const u8,
-    tool_schemas: []const u8,
-    messages: *[512][]const u8,
-    count: *u32,
-    turn: u32,
     result: *ExperimentResult,
-) bool {
-    api.log(
-        "\n--- Turn {d} ---\n",
-        .{turn + 1},
-    );
-
-    const ctx_bytes = contextSizeBytes(
-        messages[0..count.*],
-    );
-    api.log(
-        "  Context: {d} messages, {d} KB\n",
-        .{ count.*, ctx_bytes / 1024 },
-    );
-
+) ?ApiResponse {
     const api_start = timestampMs();
     const resp = callApiWithRetry(
         arena,
-        api_key,
-        model,
-        messages[0..count.*],
-        system_prompt,
-        tool_schemas,
-        config.history_dir,
-        config.max_tokens_str,
-        config.thinking_budget_str,
+        ctx.api_key,
+        ctx.model,
+        ctx.messages[0..ctx.count.*],
+        ctx.system_prompt,
+        ctx.tool_schemas,
+        ctx.config.history_dir,
+        ctx.config.max_tokens_str,
+        ctx.config.thinking_budget_str,
     );
     const api_elapsed = timestampMs() - api_start;
     result.api_ms += api_elapsed;
@@ -381,23 +376,53 @@ fn runOneTurn(
             .{resp.error_message},
         );
         result.api_failed = true;
-        return true;
+        return null;
     }
 
     logApiResponse(arena, resp, api_elapsed);
     extractTokenUsage(
         arena,
-        config.history_dir,
+        ctx.config.history_dir,
         result,
     );
+    return resp;
+}
+
+/// Execute one turn: call API, process response,
+/// execute tools.  Returns true if the loop should
+/// break.
+fn runOneTurn(
+    ctx: *const TurnContext,
+    arena: Allocator,
+    turn: u32,
+    result: *ExperimentResult,
+) bool {
+    api.log(
+        "\n--- Turn {d} ---\n",
+        .{turn + 1},
+    );
+
+    const ctx_bytes = contextSizeBytes(
+        ctx.messages[0..ctx.count.*],
+    );
+    api.log(
+        "  Context: {d} messages, {d} KB\n",
+        .{ ctx.count.*, ctx_bytes / 1024 },
+    );
+
+    const resp = callApiAndProcess(
+        ctx,
+        arena,
+        result,
+    ) orelse return true;
 
     if (resp.text.len > 0) api.logClaudeText(resp.text);
 
-    messages[count.*] = api.buildAssistantMsg(
+    ctx.messages[ctx.count.*] = api.buildAssistantMsg(
         arena,
         resp.content_json,
     );
-    count.* += 1;
+    ctx.count.* += 1;
 
     const is_tool_use = api.eql(
         resp.stop_reason,
@@ -412,11 +437,11 @@ fn runOneTurn(
     }
 
     return executeAndAppendTools(
-        config,
+        ctx.config,
         arena,
         resp,
-        messages,
-        count,
+        ctx.messages,
+        ctx.count,
         turn,
         result,
     );
@@ -1047,26 +1072,65 @@ fn executeCurl(
 
 /// Parse curl output: split body from HTTP status code,
 /// handle errors, return parsed API response.
+/// Check curl exit status.  Returns an error response
+/// if curl failed, or null on success.
+fn checkCurlSuccess(
+    arena: Allocator,
+    result: std.process.Child.RunResult,
+) ?ApiResponse {
+    const curl_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (curl_ok) return null;
+
+    const detail = if (result.stderr.len > 0)
+        api.truncate(result.stderr, 500)
+    else
+        "unknown curl error";
+    const msg = std.fmt.allocPrint(
+        arena,
+        "curl failed: {s}",
+        .{detail},
+    ) catch "curl failed";
+    return api.errResp(msg, true);
+}
+
+/// Persist the raw API response for token-usage
+/// extraction, then parse it.
+fn persistAndParseResponse(
+    arena: Allocator,
+    response_data: []const u8,
+    fs_dir: []const u8,
+) ApiResponse {
+    std.debug.assert(response_data.len > 0);
+
+    const resp_path = std.fmt.allocPrint(
+        arena,
+        "{s}/_response.json",
+        .{fs_dir},
+    ) catch "";
+    if (resp_path.len > 0) {
+        api.writeFile(
+            resp_path,
+            response_data,
+        ) catch {};
+    }
+
+    return api.parseApiResponse(
+        arena,
+        response_data,
+    );
+}
+
 fn parseCurlResult(
     arena: Allocator,
     result: std.process.Child.RunResult,
     fs_dir: []const u8,
 ) ApiResponse {
-    const curl_ok = switch (result.term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
-    if (!curl_ok) {
-        const detail = if (result.stderr.len > 0)
-            api.truncate(result.stderr, 500)
-        else
-            "unknown curl error";
-        const msg = std.fmt.allocPrint(
-            arena,
-            "curl failed: {s}",
-            .{detail},
-        ) catch "curl failed";
-        return api.errResp(msg, true);
+    // Early exit if curl process failed.
+    if (checkCurlSuccess(arena, result)) |err| {
+        return err;
     }
 
     const output = result.stdout;
@@ -1117,20 +1181,17 @@ fn parseCurlResult(
     }
 
     if (response_data.len == 0) {
-        return api.errResp("empty API response", true);
+        return api.errResp(
+            "empty API response",
+            true,
+        );
     }
 
-    // Persist raw response for token usage extraction.
-    const resp_path = std.fmt.allocPrint(
+    return persistAndParseResponse(
         arena,
-        "{s}/_response.json",
-        .{fs_dir},
-    ) catch "";
-    if (resp_path.len > 0) {
-        api.writeFile(resp_path, response_data) catch {};
-    }
-
-    return api.parseApiResponse(arena, response_data);
+        response_data,
+        fs_dir,
+    );
 }
 
 /// Descriptive error for non-200 API responses.

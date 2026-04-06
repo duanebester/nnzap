@@ -1,7 +1,7 @@
 //! nnzap tools — shared utilities for AI agent toolboxes.
 //!
-//! Common infrastructure used by both `autoresearch.zig`
-//! and `engine_research.zig`: benchmark JSON types, file
+//! Common infrastructure used by `bonsai_research.zig`
+//! and `mnist_research.zig`: benchmark JSON types, file
 //! I/O, path resolution, JSON/string helpers, and benchmark
 //! comparison logic.
 //!
@@ -214,26 +214,74 @@ pub fn extractDotField(
 // JSON output helpers
 // ============================================================
 
+/// JSON-escape a string for embedding inside a quoted
+/// JSON value.  Uses std.json.Stringify.encodeJsonString
+/// for correct handling of all control characters
+/// (U+0000–U+001F) and Unicode escaping.
+///
+/// Returns the escaped content WITHOUT surrounding
+/// quotes — callers embed the result inside their own
+/// `\"{s}\"` format strings.
 pub fn jsonEscape(
     arena: Allocator,
     input: []const u8,
 ) ![]const u8 {
     std.debug.assert(input.len <= MAX_OUTPUT_BYTES);
-    var buf: std.ArrayList(u8) = .empty;
 
-    for (input) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(arena, "\\\""),
-            '\\' => try buf.appendSlice(arena, "\\\\"),
-            '\n' => try buf.appendSlice(arena, "\\n"),
-            '\r' => try buf.appendSlice(arena, "\\r"),
-            '\t' => try buf.appendSlice(arena, "\\t"),
-            else => try buf.append(arena, c),
-        }
-    }
+    var tmp: std.io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.encodeJsonString(
+        input,
+        .{},
+        &tmp.writer,
+    );
+    const encoded = tmp.written();
 
-    std.debug.assert(buf.items.len >= input.len);
-    return buf.items;
+    // encodeJsonString wraps the result in quotes.
+    // Strip them — callers provide their own quoting.
+    std.debug.assert(encoded.len >= 2);
+    std.debug.assert(encoded[0] == '"');
+    std.debug.assert(encoded[encoded.len - 1] == '"');
+    return encoded[1 .. encoded.len - 1];
+}
+
+/// Truncate stderr output from the end (keeping the most
+/// recent lines) and JSON-escape it for embedding in a
+/// JSON response.
+pub fn truncateAndEscape(
+    arena: Allocator,
+    stderr_output: []const u8,
+    max_error_bytes: u32,
+) ![]const u8 {
+    std.debug.assert(max_error_bytes > 0);
+    const truncated = if (stderr_output.len > max_error_bytes)
+        stderr_output[stderr_output.len - max_error_bytes ..]
+    else
+        stderr_output;
+    return jsonEscape(arena, truncated);
+}
+
+/// Emit a build-failure JSON response to stdout.  Used
+/// by research toolboxes when a `zig build` subprocess
+/// fails.
+pub fn writeBuildError(
+    arena: Allocator,
+    stderr_output: []const u8,
+    max_error_bytes: u32,
+) !void {
+    const escaped = try truncateAndEscape(
+        arena,
+        stderr_output,
+        max_error_bytes,
+    );
+    const result = try std.fmt.allocPrint(
+        arena,
+        "{{\"status\": \"error\", " ++
+            "\"error\": \"build_failed\", " ++
+            "\"output\": \"{s}\"}}\n",
+        .{escaped},
+    );
+    std.debug.assert(result.len > 0);
+    try writeStdout(result);
 }
 
 pub fn writeJsonError(err: anyerror) !void {

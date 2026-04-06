@@ -813,22 +813,20 @@ fn writeCheckFailure(
     std.debug.assert(
         stderr_output.len <= tools.MAX_OUTPUT_BYTES,
     );
-    const max_err: u32 = 4000;
-    const truncated = if (stderr_output.len > max_err)
-        stderr_output[stderr_output.len - max_err ..]
-    else
-        stderr_output;
-
-    const escaped = try tools.jsonEscape(arena, truncated);
-    const json = try std.fmt.allocPrint(
+    const escaped = try tools.truncateAndEscape(
+        arena,
+        stderr_output,
+        4000,
+    );
+    const result = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"ok\", " ++
             "\"compiled\": false, " ++
             "\"errors\": \"{s}\"}}\n",
         .{escaped},
     );
-    std.debug.assert(json.len > 0);
-    try tools.writeStdout(json);
+    std.debug.assert(result.len > 0);
+    try tools.writeStdout(result);
 }
 
 // ============================================================
@@ -884,22 +882,20 @@ fn writeTestFailure(
     std.debug.assert(
         stderr_output.len <= tools.MAX_OUTPUT_BYTES,
     );
-    const max_err: u32 = 4000;
-    const truncated = if (stderr_output.len > max_err)
-        stderr_output[stderr_output.len - max_err ..]
-    else
-        stderr_output;
-
-    const escaped = try tools.jsonEscape(arena, truncated);
-    const json = try std.fmt.allocPrint(
+    const escaped = try tools.truncateAndEscape(
+        arena,
+        stderr_output,
+        4000,
+    );
+    const result = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"ok\", " ++
             "\"passed\": false, " ++
             "\"output\": \"{s}\"}}\n",
         .{escaped},
     );
-    std.debug.assert(json.len > 0);
-    try tools.writeStdout(json);
+    std.debug.assert(result.len > 0);
+    try tools.writeStdout(result);
 }
 
 // ============================================================
@@ -977,60 +973,12 @@ fn runBonsaiBench(arena: Allocator) !void {
     }
 }
 
-/// Locate the new benchmark file and write it to stdout.
-fn emitBenchmarkResult(
-    arena: Allocator,
-    bench_fs: []const u8,
-) !void {
-    std.debug.assert(bench_fs.len > 0);
-
-    const bench_name = tools.findOneBenchmark(
-        arena,
-        bench_fs,
-    );
-
-    if (bench_name) |name| {
-        const path = try std.fmt.allocPrint(
-            arena,
-            "{s}/{s}",
-            .{ bench_fs, name },
-        );
-        const content = try tools.readFile(arena, path);
-        std.debug.assert(content.len > 0);
-        try tools.writeStdout(content);
-    } else {
-        try tools.writeStdout(
-            "{\"status\": \"error\", " ++
-                "\"error\": \"no benchmark " ++
-                "produced\"}\n",
-        );
-    }
-}
-
 /// Format and emit a bench-failure JSON response.
 fn writeBenchError(
     arena: Allocator,
     stderr_output: []const u8,
 ) !void {
-    std.debug.assert(
-        stderr_output.len <= tools.MAX_OUTPUT_BYTES,
-    );
-    const max_err: u32 = 2000;
-    const truncated = if (stderr_output.len > max_err)
-        stderr_output[stderr_output.len - max_err ..]
-    else
-        stderr_output;
-
-    const escaped = try tools.jsonEscape(arena, truncated);
-    const json = try std.fmt.allocPrint(
-        arena,
-        "{{\"status\": \"error\", " ++
-            "\"error\": \"build_failed\", " ++
-            "\"output\": \"{s}\"}}\n",
-        .{escaped},
-    );
-    std.debug.assert(json.len > 0);
-    try tools.writeStdout(json);
+    try tools.writeBuildError(arena, stderr_output, 2000);
 }
 
 // ============================================================

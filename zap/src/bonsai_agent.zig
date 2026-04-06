@@ -276,6 +276,18 @@ const ExecutionResult = struct {
     completed: bool,
 };
 
+/// Accumulated statistics across two-tier experiments.
+const TwoTierStats = struct {
+    experiments: u32 = 0,
+    turns: u32 = 0,
+    tool_calls: u32 = 0,
+    api_errors: u32 = 0,
+    api_ms: i64 = 0,
+    tool_ms: i64 = 0,
+    opus_in_tokens: u64 = 0,
+    opus_out_tokens: u64 = 0,
+};
+
 /// Entry point for two-tier mode.  Sets up arena,
 /// keys, and toolbox, then delegates to the outer
 /// experiment loop.
@@ -364,17 +376,18 @@ fn runTwoTierLoop(
     std.debug.assert(opus_model.len > 0);
     std.debug.assert(ollama_model.len > 0);
 
-    var total_experiments: u32 = 0;
-    var total_turns: u32 = 0;
-    var total_tool_calls: u32 = 0;
-    var total_api_errors: u32 = 0;
-    var total_api_ms: i64 = 0;
-    var total_tool_ms: i64 = 0;
-    var opus_in_tokens: u64 = 0;
-    var opus_out_tokens: u64 = 0;
+    var stats = TwoTierStats{};
 
     var experiment: u32 = 0;
     while (experiment < MAX_EXPERIMENTS) : (experiment += 1) {
+        // Per-experiment arena — freed at the end of each
+        // iteration to prevent unbounded memory growth
+        // across 50 experiments (Rule 2).
+        var experiment_arena = std.heap.ArenaAllocator.init(
+            std.heap.page_allocator,
+        );
+        defer experiment_arena.deinit();
+
         api.log(
             "\n" ++
                 "======================================" ++
@@ -386,7 +399,7 @@ fn runTwoTierLoop(
         );
 
         const should_stop = runOneStrategyExperiment(
-            arena,
+            experiment_arena.allocator(),
             api_key,
             opus_model,
             ollama_model,
@@ -394,55 +407,25 @@ fn runTwoTierLoop(
             code_context,
             openai_tools,
             experiment,
-            &total_turns,
-            &total_tool_calls,
-            &total_api_errors,
-            &total_api_ms,
-            &total_tool_ms,
-            &opus_in_tokens,
-            &opus_out_tokens,
+            &stats,
         );
-        total_experiments += 1;
+        stats.experiments += 1;
         if (should_stop) break;
     }
 
-    printTwoTierSummary(
-        arena,
-        run_start,
-        total_experiments,
-        total_turns,
-        total_tool_calls,
-        total_api_errors,
-        total_api_ms,
-        total_tool_ms,
-        opus_in_tokens,
-        opus_out_tokens,
-    );
+    printTwoTierSummary(arena, run_start, &stats);
 }
 
-/// Run one strategy→execution cycle.  Returns true if
-/// the outer loop should stop (strategist failure).
-fn runOneStrategyExperiment(
+/// Call Opus strategist and process the result.
+/// Returns the plan text, or null on failure.
+fn callAndProcessStrategy(
     arena: Allocator,
     api_key: []const u8,
     opus_model: []const u8,
-    ollama_model: []const u8,
     rules: []const u8,
     code_context: []const u8,
-    openai_tools: []const u8,
-    experiment: u32,
-    total_turns: *u32,
-    total_tool_calls: *u32,
-    total_api_errors: *u32,
-    total_api_ms: *i64,
-    total_tool_ms: *i64,
-    opus_in: *u64,
-    opus_out: *u64,
-) bool {
-    std.debug.assert(api_key.len > 0);
-    std.debug.assert(ollama_model.len > 0);
-
-    // Phase 1: Opus designs the experiment.
+    stats: *TwoTierStats,
+) ?[]const u8 {
     const history = core.buildHistorySummary(
         arena,
         HISTORY_DIR,
@@ -464,9 +447,9 @@ fn runOneStrategyExperiment(
         code_context,
     );
     const strat_ms = core.timestampMs() - strat_start;
-    total_api_ms.* += strat_ms;
-    opus_in.* += plan_resp.input_tokens;
-    opus_out.* += plan_resp.output_tokens;
+    stats.api_ms += strat_ms;
+    stats.opus_in_tokens += plan_resp.input_tokens;
+    stats.opus_out_tokens += plan_resp.output_tokens;
 
     if (!plan_resp.success or
         plan_resp.text.len == 0)
@@ -481,8 +464,8 @@ fn runOneStrategyExperiment(
                 plan_resp.error_message,
             },
         );
-        total_api_errors.* += 1;
-        return true; // Stop outer loop.
+        stats.api_errors += 1;
+        return null;
     }
 
     api.log(
@@ -494,7 +477,36 @@ fn runOneStrategyExperiment(
             ),
         },
     );
-    api.logClaudeText(plan_resp.text);
+    return plan_resp.text;
+}
+
+/// Run one strategy→execution cycle.  Returns true if
+/// the outer loop should stop (strategist failure).
+fn runOneStrategyExperiment(
+    arena: Allocator,
+    api_key: []const u8,
+    opus_model: []const u8,
+    ollama_model: []const u8,
+    rules: []const u8,
+    code_context: []const u8,
+    openai_tools: []const u8,
+    experiment: u32,
+    stats: *TwoTierStats,
+) bool {
+    std.debug.assert(api_key.len > 0);
+    std.debug.assert(ollama_model.len > 0);
+
+    // Phase 1: Opus designs the experiment.
+    const plan = callAndProcessStrategy(
+        arena,
+        api_key,
+        opus_model,
+        rules,
+        code_context,
+        stats,
+    ) orelse return true;
+
+    api.logClaudeText(plan);
 
     // Phase 2: Local LLM executes the plan.
     api.log(
@@ -504,15 +516,15 @@ fn runOneStrategyExperiment(
     const exec = runLocalExecution(
         arena,
         ollama_model,
-        plan_resp.text,
+        plan,
         openai_tools,
     );
 
-    total_turns.* += exec.turns;
-    total_tool_calls.* += exec.tool_calls;
-    total_api_ms.* += exec.api_ms;
-    total_tool_ms.* += exec.tool_ms;
-    if (!exec.completed) total_api_errors.* += 1;
+    stats.turns += exec.turns;
+    stats.tool_calls += exec.tool_calls;
+    stats.api_ms += exec.api_ms;
+    stats.tool_ms += exec.tool_ms;
+    if (!exec.completed) stats.api_errors += 1;
 
     api.log(
         "  Experiment {d} done " ++
@@ -523,7 +535,7 @@ fn runOneStrategyExperiment(
             exec.tool_calls,
         },
     );
-    return false; // Continue outer loop.
+    return false;
 }
 
 /// Call Opus to design a single experiment plan.
@@ -761,6 +773,36 @@ fn runLocalExecution(
     return r;
 }
 
+/// Execute tool calls and append results in OpenAI
+/// message format.  Returns true if the message
+/// buffer is full.
+fn executeAndAppendExecutorTools(
+    arena: Allocator,
+    resp: core.ApiResponse,
+    msgs: *[MAX_MESSAGES][]const u8,
+    count: *u32,
+    r: *ExecutionResult,
+) bool {
+    const t1 = core.timestampMs();
+    const results = core.executeTools(
+        &config,
+        arena,
+        resp.tool_calls,
+    );
+    r.tool_ms += core.timestampMs() - t1;
+    r.tool_calls += @intCast(resp.tool_calls.len);
+
+    for (results) |tr| {
+        if (count.* >= MAX_MESSAGES - 1) break;
+        msgs[count.*] = ollama.buildToolResultMsg(
+            arena,
+            tr,
+        );
+        count.* += 1;
+    }
+    return count.* >= MAX_MESSAGES - 2;
+}
+
 /// Run one turn of the local executor loop.
 /// Returns true if the loop should break.
 fn runOneExecutorTurn(
@@ -817,27 +859,13 @@ fn runOneExecutorTurn(
         return true;
     }
 
-    // Execute tools and append results.
-    const t1 = core.timestampMs();
-    const results = core.executeTools(
-        &config,
+    return executeAndAppendExecutorTools(
         arena,
-        resp.tool_calls,
+        resp,
+        msgs,
+        count,
+        r,
     );
-    r.tool_ms += core.timestampMs() - t1;
-    r.tool_calls += @intCast(resp.tool_calls.len);
-
-    // OpenAI format: one message per tool result.
-    for (results) |tr| {
-        if (count.* >= MAX_MESSAGES - 1) break;
-        msgs[count.*] = ollama.buildToolResultMsg(
-            arena,
-            tr,
-        );
-        count.* += 1;
-    }
-    if (count.* >= MAX_MESSAGES - 2) return true;
-    return false;
 }
 
 /// Build the initial user message for the executor,
@@ -874,22 +902,15 @@ fn buildExecutorInitialMsg(
 fn printTwoTierSummary(
     arena: Allocator,
     run_start: i64,
-    total_experiments: u32,
-    total_turns: u32,
-    total_tool_calls: u32,
-    total_api_errors: u32,
-    total_api_ms: i64,
-    total_tool_ms: i64,
-    opus_in_tokens: u64,
-    opus_out_tokens: u64,
+    stats: *const TwoTierStats,
 ) void {
     const run_elapsed = core.timestampMs() - run_start;
 
     // Opus pricing: $5/MTok in, $25/MTok out.
     // Ollama is free (local).
     const cost_cents =
-        (opus_in_tokens * 5 +
-            opus_out_tokens * 25) / 10_000;
+        (stats.opus_in_tokens * 5 +
+            stats.opus_out_tokens * 25) / 10_000;
     const cost_str = std.fmt.allocPrint(
         arena,
         "${d}.{d:0>2}",
@@ -915,20 +936,20 @@ fn printTwoTierSummary(
             "======================================" ++
             "========\n",
         .{
-            total_experiments,
-            total_turns,
-            total_tool_calls,
-            total_api_errors,
-            opus_in_tokens,
-            opus_out_tokens,
+            stats.experiments,
+            stats.turns,
+            stats.tool_calls,
+            stats.api_errors,
+            stats.opus_in_tokens,
+            stats.opus_out_tokens,
             cost_str,
             core.nanosToMsStr(
                 arena,
-                total_api_ms * 1_000_000,
+                stats.api_ms * 1_000_000,
             ),
             core.nanosToMsStr(
                 arena,
-                total_tool_ms * 1_000_000,
+                stats.tool_ms * 1_000_000,
             ),
             core.nanosToMsStr(
                 arena,

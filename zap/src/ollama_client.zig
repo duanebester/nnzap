@@ -33,8 +33,6 @@ fn resolveApiUrl() []const u8 {
 }
 const MAX_API_RESPONSE: usize = 8 * 1024 * 1024;
 const MAX_TOOL_CALLS: u32 = 16;
-const HISTORY_DIR: []const u8 =
-    ".engine_agent_history";
 
 comptime {
     std.debug.assert(MAX_API_RESPONSE > 0);
@@ -42,61 +40,13 @@ comptime {
 }
 
 // ============================================================
-// JSON Value navigation helpers
-//
-// Mirrors the private helpers in api_client.zig.  These
-// pull typed fields from a parsed json.ObjectMap with
-// sensible defaults when the field is missing or has the
-// wrong type.
+// JSON Value navigation helpers — imported from api_client.
 // ============================================================
 
-/// Get a string field from a JSON object, or null.
-fn getStr(
-    obj: json.ObjectMap,
-    key: []const u8,
-) ?[]const u8 {
-    const val = obj.get(key) orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
-
-/// Get an integer field, or 0.
-fn getInt(
-    obj: json.ObjectMap,
-    key: []const u8,
-) i64 {
-    const val = obj.get(key) orelse return 0;
-    return switch (val) {
-        .integer => |i| i,
-        else => 0,
-    };
-}
-
-/// Get an object field.
-fn getObj(
-    obj: json.ObjectMap,
-    key: []const u8,
-) ?json.ObjectMap {
-    const val = obj.get(key) orelse return null;
-    return switch (val) {
-        .object => |o| o,
-        else => null,
-    };
-}
-
-/// Get an array field as a slice of Values.
-fn getArr(
-    obj: json.ObjectMap,
-    key: []const u8,
-) ?[]const json.Value {
-    const val = obj.get(key) orelse return null;
-    return switch (val) {
-        .array => |a| a.items,
-        else => null,
-    };
-}
+const getStr = api.getStr;
+const getInt = api.getInt;
+const getObj = api.getObj;
+const getArr = api.getArr;
 
 // ============================================================
 // Tool schema translation
@@ -156,7 +106,7 @@ fn writeOpenAITool(
         tool,
         "description",
     ) orelse "";
-    std.debug.assert(name.len >= 0);
+    std.debug.assert(name.len > 0);
 
     try w.beginObject();
     try w.objectField("type");
@@ -318,6 +268,30 @@ pub fn callApi(
     );
 }
 
+/// Check curl exit status. Returns an error response
+/// if curl failed, or null on success.
+fn checkCurlExit(
+    arena: Allocator,
+    result: std.process.Child.RunResult,
+) ?api.ApiResponse {
+    const curl_ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (curl_ok) return null;
+
+    const detail = if (result.stderr.len > 0)
+        api.truncate(result.stderr, 500)
+    else
+        "unknown curl error";
+    const msg = std.fmt.allocPrint(
+        arena,
+        "ollama curl failed: {s}",
+        .{detail},
+    ) catch "ollama curl failed";
+    return api.errResp(msg, true);
+}
+
 /// Save the request, execute curl, and hand off to
 /// response processing.
 fn executeCurlAndProcess(
@@ -327,7 +301,6 @@ fn executeCurlAndProcess(
 ) api.ApiResponse {
     std.debug.assert(body.len > 0);
     std.debug.assert(history_dir.len > 0);
-
     // Save request for debugging.
     const request_path = std.fmt.allocPrint(
         arena,
@@ -343,7 +316,6 @@ fn executeCurlAndProcess(
         .{body.len / 1024},
     );
 
-    // Build curl data argument referencing the file.
     const data_arg = std.fmt.allocPrint(
         arena,
         "@{s}",
@@ -352,9 +324,7 @@ fn executeCurlAndProcess(
         "failed to format curl arg",
         false,
     );
-
     api.log("  Waiting for Ollama response...\n", .{});
-
     const result = std.process.Child.run(.{
         .allocator = arena,
         .argv = &.{
@@ -384,24 +354,9 @@ fn executeCurlAndProcess(
         return api.errResp(msg, true);
     };
 
-    // Check curl process exit.
-    const curl_ok = switch (result.term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
-    if (!curl_ok) {
-        const detail = if (result.stderr.len > 0)
-            api.truncate(result.stderr, 500)
-        else
-            "unknown curl error";
-        const msg = std.fmt.allocPrint(
-            arena,
-            "ollama curl failed: {s}",
-            .{detail},
-        ) catch "ollama curl failed";
-        return api.errResp(msg, true);
+    if (checkCurlExit(arena, result)) |err| {
+        return err;
     }
-
     return processRawOutput(
         arena,
         result.stdout,
@@ -624,34 +579,33 @@ pub fn parseApiResponse(
     return buildOllamaSuccess(arena, obj);
 }
 
+/// Extract the first choice from the choices array.
+/// Returns the choice object, or null if missing.
+fn extractFirstChoice(
+    obj: json.ObjectMap,
+) ?json.ObjectMap {
+    const choices = getArr(obj, "choices") orelse {
+        return null;
+    };
+    if (choices.len == 0) return null;
+
+    return switch (choices[0]) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
 /// Build a successful ApiResponse from the parsed choices,
 /// message content, tool calls, and token usage.
 fn buildOllamaSuccess(
     arena: Allocator,
     obj: json.ObjectMap,
 ) api.ApiResponse {
-    // Extract choices array.
-    const choices = getArr(obj, "choices") orelse
+    const choice = extractFirstChoice(obj) orelse {
         return api.errResp(
-            "no choices in ollama response",
+            "no valid choice in ollama response",
             false,
         );
-    if (choices.len == 0) {
-        return api.errResp(
-            "empty choices array",
-            false,
-        );
-    }
-    // At least one choice exists after the length check.
-    std.debug.assert(choices.len > 0);
-
-    // First choice object.
-    const choice = switch (choices[0]) {
-        .object => |o| o,
-        else => return api.errResp(
-            "invalid choice object",
-            false,
-        ),
     };
 
     // finish_reason → stop_reason.

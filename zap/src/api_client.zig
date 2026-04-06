@@ -1,8 +1,9 @@
 //! api_client.zig — shared Anthropic API client infrastructure.
 //!
 //! Common types, JSON building, response parsing, logging,
-//! and timestamp formatting used by both `agent.zig` and
-//! `engine_agent.zig`.  Each agent imports this module and
+//! and timestamp formatting used by `agent_core.zig`,
+//! `bonsai_agent.zig`, and `mnist_agent.zig`.  Each agent
+//! imports this module and
 //! provides its own system prompt, tool schemas, tool
 //! dispatch, and API transport (std.http vs curl).
 //!
@@ -18,6 +19,7 @@
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
+const tools = @import("tools.zig");
 
 // ============================================================
 // Constants (Rule 4 — hard limits)
@@ -79,7 +81,7 @@ pub const ParsedContent = struct {
 // ============================================================
 
 /// Get a string field from a JSON object, or null.
-fn getStr(
+pub fn getStr(
     obj: json.ObjectMap,
     key: []const u8,
 ) ?[]const u8 {
@@ -91,7 +93,7 @@ fn getStr(
 }
 
 /// Get an integer field, or 0.
-fn getInt(
+pub fn getInt(
     obj: json.ObjectMap,
     key: []const u8,
 ) i64 {
@@ -103,7 +105,7 @@ fn getInt(
 }
 
 /// Get an object field.
-fn getObj(
+pub fn getObj(
     obj: json.ObjectMap,
     key: []const u8,
 ) ?json.ObjectMap {
@@ -115,7 +117,7 @@ fn getObj(
 }
 
 /// Get an array field as a slice of Values.
-fn getArr(
+pub fn getArr(
     obj: json.ObjectMap,
     key: []const u8,
 ) ?[]const json.Value {
@@ -155,17 +157,9 @@ pub fn appendJsonString(
 // String helpers
 // ============================================================
 
-pub fn eql(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
-
-pub fn truncate(
-    s: []const u8,
-    max: usize,
-) []const u8 {
-    std.debug.assert(max > 0);
-    return if (s.len <= max) s else s[0..max];
-}
+/// Re-exported from tools.zig for backward compatibility.
+pub const eql = tools.eql;
+pub const truncate = tools.truncate;
 
 // ============================================================
 // API request building
@@ -690,9 +684,8 @@ pub fn saveRunLog(
 // Logging (all output goes to stderr)
 // ============================================================
 
-pub const stderr_file = std.fs.File{
-    .handle = std.posix.STDERR_FILENO,
-};
+/// Re-exported from tools.zig for backward compatibility.
+pub const stderr_file = tools.stderr_file;
 
 pub fn log(
     comptime fmt: []const u8,
@@ -734,17 +727,8 @@ pub fn logToolCall(
 // File I/O
 // ============================================================
 
-pub fn writeFile(
-    path: []const u8,
-    content: []const u8,
-) !void {
-    std.debug.assert(path.len > 0);
-    std.debug.assert(content.len > 0);
-
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(content);
-}
+/// Re-exported from tools.zig for backward compatibility.
+pub const writeFile = tools.writeFile;
 
 // ============================================================
 // Timestamp formatting

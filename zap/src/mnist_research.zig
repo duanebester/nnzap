@@ -718,6 +718,59 @@ fn applyChanges(
     return buf.items;
 }
 
+/// A scalar config line replacement: when the change
+/// value is present and the trimmed line starts with
+/// the prefix, write the declaration with the new value.
+const ScalarRule = struct {
+    value: ?[]const u8,
+    prefix: []const u8,
+    declaration: []const u8,
+};
+
+/// Build the table of scalar replacement rules from
+/// the current config changes.
+fn scalarRules(
+    changes: *const ConfigChanges,
+) [4]ScalarRule {
+    return .{
+        .{
+            .value = changes.lr,
+            .prefix = "const learning_rate:",
+            .declaration = "const learning_rate: f32 = ",
+        },
+        .{
+            .value = changes.batch,
+            .prefix = "const max_batch:",
+            .declaration = "const max_batch: u32 = ",
+        },
+        .{
+            .value = changes.epochs,
+            .prefix = "const num_epochs:",
+            .declaration = "const num_epochs: u32 = ",
+        },
+        .{
+            .value = changes.seed,
+            .prefix = "const seed:",
+            .declaration = "const seed: u64 = ",
+        },
+    };
+}
+
+/// Write a scalar declaration line: indent + declaration
+/// prefix + value + semicolon.  Avoids comptime fmt.
+fn writeScalarReplacement(
+    arena: Allocator,
+    buf: *std.ArrayList(u8),
+    indent: usize,
+    declaration: []const u8,
+    value: []const u8,
+) void {
+    buf.appendNTimes(arena, ' ', indent) catch return;
+    buf.appendSlice(arena, declaration) catch return;
+    buf.appendSlice(arena, value) catch return;
+    buf.appendSlice(arena, ";") catch return;
+}
+
 /// Check if this line should be replaced.  If so, write
 /// the replacement to `buf` and return true.  Otherwise
 /// return false and the caller keeps the original.
@@ -729,64 +782,18 @@ fn tryReplaceLine(
     changes: *const ConfigChanges,
     first_net_param: *bool,
 ) bool {
-    if (changes.lr) |lr| {
-        if (tools.startsWith(
-            trimmed,
-            "const learning_rate:",
-        )) {
-            tools.writeIndented(
-                arena,
-                buf,
-                indent,
-                "const learning_rate: f32 = {s};",
-                .{lr},
-            );
-            return true;
-        }
-    }
-    if (changes.batch) |batch| {
-        if (tools.startsWith(
-            trimmed,
-            "const max_batch:",
-        )) {
-            tools.writeIndented(
-                arena,
-                buf,
-                indent,
-                "const max_batch: u32 = {s};",
-                .{batch},
-            );
-            return true;
-        }
-    }
-    if (changes.epochs) |epochs| {
-        if (tools.startsWith(
-            trimmed,
-            "const num_epochs:",
-        )) {
-            tools.writeIndented(
-                arena,
-                buf,
-                indent,
-                "const num_epochs: u32 = {s};",
-                .{epochs},
-            );
-            return true;
-        }
-    }
-    if (changes.seed) |seed_val| {
-        if (tools.startsWith(
-            trimmed,
-            "const seed:",
-        )) {
-            tools.writeIndented(
-                arena,
-                buf,
-                indent,
-                "const seed: u64 = {s};",
-                .{seed_val},
-            );
-            return true;
+    for (scalarRules(changes)) |rule| {
+        if (rule.value) |val| {
+            if (tools.startsWith(trimmed, rule.prefix)) {
+                writeScalarReplacement(
+                    arena,
+                    buf,
+                    indent,
+                    rule.declaration,
+                    val,
+                );
+                return true;
+            }
         }
     }
     return tryReplaceOptimizer(
@@ -799,6 +806,89 @@ fn tryReplaceLine(
     );
 }
 
+/// Replace `net.update(...)` or `net.updateAdam(...)`
+/// with the correct call for the chosen optimizer.
+fn tryReplaceUpdateCall(
+    arena: Allocator,
+    buf: *std.ArrayList(u8),
+    trimmed: []const u8,
+    indent: usize,
+    optimizer: []const u8,
+    changes: *const ConfigChanges,
+) bool {
+    if (!tools.startsWith(trimmed, "net.update")) {
+        return false;
+    }
+    if (tools.eql(optimizer, "adam")) {
+        const b1 = changes.beta1 orelse "0.9";
+        const b2 = changes.beta2 orelse "0.999";
+        const eps = changes.epsilon orelse "1e-8";
+        tools.writeIndented(
+            arena,
+            buf,
+            indent,
+            "net.updateAdam(" ++
+                "device, enc, " ++
+                "learning_rate, " ++
+                "{s}, {s}, {s});",
+            .{ b1, b2, eps },
+        );
+    } else {
+        tools.writeIndented(
+            arena,
+            buf,
+            indent,
+            "net.update(" ++
+                "device, enc, learning_rate);",
+            .{},
+        );
+    }
+    return true;
+}
+
+/// Replace the net parameter type in trainEpoch
+/// based on the optimizer (first occurrence only).
+fn tryReplaceNetParam(
+    arena: Allocator,
+    buf: *std.ArrayList(u8),
+    trimmed: []const u8,
+    indent: usize,
+    optimizer: []const u8,
+    first_net_param: *bool,
+) bool {
+    if (!first_net_param.*) return false;
+    if (std.mem.indexOf(
+        u8,
+        trimmed,
+        "MnistNet,",
+    ) == null) return false;
+    if (!tools.startsWith(trimmed, "net:")) {
+        return false;
+    }
+
+    first_net_param.* = false;
+    if (tools.eql(optimizer, "adam")) {
+        tools.writeIndented(
+            arena,
+            buf,
+            indent,
+            "net: *MnistNet,",
+            .{},
+        );
+    } else {
+        tools.writeIndented(
+            arena,
+            buf,
+            indent,
+            "net: *const MnistNet,",
+            .{},
+        );
+    }
+    return true;
+}
+
+/// Dispatch optimizer-related line replacements:
+/// update calls, .optimizer field, net parameter type.
 fn tryReplaceOptimizer(
     arena: Allocator,
     buf: *std.ArrayList(u8),
@@ -809,34 +899,14 @@ fn tryReplaceOptimizer(
 ) bool {
     const opt = changes.optimizer orelse return false;
 
-    // Update call: net.update(...) or net.updateAdam(...).
-    if (tools.startsWith(trimmed, "net.update")) {
-        if (tools.eql(opt, "adam")) {
-            const b1 = changes.beta1 orelse "0.9";
-            const b2 = changes.beta2 orelse "0.999";
-            const eps = changes.epsilon orelse "1e-8";
-            tools.writeIndented(
-                arena,
-                buf,
-                indent,
-                "net.updateAdam(" ++
-                    "device, enc, " ++
-                    "learning_rate, " ++
-                    "{s}, {s}, {s});",
-                .{ b1, b2, eps },
-            );
-        } else {
-            tools.writeIndented(
-                arena,
-                buf,
-                indent,
-                "net.update(" ++
-                    "device, enc, learning_rate);",
-                .{},
-            );
-        }
-        return true;
-    }
+    if (tryReplaceUpdateCall(
+        arena,
+        buf,
+        trimmed,
+        indent,
+        opt,
+        changes,
+    )) return true;
 
     // Benchmark config .optimizer field.
     if (tools.startsWith(trimmed, ".optimizer = .")) {
@@ -850,37 +920,14 @@ fn tryReplaceOptimizer(
         return true;
     }
 
-    // trainEpoch net parameter type (first occurrence).
-    if (first_net_param.* and
-        std.mem.indexOf(
-            u8,
-            trimmed,
-            "MnistNet,",
-        ) != null and
-        tools.startsWith(trimmed, "net:"))
-    {
-        first_net_param.* = false;
-        if (tools.eql(opt, "adam")) {
-            tools.writeIndented(
-                arena,
-                buf,
-                indent,
-                "net: *MnistNet,",
-                .{},
-            );
-        } else {
-            tools.writeIndented(
-                arena,
-                buf,
-                indent,
-                "net: *const MnistNet,",
-                .{},
-            );
-        }
-        return true;
-    }
-
-    return false;
+    return tryReplaceNetParam(
+        arena,
+        buf,
+        trimmed,
+        indent,
+        opt,
+        first_net_param,
+    );
 }
 
 fn buildLayoutBlock(
@@ -1058,25 +1105,7 @@ fn writeTrainError(
     arena: Allocator,
     stderr_output: []const u8,
 ) !void {
-    // Truncate stderr for JSON embedding.
-    const max_err = 2000;
-    const truncated = if (stderr_output.len > max_err)
-        stderr_output[stderr_output.len - max_err ..]
-    else
-        stderr_output;
-
-    const escaped = try tools.jsonEscape(
-        arena,
-        truncated,
-    );
-    const json = try std.fmt.allocPrint(
-        arena,
-        "{{\"status\": \"error\", " ++
-            "\"error\": \"build_failed\", " ++
-            "\"output\": \"{s}\"}}\n",
-        .{escaped},
-    );
-    try tools.writeStdout(json);
+    try tools.writeBuildError(arena, stderr_output, 2000);
 }
 
 // ============================================================

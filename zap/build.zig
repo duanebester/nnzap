@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/api_client.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tools.zig", .module = tools_module },
+        },
     });
 
     const ollama_client_module = b.createModule(.{
