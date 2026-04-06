@@ -20,6 +20,11 @@ zap/data/mnist/*
 # Agent history (persistent experiment log across runs)
 .agent_history/
 .engine_agent_history/
+.bonsai_history/
+.mnist_history/
+
+# MNIST snapshots (local experiment state)
+.mnist_snapshots/
 
 # Benchmark results (regenerated per run)
 benchmarks/
