@@ -9,7 +9,7 @@ GPU-accelerated neural network library + autonomous experiment runner for Apple 
 | Package        | Description                                                                                    |
 | -------------- | ---------------------------------------------------------------------------------------------- |
 | [`nn/`](nn/)   | GPU-powered neural network library — Metal compute, comptime layouts, zero-copy unified memory |
-| [`zap/`](zap/) | Autonomous experiment runner — LLM-powered research loops à la Karpathy's autoresearch         |
+| [`zap/`](zap/) | Autonomous experiment runner — LLM-powered research loops with a generic toolbox framework     |
 
 ## Why
 
@@ -52,51 +52,61 @@ Unified Memory  ──[compute]──>  same memory
 
 ```
 nnzap/
-├── nn/                            # Neural network library
-│   ├── build.zig                  # Library build (links Metal, Foundation, zig-objc)
-│   ├── build.zig.zon              # Package manifest
+├── nn/                              # Neural network library
+│   ├── build.zig                    # Library build (links Metal, Foundation, zig-objc)
+│   ├── build.zig.zon                # Package manifest
 │   ├── src/
-│   │   ├── root.zig               # Library entry point, re-exports
-│   │   ├── metal.zig              # Metal compute backend (Device, Buffer, pipelines)
-│   │   ├── layout.zig             # Comptime network layout (sizes, offsets, shapes)
-│   │   ├── network.zig            # Network struct with forward/backward pass
-│   │   ├── mnist.zig              # MNIST IDX data loader
-│   │   ├── benchmark.zig          # Benchmark result struct, JSON serialisation
+│   │   ├── root.zig                 # Library entry point, re-exports
+│   │   ├── metal.zig                # Metal compute backend (Device, Buffer, pipelines)
+│   │   ├── layout.zig               # Comptime network layout (sizes, offsets, shapes)
+│   │   ├── network.zig              # Network struct with forward/backward pass
+│   │   ├── transformer.zig          # Transformer implementation (Bonsai 1.7B)
+│   │   ├── model.zig                # Model loading (safetensors)
+│   │   ├── safetensors.zig          # Safetensors format parser
+│   │   ├── tokenizer.zig            # Tokenizer
+│   │   ├── mnist.zig                # MNIST IDX data loader
+│   │   ├── benchmark.zig            # Benchmark recording + JSON serialisation
 │   │   └── shaders/
-│   │       └── compute.metal      # All GPU compute kernels (MSL)
+│   │       ├── compute.metal        # General NN GPU kernels (MSL)
+│   │       └── transformer.metal    # Attention-specific GPU kernels
 │   └── examples/
-│       └── mnist.zig              # MNIST training loop, evaluation, benchmarking
-├── zap/                           # Autonomous experiment runner
-│   ├── build.zig                  # CLI tools build
-│   ├── build.zig.zon              # Package manifest
+│       ├── mnist.zig                # MNIST training loop + evaluation
+│       ├── mnist_1bit.zig           # 1-bit MNIST variant
+│       ├── bonsai.zig               # Bonsai tree classifier
+│       ├── bonsai_bench.zig         # Bonsai benchmarking
+│       └── inference_bench.zig      # Inference benchmarking
+├── zap/                             # Autonomous experiment runner
+│   ├── build.zig                    # CLI tools build
+│   ├── build.zig.zon                # Package manifest
 │   ├── src/
-│   │   ├── agent_core.zig         # Shared agent framework (loop, dispatch, API)
-│   │   ├── mnist_agent.zig        # MNIST training agent (profile config)
-│   │   ├── mnist_research.zig     # MNIST research CLI (config/train/bench)
-│   │   ├── bonsai_agent.zig       # Bonsai inference agent (profile config + two-tier)
-│   │   ├── bonsai_research.zig    # Bonsai research CLI (snapshot/rollback/bench/edit)
-│   │   ├── api_client.zig         # Anthropic HTTP client
-│   │   ├── ollama_client.zig      # Local LLM client (two-tier mode)
-│   │   └── tools.zig              # Shared CLI/file utilities
-│   ├── programs/
-│   │   ├── program.md             # Shared conventions
-│   │   ├── mnist_program.md       # MNIST agent skill file
-│   │   ├── mnist_system.md        # MNIST system prompt
-│   │   ├── mnist_tools.json       # MNIST tool schemas
-│   │   ├── bonsai_program.md      # Bonsai agent skill file
-│   │   ├── bonsai_system.md       # Bonsai system prompt
-│   │   ├── bonsai_tools.json      # Bonsai tool schemas
-│   │   ├── bonsai_strategist.md   # Two-tier strategist prompt
-│   │   └── bonsai_executor.md     # Two-tier executor prompt
-├── reference/
-│   ├── mlx_reference.py           # MLX baseline for comparison
-│   └── pytorch_reference.py       # PyTorch baseline for comparison
-├── data/                          # MNIST dataset (downloaded at runtime)
+│   │   ├── agent_core.zig           # Generic agent framework (loop, dispatch, API)
+│   │   ├── toolbox.zig              # Generic toolbox (23 tools, ToolboxConfig)
+│   │   ├── tools.zig                # Shared CLI/file utilities
+│   │   ├── api_client.zig           # Anthropic HTTP client
+│   │   ├── bonsai_agent.zig         # Bonsai agent profile (~100 lines)
+│   │   ├── bonsai_research.zig      # Bonsai toolbox config (~90 lines)
+│   │   ├── mnist_agent.zig          # MNIST agent profile (~130 lines)
+│   │   └── mnist_research.zig       # MNIST toolbox config + custom tools
+│   └── programs/
+│       ├── program.md               # Shared conventions
+│       ├── bonsai_program.md        # Bonsai skill file
+│       ├── bonsai_system.md         # Bonsai system prompt
+│       ├── mnist_program.md         # MNIST skill file
+│       └── mnist_system.md          # MNIST system prompt
+├── reference/                       # Baseline implementations for comparison
+│   ├── mlx_reference.py             # MLX MNIST baseline
+│   ├── mlx_inference.py             # MLX inference baseline
+│   ├── mlx_bonsai.py                # MLX Bonsai baseline
+│   ├── pytorch_reference.py         # PyTorch MNIST baseline
+│   └── pytorch_inference.py         # PyTorch inference baseline
 ├── docs/
-│   ├── ARCHITECTURE.md            # Detailed architecture documentation
-│   └── STRATEGY.md                # Strategic positioning (Moreau pattern)
-├── CLAUDE.md                      # Engineering principles
-└── README.md                      # This file
+│   ├── ARCHITECTURE.md              # Detailed technical architecture
+│   ├── STRATEGY.md                  # Strategic positioning (Moreau pattern)
+│   ├── BONSAI.md                    # Bonsai model documentation
+│   └── PERF_PLAN.md                 # Performance roadmap
+├── data/                            # Datasets (downloaded at runtime)
+├── CLAUDE.md                        # Engineering principles
+└── README.md                        # This file
 ```
 
 ## Quick start
@@ -224,55 +234,81 @@ try bench.save("mnist");
 
 ## Autoresearch
 
-The `zap/` package contains tools for autonomous ML experiment loops,
-built on a shared agent framework (`agent_core.zig`) with pluggable
-research profiles.
+The `zap/` package runs autonomous ML experiment loops. An LLM
+(Claude) drives the research — reading code, editing files, running
+benchmarks, and iterating — while a generic toolbox framework handles
+the mechanics.
 
-### How it works
+### Framework
+
+Zap is built around two generic engines and thin domain configs:
 
 ```
-┌────────────────┐     ┌──────────────┐     ┌──────────────┐
-│ mnist_research │────>│  nn (build   │────>│  benchmarks/  │
-│ CLI toolbox    │     │  + run)      │     │  JSON results │
-└────────────────┘     └──────────────┘     └──────────────┘
-        │                                         │
-        └──────── compare / config-set ───────────┘
+                    ┌───────────────────┐
+                    │   agent_core.zig  │  Generic agent loop
+                    │   (API, dispatch, │  (turn management,
+                    │    history)       │   context building)
+                    └────────┬──────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ...
+     ┌────────────┐  ┌──────────────┐
+     │ bonsai     │  │ mnist        │  Agent profiles
+     │ _agent.zig │  │ _agent.zig   │  (~100 lines each)
+     └────────────┘  └──────────────┘
+
+
+                    ┌───────────────────┐
+                    │   toolbox.zig     │  Generic toolbox
+                    │   (23 tools:      │  (snapshot, bench,
+                    │    file I/O,      │   edit, diff,
+                    │    build, ...)    │   commit, ...)
+                    └────────┬──────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ...
+     ┌────────────┐  ┌──────────────┐
+     │ bonsai     │  │ mnist        │  Toolbox configs
+     │ _research  │  │ _research    │  (~90 lines each)
+     └────────────┘  └──────────────┘
 ```
+
+**Agent profiles** configure the LLM loop: system prompt, tool
+schemas (defined as comptime `ToolDef` structs), history fields,
+and turn limits.
+
+**Toolbox configs** configure the CLI: write scope, read scope,
+build/test/bench commands, snapshot directory, and an optional
+`custom_dispatch` callback for domain-specific tools.
+
+Adding a new domain means writing ~200 lines of config (one agent
+profile, one toolbox config, one system prompt) — no copy-pasting
+thousands of lines of tool logic.
 
 ### MNIST research (hyperparameter optimisation)
 
 ```bash
-# Build both packages
-cd nn && zig build && cd ..
-cd zap && zig build && cd ..
+cd zap && zig build
 
-# Run from zap directory
-cd zap
 ./zig-out/bin/mnist_research help
 ./zig-out/bin/mnist_research config-show
-./zig-out/bin/mnist_research train
-./zig-out/bin/mnist_research benchmark-compare
+./zig-out/bin/mnist_research bench
+./zig-out/bin/mnist_research bench-compare
 ```
 
 ### MNIST agent
 
-The agent wraps mnist_research with an LLM (Claude) that decides what
-experiments to run:
-
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-cd zap
-zig build
+cd zap && zig build
 ./zig-out/bin/mnist_agent
 ```
 
 ### Bonsai research (inference optimisation)
 
-Bonsai research targets the core library code — Metal kernels, dispatch
-strategies, buffer layouts:
-
 ```bash
-cd zap
+cd zap && zig build
+
 ./zig-out/bin/bonsai_research help
 ./zig-out/bin/bonsai_research snapshot
 ./zig-out/bin/bonsai_research bench
@@ -280,20 +316,9 @@ cd zap
 
 ### Bonsai agent
 
-Single-tier (Claude drives everything):
-
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-cd zap
-./zig-out/bin/bonsai_agent
-```
-
-Two-tier (Opus strategist + local LLM executor):
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export LOCAL_LLM_MODEL=default
-cd zap
+cd zap && zig build
 ./zig-out/bin/bonsai_agent
 ```
 
@@ -312,23 +337,32 @@ cd zap
 - [x] MNIST data loader with one-hot encoding
 - [x] Benchmark recording + JSON serialisation
 - [x] Fused matmul+bias+relu kernel
-- [x] Tiled matmul kernel (16×16 tiles, shared memory)
+- [x] Tiled matmul kernel (16×16 tiles, shared memory, forward + backward)
 - [x] Multi-batch command buffer encoding
-- [x] Autoresearch toolbox
-- [x] LLM agent (hyperparameter + engine)
+- [x] Transformer implementation (Bonsai 1.7B inference)
+- [x] Safetensors model loading
+- [x] Tokenizer
+- [x] Generic autoresearch toolbox framework
+- [x] Comptime tool definitions (schemas + dispatch)
+- [x] LLM agents (hyperparameter + engine optimisation)
 
 ### Next
 
-- [ ] Tiled matmul for backward pass
 - [ ] Conv2D layer
-- [ ] Attention / transformer block
-- [ ] Model serialisation (save/load weights)
+- [ ] Batched prefill (quantised matrix-matrix multiply for multi-token prefill)
+- [ ] Flash attention (tiled attention for long contexts)
+- [ ] Transformer training / backward pass
+- [ ] Save trained weights to safetensors
+- [ ] Training checkpoints (periodic weight snapshots mid-training)
 - [ ] CoreML export
 
 ## Docs
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — detailed technical architecture
 - [`docs/STRATEGY.md`](docs/STRATEGY.md) — strategic positioning and target domains
+- [`docs/BONSAI.md`](docs/BONSAI.md) — Bonsai model documentation
+- [`docs/PERF_PLAN.md`](docs/PERF_PLAN.md) — performance roadmap
+- [`zap/docs/framework_design.md`](zap/docs/framework_design.md) — toolbox framework design
 - [`CLAUDE.md`](CLAUDE.md) — engineering principles and coding rules
 
 ## Dependencies

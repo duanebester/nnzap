@@ -1,0 +1,9 @@
+Fuse gate/up QMV + SiLU + elementwise mul into single kernel dispatch
+
+Add qmv_spec_fused_pair_silu_f16io kernel that computes
+silu(gate_proj) * up_proj in the QMV output stage, eliminating
+the separate silu_elementwise_mul_f16 dispatch and two buffer
+barriers per block. For 28-layer Bonsai 1.7B this saves 28
+kernel dispatches and 56 barrier insertions per decode token.
+
+Decode throughput: 182.8 → ~190 tok/s (p50 latency 5449 → ~5200us)

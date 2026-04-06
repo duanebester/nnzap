@@ -319,16 +319,20 @@ pub fn writeIndented(
 // ============================================================
 
 /// Convert a monorepo-root-relative path to a filesystem
-/// path relative to the zap/ working directory.
+/// path relative to the current working directory.
+/// `root` is the prefix to prepend (e.g. ".." when running
+/// from a subdirectory of the monorepo).
 ///
 /// Paths already local to zap/ (src/, programs/, build.zig,
 /// build.zig.zon) pass through unchanged.  Everything else
-/// gets a "../" prefix to reach the monorepo root.
+/// gets a "{root}/" prefix to reach the monorepo root.
 pub fn resolveToFs(
     arena: Allocator,
+    root: []const u8,
     path: []const u8,
 ) ![]const u8 {
     std.debug.assert(path.len > 0);
+    std.debug.assert(root.len > 0);
 
     // Paths local to zap/ need no prefix.
     if (startsWith(path, "src/") or
@@ -341,8 +345,8 @@ pub fn resolveToFs(
 
     return try std.fmt.allocPrint(
         arena,
-        "../{s}",
-        .{path},
+        "{s}/{s}",
+        .{ root, path },
     );
 }
 
@@ -461,16 +465,29 @@ pub fn sortStrings(items: [][]const u8) void {
 // benchmark directory, so callers control resolution.
 // ============================================================
 
-pub fn isBenchmarkFile(name: []const u8) bool {
-    return (std.mem.startsWith(u8, name, "mnist_") or
-        std.mem.startsWith(u8, name, "inference_")) and
-        std.mem.endsWith(u8, name, ".json");
+/// Check whether a filename matches any of the given
+/// benchmark prefixes and ends with `.json`.
+pub fn isBenchmarkFile(
+    name: []const u8,
+    prefixes: []const []const u8,
+) bool {
+    std.debug.assert(prefixes.len > 0);
+    if (!std.mem.endsWith(u8, name, ".json")) {
+        return false;
+    }
+    for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// List all benchmark JSON filenames, sorted ascending.
 pub fn listBenchmarkFiles(
     arena: Allocator,
     bench_dir_fs: []const u8,
+    prefixes: []const []const u8,
 ) ![]const []const u8 {
     std.debug.assert(bench_dir_fs.len > 0);
     var dir = std.fs.cwd().openDir(
@@ -483,7 +500,7 @@ pub fn listBenchmarkFiles(
     var iter = dir.iterate();
 
     while (try iter.next()) |entry| {
-        if (isBenchmarkFile(entry.name)) {
+        if (isBenchmarkFile(entry.name, prefixes)) {
             const dupe = try arena.dupe(u8, entry.name);
             try names.append(arena, dupe);
         }
@@ -498,6 +515,7 @@ pub fn listBenchmarkFiles(
 pub fn findOneBenchmark(
     arena: Allocator,
     bench_dir_fs: []const u8,
+    prefixes: []const []const u8,
 ) ?[]const u8 {
     std.debug.assert(bench_dir_fs.len > 0);
     var dir = std.fs.cwd().openDir(
@@ -508,7 +526,7 @@ pub fn findOneBenchmark(
 
     var iter = dir.iterate();
     while (iter.next() catch null) |entry| {
-        if (isBenchmarkFile(entry.name)) {
+        if (isBenchmarkFile(entry.name, prefixes)) {
             return arena.dupe(u8, entry.name) catch null;
         }
     }
@@ -519,6 +537,7 @@ pub fn findOneBenchmark(
 /// of files removed.
 pub fn cleanBenchmarkFiles(
     bench_dir_fs: []const u8,
+    prefixes: []const []const u8,
 ) u32 {
     std.debug.assert(bench_dir_fs.len > 0);
     var dir = std.fs.cwd().openDir(
@@ -530,7 +549,7 @@ pub fn cleanBenchmarkFiles(
     var count: u32 = 0;
     var iter = dir.iterate();
     while (iter.next() catch null) |entry| {
-        if (isBenchmarkFile(entry.name)) {
+        if (isBenchmarkFile(entry.name, prefixes)) {
             dir.deleteFile(entry.name) catch {};
             count += 1;
         }
@@ -643,11 +662,13 @@ pub fn formatCompareEntry(
 pub fn toolBenchCompare(
     arena: Allocator,
     bench_dir_fs: []const u8,
+    prefixes: []const []const u8,
 ) !void {
     std.debug.assert(bench_dir_fs.len > 0);
     const names = try listBenchmarkFiles(
         arena,
         bench_dir_fs,
+        prefixes,
     );
     var buf: std.ArrayList(u8) = .empty;
 

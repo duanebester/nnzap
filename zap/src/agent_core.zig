@@ -73,6 +73,187 @@ pub const ToolMapping = struct {
     field: ?[]const u8 = null,
 };
 
+// ============================================================
+// Comptime tool definitions
+//
+// Define tools once as ToolDef structs.  At compile time,
+// generate both the ToolMapping dispatch table and the
+// JSON schema string for the Anthropic API.  Single
+// source of truth — no separate JSON files (Rule 14).
+// ============================================================
+
+/// JSON Schema property type for tool parameters.
+pub const PropertyType = enum {
+    string,
+    integer,
+    string_array,
+};
+
+/// One property in a tool's input schema.
+pub const Property = struct {
+    name: []const u8,
+    description: []const u8,
+    type: PropertyType = .string,
+    required: bool = true,
+};
+
+/// Complete tool definition: dispatch info + API schema.
+/// Define once, derive both ToolMapping and JSON at
+/// comptime.
+pub const ToolDef = struct {
+    /// LLM-facing name: "read_file".
+    name: []const u8,
+    /// CLI-facing subcommand: "read-file".
+    subcommand: []const u8,
+    /// LLM-facing description for the API schema.
+    description: []const u8,
+    /// Input properties (empty = no parameters).
+    properties: []const Property = &.{},
+    /// Override auto-derived dispatch shape.  null =
+    /// derive: 0 props → no_input, 1 → string_arg,
+    /// 2+ → json_payload.
+    shape_override: ?ToolShape = null,
+
+    /// Resolve the dispatch shape for this tool.
+    fn resolveShape(
+        comptime self: ToolDef,
+    ) ToolShape {
+        if (self.shape_override) |s| return s;
+        return switch (self.properties.len) {
+            0 => .no_input,
+            1 => .string_arg,
+            else => .json_payload,
+        };
+    }
+
+    /// Derive the field name for string_arg dispatch.
+    fn resolveField(
+        comptime self: ToolDef,
+    ) ?[]const u8 {
+        if (self.resolveShape() != .string_arg) {
+            return null;
+        }
+        comptime std.debug.assert(
+            self.properties.len == 1,
+        );
+        return self.properties[0].name;
+    }
+};
+
+/// Generate a ToolMapping slice from ToolDef array.
+pub fn toolMappings(
+    comptime defs: []const ToolDef,
+) []const ToolMapping {
+    comptime {
+        var maps: [defs.len]ToolMapping = undefined;
+        for (defs, 0..) |def, i| {
+            maps[i] = .{
+                .tool_name = def.name,
+                .subcommand = def.subcommand,
+                .shape = def.resolveShape(),
+                .field = def.resolveField(),
+            };
+        }
+        const final = maps;
+        return &final;
+    }
+}
+
+/// Generate the Anthropic tool schemas JSON array
+/// from a ToolDef array.
+pub fn toolSchemas(
+    comptime defs: []const ToolDef,
+) []const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var json: []const u8 = "[";
+        for (defs, 0..) |def, i| {
+            if (i > 0) json = json ++ ",";
+            json = json ++ toolJson(def);
+        }
+        return json ++ "]";
+    }
+}
+
+// ── Comptime JSON helpers (private) ──────────────────
+
+/// Generate JSON for one tool definition.
+fn toolJson(comptime def: ToolDef) []const u8 {
+    return "{\"name\":\"" ++ def.name ++ "\"," ++
+        "\"description\":\"" ++
+        comptimeEscape(def.description) ++
+        "\",\"input_schema\":" ++
+        schemaJson(def.properties) ++ "}";
+}
+
+/// Generate the input_schema JSON object.
+fn schemaJson(
+    comptime props: []const Property,
+) []const u8 {
+    comptime {
+        var pj: []const u8 = "";
+        var rj: []const u8 = "";
+        for (props, 0..) |p, i| {
+            if (i > 0) pj = pj ++ ",";
+            pj = pj ++ propJson(p);
+            if (p.required) {
+                if (rj.len > 0) rj = rj ++ ",";
+                rj = rj ++ "\"" ++ p.name ++ "\"";
+            }
+        }
+        return "{\"type\":\"object\"," ++
+            "\"properties\":{" ++ pj ++ "}," ++
+            "\"required\":[" ++ rj ++ "]}";
+    }
+}
+
+/// Generate JSON for one property.
+fn propJson(comptime p: Property) []const u8 {
+    const type_str = switch (p.type) {
+        .string => "\"type\":\"string\"",
+        .integer => "\"type\":\"integer\"",
+        .string_array => "\"type\":\"array\"," ++
+            "\"items\":{\"type\":\"string\"}",
+    };
+    return "\"" ++ p.name ++ "\":{" ++ type_str ++
+        ",\"description\":\"" ++
+        comptimeEscape(p.description) ++ "\"}";
+}
+
+/// Escape a string for use in JSON at compile time.
+fn comptimeEscape(
+    comptime s: []const u8,
+) []const u8 {
+    comptime {
+        var r: []const u8 = "";
+        for (s) |c| {
+            r = r ++ escapeChar(c);
+        }
+        return r;
+    }
+}
+
+/// Return the JSON escape sequence for one byte.
+fn escapeChar(comptime c: u8) []const u8 {
+    return switch (c) {
+        '"' => "\\\"",
+        '\\' => "\\\\",
+        '\n' => "\\n",
+        '\r' => "\\r",
+        '\t' => "\\t",
+        else => &[_]u8{c},
+    };
+}
+
+/// One metric to extract from benchmark JSONL for the
+/// compact history summary.
+pub const HistoryField = struct {
+    /// JSON key in the benchmark output.
+    json_key: []const u8,
+    /// Short label for the history summary line.
+    label: []const u8,
+};
+
 /// Profile definition.  Each research domain provides
 /// one of these to configure the generic agent loop.
 pub const AgentConfig = struct {
@@ -81,9 +262,11 @@ pub const AgentConfig = struct {
     toolbox_path: []const u8,
     history_dir: []const u8,
 
-    // Prompts (loaded from files at startup).
+    // Prompts.
     system_prompt_path: []const u8,
-    tool_schemas_path: []const u8,
+    /// Anthropic tool schemas JSON array.  Generate at
+    /// comptime from ToolDef array via toolSchemas().
+    tool_schemas: []const u8,
 
     // Tool dispatch table.
     tool_map: []const ToolMapping,
@@ -91,6 +274,11 @@ pub const AgentConfig = struct {
     // Tool names whose output gets persisted to
     // experiments.jsonl on success.
     persist_tools: []const []const u8 = &.{},
+
+    /// Metrics to extract from benchmark JSON for the
+    /// compact history.  Walked by formatHistoryLine
+    /// instead of hardcoded field names.
+    history_fields: []const HistoryField = &.{},
 
     // Limits (Rule 4 — hard caps).
     max_experiments: u32 = 50,
@@ -193,10 +381,7 @@ pub fn run(config: *const AgentConfig) !void {
         arena,
         config.system_prompt_path,
     );
-    const tool_schemas = loadPromptFile(
-        arena,
-        config.tool_schemas_path,
-    );
+    const tool_schemas = config.tool_schemas;
 
     var stats = RunStats{};
 
@@ -1451,7 +1636,7 @@ fn buildDefaultContext(
 ) []const u8 {
     const history = buildHistorySummary(
         arena,
-        config.history_dir,
+        config,
     );
     const summaries = buildSummariesSection(
         arena,
@@ -1589,14 +1774,14 @@ pub fn appendExperiment(
 /// Build a compact summary table from experiments.jsonl.
 pub fn buildHistorySummary(
     arena: Allocator,
-    history_dir: []const u8,
+    config: *const AgentConfig,
 ) []const u8 {
     const max_visible: u32 = 10;
 
     const hist_path = std.fmt.allocPrint(
         arena,
         "{s}/experiments.jsonl",
-        .{history_dir},
+        .{config.history_dir},
     ) catch return "";
     const fs_path = resolveToFs(
         arena,
@@ -1644,6 +1829,7 @@ pub fn buildHistorySummary(
     );
 
     return formatHistoryLines(
+        config,
         arena,
         lines[0..line_count],
         start,
@@ -1654,6 +1840,7 @@ pub fn buildHistorySummary(
 
 /// Format the visible history lines into a summary.
 fn formatHistoryLines(
+    config: *const AgentConfig,
     arena: Allocator,
     lines: []const []const u8,
     start: u32,
@@ -1672,6 +1859,7 @@ fn formatHistoryLines(
     var idx: u32 = start;
     while (idx < total) : (idx += 1) {
         const row = formatHistoryLine(
+            config,
             arena,
             idx + 1,
             lines[idx],
@@ -1684,8 +1872,10 @@ fn formatHistoryLines(
 }
 
 /// Extract key metrics from one JSONL line into a
-/// compact human-readable row.
+/// compact human-readable row.  Walks config.history_fields
+/// so each domain controls which metrics appear.
 fn formatHistoryLine(
+    config: *const AgentConfig,
     arena: Allocator,
     index: u32,
     line: []const u8,
@@ -1705,28 +1895,39 @@ fn formatHistoryLine(
     };
 
     const ts = getStrOr(obj, "timestamp_utc", "?");
-    const throughput = getNumStr(
-        arena,
-        obj,
-        "throughput_images_per_sec",
-    );
-    const accuracy = getNumStr(
-        arena,
-        obj,
-        "final_test_accuracy_pct",
-    );
-    const train_ms = getNumStr(
-        arena,
-        obj,
-        "total_training_ms",
-    );
 
-    return std.fmt.allocPrint(
+    // Fallback: no fields configured — show raw line.
+    if (config.history_fields.len == 0) {
+        return std.fmt.allocPrint(
+            arena,
+            "  {d}. {s}  (raw) {s}\n",
+            .{ index, ts, line },
+        ) catch null;
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    const prefix = std.fmt.allocPrint(
         arena,
-        "  {d}. {s}  throughput={s}  " ++
-            "acc={s}%  time={s}ms\n",
-        .{ index, ts, throughput, accuracy, train_ms },
-    ) catch null;
+        "  {d}. {s}",
+        .{ index, ts },
+    ) catch return null;
+    buf.appendSlice(arena, prefix) catch return null;
+
+    for (config.history_fields) |field| {
+        const val = getNumStr(
+            arena,
+            obj,
+            field.json_key,
+        );
+        const part = std.fmt.allocPrint(
+            arena,
+            "  {s}={s}",
+            .{ field.label, val },
+        ) catch continue;
+        buf.appendSlice(arena, part) catch continue;
+    }
+    buf.appendSlice(arena, "\n") catch return null;
+    return buf.items;
 }
 
 /// Load experiment summaries from summaries.jsonl.
@@ -1895,7 +2096,7 @@ pub fn resolveToFs(
     path: []const u8,
 ) ?[]const u8 {
     if (path.len == 0) return null;
-    return tools.resolveToFs(arena, path) catch null;
+    return tools.resolveToFs(arena, "..", path) catch null;
 }
 
 // ============================================================
@@ -1997,5 +2198,74 @@ pub fn printHeader(name: []const u8) void {
             "========================================" ++
             "======\n\n",
         .{name},
+    );
+}
+
+test "comptime tool schema generation" {
+    const defs = [_]ToolDef{
+        .{
+            .name = "list_items",
+            .subcommand = "list-items",
+            .description = "List all items.",
+        },
+        .{
+            .name = "read_file",
+            .subcommand = "read-file",
+            .description = "Read a file.",
+            .properties = &.{.{
+                .name = "path",
+                .description = "File path to read.",
+            }},
+        },
+        .{
+            .name = "search",
+            .subcommand = "search",
+            .description = "Search with options.",
+            .properties = &.{
+                .{
+                    .name = "query",
+                    .description = "Search query.",
+                },
+                .{
+                    .name = "limit",
+                    .description = "Max results.",
+                    .type = .integer,
+                    .required = false,
+                },
+            },
+        },
+    };
+
+    const maps = comptime toolMappings(&defs);
+    const json = comptime toolSchemas(&defs);
+
+    // Mapping count matches def count.
+    comptime std.debug.assert(maps.len == 3);
+
+    // Shapes derived correctly from property count.
+    comptime std.debug.assert(maps[0].shape == .no_input);
+    comptime std.debug.assert(maps[1].shape == .string_arg);
+    comptime std.debug.assert(maps[2].shape == .json_payload);
+
+    // Field derived for the string_arg tool.
+    comptime std.debug.assert(
+        std.mem.eql(u8, maps[1].field.?, "path"),
+    );
+    comptime std.debug.assert(maps[0].field == null);
+    comptime std.debug.assert(maps[2].field == null);
+
+    // JSON is a valid array envelope.
+    comptime std.debug.assert(json[0] == '[');
+    comptime std.debug.assert(json[json.len - 1] == ']');
+
+    // JSON contains each tool name.
+    comptime std.debug.assert(
+        std.mem.indexOf(u8, json, "list_items") != null,
+    );
+    comptime std.debug.assert(
+        std.mem.indexOf(u8, json, "read_file") != null,
+    );
+    comptime std.debug.assert(
+        std.mem.indexOf(u8, json, "search") != null,
     );
 }

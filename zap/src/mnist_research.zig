@@ -1,36 +1,19 @@
-//! nnzap autoresearch — AI agent toolbox.
+//! MNIST research toolbox — configures the generic
+//! toolbox for MNIST hyperparameter optimisation.
 //!
-//! A CLI binary that outputs JSON on stdout, designed for
-//! AI coding agents to invoke via terminal.  Each subcommand
-//! is a "tool" the agent calls.
+//! Custom tools (config-show, config-set, config-backup,
+//! config-restore) handle MNIST-specific source code
+//! parsing and modification.  All other tools are
+//! provided by the generic toolbox.
 //!
-//! Tools:
-//!   help               Show available tools
-//!   benchmark-list     List benchmark JSON filenames
-//!   benchmark-latest   Output latest benchmark result
-//!   benchmark-compare  Compare all benchmark runs
-//!   config-show        Current hyperparameters from main.zig
-//!   config-set K=V ... Modify hyperparameters in main.zig
-//!   config-backup      Backup main.zig before editing
-//!   config-restore     Restore main.zig from backup
-//!   train              Build + run training, output result
-//!   clean              Delete old benchmark files
-//!
-//! Output contract:
-//!   stdout  → JSON (parsed by agent)
-//!   stderr  → human-readable diagnostics
-//!   exit 0  → success
-//!   exit 1  → failure (stdout still valid JSON with error)
-//!
-//! Build:
+//! Usage:
 //!   zig build
-//!
-//! Run:
-//!   ./zig-out/bin/autoresearch <tool> [args...]
+//!   ./zig-out/bin/mnist_research <tool> [args...]
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const tools = @import("tools.zig");
+const toolbox = @import("toolbox.zig");
 
 // ============================================================
 // Constants (Rule 4 — hard limits)
@@ -43,7 +26,7 @@ const MAIN_PATH = "nn/examples/mnist.zig";
 const BACKUP_PATH = "nn/examples/mnist.zig.bak";
 
 // ============================================================
-// Config types — autoresearch-specific
+// Config types — MNIST-specific
 // ============================================================
 
 const Layer = struct {
@@ -78,221 +61,95 @@ const ConfigChanges = struct {
 };
 
 // ============================================================
+// Toolbox configuration
+// ============================================================
+
+const config = toolbox.ToolboxConfig{
+    .name = "mnist",
+    .project_root = "../nn",
+    .write_scope = &.{
+        "nn/examples/mnist.zig",
+    },
+    .read_scope = &.{
+        "nn/src/",
+        "nn/examples/",
+        "benchmarks/",
+        ".mnist_history/",
+    },
+    .read_files = &.{
+        "nn/build.zig",
+        "nn/build.zig.zon",
+    },
+    .engine_files = &.{
+        "nn/examples/mnist.zig",
+    },
+    .check_command = &.{ "zig", "build" },
+    .test_command = &.{ "zig", "build", "test" },
+    .bench_command = &.{ "zig", "build", "run" },
+    .bench_output_file = true,
+    .bench_dir = "benchmarks",
+    .bench_prefixes = &.{ "mnist_", "inference_" },
+    .history_dir = ".mnist_history",
+    .snapshot_dir = ".mnist_snapshots",
+    .custom_dispatch = &mnistDispatch,
+};
+
+// ============================================================
 // Entry point
 // ============================================================
 
-pub fn main() !void {
-    var arena_state = std.heap.ArenaAllocator.init(
-        std.heap.page_allocator,
-    );
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const args = try std.process.argsAlloc(arena);
-    std.debug.assert(args.len >= 1);
-
-    if (args.len < 2) {
-        try toolHelp();
-        std.process.exit(1);
-    }
-
-    const cmd = args[1];
-    const rest: []const []const u8 = if (args.len > 2)
-        args[2..]
-    else
-        &.{};
-
-    dispatch(arena, cmd, rest) catch |err| {
-        try tools.writeJsonError(err);
-        std.process.exit(1);
-    };
+pub fn main() void {
+    toolbox.run(&config);
 }
 
-fn dispatch(
+// ============================================================
+// Custom dispatch — MNIST-specific tools
+// ============================================================
+
+fn mnistDispatch(
     arena: Allocator,
     cmd: []const u8,
     args: []const []const u8,
-) !void {
-    if (tools.eql(cmd, "help")) return toolHelp();
-    if (tools.eql(cmd, "benchmark-list")) {
-        return toolBenchList(arena);
-    }
-    if (tools.eql(cmd, "benchmark-latest")) {
-        return toolBenchLatest(arena);
-    }
-    if (tools.eql(cmd, "benchmark-compare")) {
-        return toolBenchCompare(arena);
-    }
+) !bool {
     if (tools.eql(cmd, "config-show")) {
-        return toolConfigShow(arena);
+        try toolConfigShow(arena);
+        return true;
     }
     if (tools.eql(cmd, "config-set")) {
-        return toolConfigSet(arena, args);
+        try toolConfigSet(arena, args);
+        return true;
     }
     if (tools.eql(cmd, "config-backup")) {
-        return toolConfigBackup(arena);
+        try toolConfigBackup(arena);
+        return true;
     }
     if (tools.eql(cmd, "config-restore")) {
-        return toolConfigRestore(arena);
+        try toolConfigRestore(arena);
+        return true;
     }
-    if (tools.eql(cmd, "train")) return toolTrain(arena);
-    if (tools.eql(cmd, "clean")) return toolClean(arena);
-
-    try toolHelp();
-    std.process.exit(1);
+    return false;
 }
 
 // ============================================================
-// Tool: help
-// ============================================================
-
-fn toolHelp() !void {
-    try tools.writeStdout(
-        \\{
-        \\  "tools": [
-        \\    {
-        \\      "name": "benchmark-list",
-        \\      "description": "List all benchmark JSON files",
-        \\      "args": []
-        \\    },
-        \\    {
-        \\      "name": "benchmark-latest",
-        \\      "description": "Output the latest benchmark",
-        \\      "args": []
-        \\    },
-        \\    {
-        \\      "name": "benchmark-compare",
-        \\      "description": "Compare all benchmark runs",
-        \\      "args": []
-        \\    },
-        \\    {
-        \\      "name": "config-show",
-        \\      "description": "Show current hyperparameters",
-        \\      "args": []
-        \\    },
-        \\    {
-        \\      "name": "config-set",
-        \\      "description": "Modify hyperparameters",
-        \\      "args": [
-        \\        "lr=<float>",
-        \\        "batch=<int>",
-        \\        "epochs=<int>",
-        \\        "seed=<int>",
-        \\        "optimizer=sgd|adam",
-        \\        "arch=in:out:act,in:out:act,...",
-        \\        "beta1=<float>",
-        \\        "beta2=<float>",
-        \\        "epsilon=<float>"
-        \\      ]
-        \\    },
-        \\    {
-        \\      "name": "config-backup",
-        \\      "description": "Backup src/main.zig",
-        \\      "args": []
-        \\    },
-        \\    {
-        \\      "name": "config-restore",
-        \\      "description": "Restore src/main.zig from backup",
-        \\      "args": []
-        \\    },
-        \\    {
-        \\      "name": "train",
-        \\      "description": "Build and run MNIST training",
-        \\      "args": []
-        \\    },
-        \\    {
-        \\      "name": "clean",
-        \\      "description": "Delete old benchmark files",
-        \\      "args": []
-        \\    }
-        \\  ]
-        \\}
-        \\
-    );
-}
-
-// ============================================================
-// Tool: benchmark-list
-// ============================================================
-
-fn toolBenchList(arena: Allocator) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        tools.BENCH_DIR,
-    );
-    const names = try tools.listBenchmarkFiles(
-        arena,
-        bench_fs,
-    );
-    var buf: std.ArrayList(u8) = .empty;
-
-    try buf.appendSlice(arena, "{\"files\": [");
-    for (names, 0..) |name, i| {
-        if (i > 0) try buf.appendSlice(arena, ", ");
-        try buf.appendSlice(arena, "\"");
-        try buf.appendSlice(arena, name);
-        try buf.appendSlice(arena, "\"");
-    }
-    try buf.appendSlice(arena, "]}\n");
-    try tools.writeStdout(buf.items);
-}
-
-// ============================================================
-// Tool: benchmark-latest
-// ============================================================
-
-fn toolBenchLatest(arena: Allocator) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        tools.BENCH_DIR,
-    );
-    const names = try tools.listBenchmarkFiles(
-        arena,
-        bench_fs,
-    );
-    if (names.len == 0) return error.NoBenchmarkFiles;
-
-    const latest = names[names.len - 1];
-    const path = try std.fmt.allocPrint(
-        arena,
-        "{s}/{s}",
-        .{ bench_fs, latest },
-    );
-    const content = try tools.readFile(arena, path);
-    try tools.writeStdout(content);
-}
-
-// ============================================================
-// Tool: benchmark-compare
-// ============================================================
-
-fn toolBenchCompare(arena: Allocator) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        tools.BENCH_DIR,
-    );
-    try tools.toolBenchCompare(arena, bench_fs);
-}
-
-// ============================================================
-// Tool: config-show
+// config-show — parse current hyperparameters from source
 // ============================================================
 
 fn toolConfigShow(arena: Allocator) !void {
     const main_fs = try tools.resolveToFs(
         arena,
+        config.fs_root,
         MAIN_PATH,
     );
     const source = try tools.readFile(arena, main_fs);
-    const config = parseMainConfig(source);
-    const json = try formatConfigJson(arena, &config);
+    const cfg = parseMainConfig(source);
+    const json = try formatConfigJson(arena, &cfg);
     try tools.writeStdout(json);
 }
 
 fn parseMainConfig(source: []const u8) MainConfig {
     std.debug.assert(source.len > 0);
 
-    var config: MainConfig = .{};
+    var cfg: MainConfig = .{};
     var in_layout = false;
 
     var iter = std.mem.splitScalar(u8, source, '\n');
@@ -312,12 +169,12 @@ fn parseMainConfig(source: []const u8) MainConfig {
             )) {
                 in_layout = false;
             } else {
-                parseLayoutLine(&config, trimmed);
+                parseLayoutLine(&cfg, trimmed);
             }
             continue;
         }
 
-        parseScalarLine(&config, trimmed);
+        parseScalarLine(&cfg, trimmed);
 
         if (std.mem.startsWith(
             u8,
@@ -327,58 +184,58 @@ fn parseMainConfig(source: []const u8) MainConfig {
             in_layout = true;
         }
     }
-    return config;
+    return cfg;
 }
 
 fn parseScalarLine(
-    config: *MainConfig,
+    cfg: *MainConfig,
     trimmed: []const u8,
 ) void {
     if (tools.extractAfterEq(
         trimmed,
         "const max_batch:",
     )) |v| {
-        config.max_batch = v;
+        cfg.max_batch = v;
     }
     if (tools.extractAfterEq(
         trimmed,
         "const learning_rate:",
     )) |v| {
-        config.learning_rate = v;
+        cfg.learning_rate = v;
     }
     if (tools.extractAfterEq(
         trimmed,
         "const num_epochs:",
     )) |v| {
-        config.num_epochs = v;
+        cfg.num_epochs = v;
     }
     if (tools.extractAfterEq(
         trimmed,
         "const seed:",
     )) |v| {
-        config.seed = v;
+        cfg.seed = v;
     }
     if (std.mem.startsWith(
         u8,
         trimmed,
         "net.updateAdam(",
     )) {
-        config.optimizer = "adam";
-        parseAdamArgs(config, trimmed);
+        cfg.optimizer = "adam";
+        parseAdamArgs(cfg, trimmed);
     } else if (std.mem.startsWith(
         u8,
         trimmed,
         "net.update(",
     )) {
-        config.optimizer = "sgd";
+        cfg.optimizer = "sgd";
     }
 }
 
 fn parseLayoutLine(
-    config: *MainConfig,
+    cfg: *MainConfig,
     trimmed: []const u8,
 ) void {
-    if (config.layer_count >= MAX_LAYERS) return;
+    if (cfg.layer_count >= MAX_LAYERS) return;
     if (!std.mem.startsWith(u8, trimmed, ".{")) return;
 
     const in_val = tools.extractField(
@@ -395,7 +252,7 @@ fn parseLayoutLine(
     );
 
     if (in_val != null and out_val != null) {
-        config.layers[config.layer_count] = .{
+        cfg.layers[cfg.layer_count] = .{
             .in = std.fmt.parseInt(
                 u32,
                 in_val.?,
@@ -408,12 +265,12 @@ fn parseLayoutLine(
             ) catch 0,
             .act = act_val orelse "relu",
         };
-        config.layer_count += 1;
+        cfg.layer_count += 1;
     }
 }
 
 fn parseAdamArgs(
-    config: *MainConfig,
+    cfg: *MainConfig,
     trimmed: []const u8,
 ) void {
     // net.updateAdam(device, enc, lr, 0.9, 0.999, 1e-8);
@@ -443,15 +300,15 @@ fn parseAdamArgs(
     }
     // Args: device, enc, lr, beta1, beta2, epsilon.
     if (count >= 6) {
-        config.beta1 = parts[3];
-        config.beta2 = parts[4];
-        config.epsilon = parts[5];
+        cfg.beta1 = parts[3];
+        cfg.beta2 = parts[4];
+        cfg.epsilon = parts[5];
     }
 }
 
 fn formatConfigJson(
     arena: Allocator,
-    config: *const MainConfig,
+    cfg: *const MainConfig,
 ) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(
@@ -460,7 +317,7 @@ fn formatConfigJson(
     );
 
     const layer_slice =
-        config.layers[0..config.layer_count];
+        cfg.layers[0..cfg.layer_count];
     for (layer_slice, 0..) |layer, i| {
         if (i > 0) try buf.appendSlice(arena, ",\n");
         const entry = try std.fmt.allocPrint(
@@ -482,25 +339,25 @@ fn formatConfigJson(
             "  \"seed\": {s},\n" ++
             "  \"optimizer\": \"{s}\"",
         .{
-            config.max_batch,
-            config.learning_rate,
-            config.num_epochs,
-            config.seed,
-            config.optimizer,
+            cfg.max_batch,
+            cfg.learning_rate,
+            cfg.num_epochs,
+            cfg.seed,
+            cfg.optimizer,
         },
     );
     try buf.appendSlice(arena, rest);
 
-    if (tools.eql(config.optimizer, "adam")) {
+    if (tools.eql(cfg.optimizer, "adam")) {
         const adam = try std.fmt.allocPrint(
             arena,
             ",\n  \"beta1\": {s},\n" ++
                 "  \"beta2\": {s},\n" ++
                 "  \"epsilon\": {s}",
             .{
-                config.beta1,
-                config.beta2,
-                config.epsilon,
+                cfg.beta1,
+                cfg.beta2,
+                cfg.epsilon,
             },
         );
         try buf.appendSlice(arena, adam);
@@ -511,11 +368,9 @@ fn formatConfigJson(
 }
 
 // ============================================================
-// Tool: config-set
+// config-set — modify hyperparameters in source file
 // ============================================================
 
-/// Read settings from a -f JSON input file.
-/// Falls back to positional args if -f is not present.
 fn resolveConfigArgs(
     arena: Allocator,
     args: []const []const u8,
@@ -585,6 +440,7 @@ fn toolConfigSet(
     const changes = parseConfigArgs(resolved);
     const main_fs = try tools.resolveToFs(
         arena,
+        config.fs_root,
         MAIN_PATH,
     );
     const source = try tools.readFile(arena, main_fs);
@@ -756,8 +612,6 @@ fn scalarRules(
     };
 }
 
-/// Write a scalar declaration line: indent + declaration
-/// prefix + value + semicolon.  Avoids comptime fmt.
 fn writeScalarReplacement(
     arena: Allocator,
     buf: *std.ArrayList(u8),
@@ -988,16 +842,18 @@ fn parseLayerSpec(
 }
 
 // ============================================================
-// Tool: config-backup / config-restore
+// config-backup / config-restore
 // ============================================================
 
 fn toolConfigBackup(arena: Allocator) !void {
     const src_fs = try tools.resolveToFs(
         arena,
+        config.fs_root,
         MAIN_PATH,
     );
     const dst_fs = try tools.resolveToFs(
         arena,
+        config.fs_root,
         BACKUP_PATH,
     );
     try tools.copyFile(src_fs, dst_fs);
@@ -1010,6 +866,7 @@ fn toolConfigBackup(arena: Allocator) !void {
 fn toolConfigRestore(arena: Allocator) !void {
     const bak_fs = try tools.resolveToFs(
         arena,
+        config.fs_root,
         BACKUP_PATH,
     );
     if (!tools.fileExists(bak_fs)) {
@@ -1017,6 +874,7 @@ fn toolConfigRestore(arena: Allocator) !void {
     }
     const main_fs = try tools.resolveToFs(
         arena,
+        config.fs_root,
         MAIN_PATH,
     );
     try tools.copyFile(bak_fs, main_fs);
@@ -1024,106 +882,4 @@ fn toolConfigRestore(arena: Allocator) !void {
         "{\"status\": \"ok\", " ++
             "\"restored\": \"src/main.zig\"}\n",
     );
-}
-
-// ============================================================
-// Tool: train
-// ============================================================
-
-fn toolTrain(arena: Allocator) !void {
-    // Clean old benchmarks so we find exactly the new one.
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        tools.BENCH_DIR,
-    );
-    _ = tools.cleanBenchmarkFiles(bench_fs);
-
-    std.debug.print(
-        "autoresearch: running zig build run...\n",
-        .{},
-    );
-
-    const result = std.process.Child.run(.{
-        .allocator = arena,
-        .argv = &[_][]const u8{
-            "zig", "build", "run",
-        },
-        .cwd = "../" ++ tools.NN_DIR,
-        .max_output_bytes = tools.MAX_OUTPUT_BYTES,
-    }) catch |err| {
-        const json = try std.fmt.allocPrint(
-            arena,
-            "{{\"status\": \"error\", " ++
-                "\"error\": \"spawn_failed: " ++
-                "{s}\"}}\n",
-            .{@errorName(err)},
-        );
-        try tools.writeStdout(json);
-        return;
-    };
-
-    // Forward training output to stderr for diagnostics.
-    if (result.stderr.len > 0) {
-        tools.stderr_file.writeAll(
-            result.stderr,
-        ) catch {};
-    }
-
-    const success = switch (result.term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
-
-    if (!success) {
-        try writeTrainError(arena, result.stderr);
-        return;
-    }
-
-    // Find and output the benchmark JSON.
-    const bench_name = tools.findOneBenchmark(
-        arena,
-        bench_fs,
-    );
-    if (bench_name) |name| {
-        const path = try std.fmt.allocPrint(
-            arena,
-            "{s}/{s}",
-            .{ bench_fs, name },
-        );
-        const content = try tools.readFile(arena, path);
-        try tools.writeStdout(content);
-    } else {
-        try tools.writeStdout(
-            "{\"status\": \"error\", " ++
-                "\"error\": \"no benchmark " ++
-                "produced\"}\n",
-        );
-    }
-}
-
-fn writeTrainError(
-    arena: Allocator,
-    stderr_output: []const u8,
-) !void {
-    try tools.writeBuildError(arena, stderr_output, 2000);
-}
-
-// ============================================================
-// Tool: clean
-// ============================================================
-
-fn toolClean(arena: Allocator) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        tools.BENCH_DIR,
-    );
-    const count = tools.cleanBenchmarkFiles(bench_fs);
-    var buf: [128]u8 = undefined;
-    const json = std.fmt.bufPrint(
-        &buf,
-        "{{\"status\": \"ok\", " ++
-            "\"files_deleted\": {d}}}\n",
-        .{count},
-    ) catch unreachable;
-    try tools.writeStdout(json);
 }

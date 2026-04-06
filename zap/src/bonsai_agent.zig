@@ -1,35 +1,31 @@
 //! Bonsai research agent — optimises Bonsai 1.7B
 //! inference on Apple Silicon.
 //!
-//! Single-tier mode: Claude drives everything.
-//! Two-tier mode: Opus strategist + local LLM executor.
+//! Thin profile on agent_core.  Configures the generic
+//! agent loop for Bonsai inference optimisation.  All
+//! tool logic lives in the bonsai_research toolbox
+//! binary.
+//!
+//! Usage:
+//!   export ANTHROPIC_API_KEY=sk-ant-...
+//!   zig build
+//!   ./zig-out/bin/bonsai_agent
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("agent_core.zig");
 const api = core.api;
-const ollama = @import("ollama_client.zig");
 
 // ============================================================
 // Constants (Rule 4 — hard limits)
 // ============================================================
 
-const DEFAULT_LOCAL_MODEL: []const u8 =
-    "mlx-qwen3.5-27b-claude-4.6-opus-" ++
-    "reasoning-distilled-v2";
-const MAX_TURNS_PER_EXECUTION: u32 = 60;
-const LOCAL_LLM_MAX_TOKENS_STR: []const u8 = "16384";
-const MAX_MESSAGES: u32 = 512;
-const MAX_API_RESPONSE: usize = 8 * 1024 * 1024;
-const MAX_CODE_CONTEXT: usize = 4 * 1024 * 1024;
 const MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
-const MAX_EXPERIMENTS: u32 = 50;
 const HISTORY_DIR: []const u8 = ".bonsai_history";
 
-/// Source files included as code context for the Opus
-/// strategist.  These are the hot-path files the
-/// strategist needs to design concrete experiments.
-/// Read once at startup (Rule 8 — amortise upfront).
+/// Source files comprising the hot path.  Kept here so
+/// the context builder can include them in a future
+/// revision (Rule 8 — amortise upfront).
 const CODE_CONTEXT_FILES = [_][]const u8{
     "nn/src/shaders/transformer.metal",
     "nn/src/shaders/compute.metal",
@@ -39,35 +35,272 @@ const CODE_CONTEXT_FILES = [_][]const u8{
 };
 
 // ============================================================
-// Tool mapping table
+// Tool definitions (comptime)
 //
-// Maps each LLM tool name to a CLI subcommand on the
-// bonsai_research toolbox binary.  21 entries matching
-// bonsai_tools.json.
+// Each ToolDef declares the LLM-facing schema and maps
+// to a CLI subcommand on the bonsai_research toolbox
+// binary.  toolMappings() and toolSchemas() derive the
+// dispatch table and JSON schemas at comptime.
 // ============================================================
 
-const bonsai_tools = [_]core.ToolMapping{
-    .{ .tool_name = "snapshot", .subcommand = "snapshot", .shape = .no_input },
-    .{ .tool_name = "snapshot_list", .subcommand = "snapshot-list", .shape = .no_input },
-    .{ .tool_name = "rollback", .subcommand = "rollback", .shape = .string_arg, .field = "id" },
-    .{ .tool_name = "rollback_latest", .subcommand = "rollback-latest", .shape = .no_input },
-    .{ .tool_name = "diff", .subcommand = "diff", .shape = .string_arg, .field = "id" },
-    .{ .tool_name = "check", .subcommand = "check", .shape = .no_input },
-    .{ .tool_name = "test", .subcommand = "test", .shape = .no_input },
-    .{ .tool_name = "bench", .subcommand = "bench", .shape = .no_input },
-    .{ .tool_name = "bench_infer", .subcommand = "bench-infer", .shape = .no_input },
-    .{ .tool_name = "bench_compare", .subcommand = "bench-compare", .shape = .no_input },
-    .{ .tool_name = "history", .subcommand = "history", .shape = .string_arg, .field = "count" },
-    .{ .tool_name = "show", .subcommand = "show", .shape = .string_arg, .field = "file" },
-    .{ .tool_name = "show_function", .subcommand = "show-function", .shape = .json_payload },
-    .{ .tool_name = "read_file", .subcommand = "read-file", .shape = .string_arg, .field = "path" },
-    .{ .tool_name = "write_file", .subcommand = "write-file", .shape = .json_payload },
-    .{ .tool_name = "edit_file", .subcommand = "edit-file", .shape = .json_payload },
-    .{ .tool_name = "list_directory", .subcommand = "list-dir", .shape = .string_arg, .field = "path" },
-    .{ .tool_name = "cwd", .subcommand = "cwd", .shape = .no_input },
-    .{ .tool_name = "run_command", .subcommand = "run-cmd", .shape = .json_payload },
-    .{ .tool_name = "commit", .subcommand = "commit", .shape = .json_payload },
-    .{ .tool_name = "add_summary", .subcommand = "add-summary", .shape = .json_payload },
+const bonsai_tools = [_]core.ToolDef{
+    // ---- Snapshot management ----
+    .{
+        .name = "snapshot",
+        .subcommand = "snapshot",
+        .description = "Save engine source files as " ++
+            "a restore point. Always call before " ++
+            "editing.",
+    },
+    .{
+        .name = "snapshot_list",
+        .subcommand = "snapshot-list",
+        .description = "List all saved snapshots with timestamps.",
+    },
+    .{
+        .name = "rollback",
+        .subcommand = "rollback",
+        .description = "Restore engine files from " ++
+            "a specific snapshot.",
+        .properties = &.{.{
+            .name = "id",
+            .description = "Snapshot ID from " ++
+                "snapshot or snapshot_list",
+        }},
+    },
+    .{
+        .name = "rollback_latest",
+        .subcommand = "rollback-latest",
+        .description = "Restore from the most recent " ++
+            "snapshot. Use when check/test/bench " ++
+            "fails.",
+    },
+    .{
+        .name = "diff",
+        .subcommand = "diff",
+        .description = "Show source file changes " ++
+            "since a snapshot.",
+        .properties = &.{.{
+            .name = "id",
+            .description = "Snapshot ID to diff against",
+        }},
+    },
+    // ---- Build / test / bench ----
+    .{
+        .name = "check",
+        .subcommand = "check",
+        .description = "Compile-only validation " ++
+            "(~2s). Run after every edit. STOP if " ++
+            "this fails.",
+    },
+    .{
+        .name = "test",
+        .subcommand = "test",
+        .description = "Run full test suite for " ++
+            "numerical correctness. STOP if this " ++
+            "fails.",
+    },
+    .{
+        .name = "bench",
+        .subcommand = "bench",
+        .description = "Full MNIST training " ++
+            "benchmark (~10s). Returns JSON with " ++
+            "throughput_images_per_sec and " ++
+            "final_test_accuracy_pct.",
+    },
+    .{
+        .name = "bench_infer",
+        .subcommand = "bench-infer",
+        .description = "Inference benchmark (~5s). " ++
+            "Returns JSON with gpu_batched " ++
+            "images/sec, gpu_single_sample p50/p99 " ++
+            "latency, and cpu_single_sample " ++
+            "p50/p99 latency.",
+    },
+    .{
+        .name = "bench_compare",
+        .subcommand = "bench-compare",
+        .description = "Compare all benchmark " ++
+            "results side by side.",
+    },
+    .{
+        .name = "history",
+        .subcommand = "history",
+        .description = "Return the last N full " ++
+            "experiment benchmark records as a " ++
+            "JSON array. Use this for detailed " ++
+            "per-epoch data, config, etc. The " ++
+            "initial summary only shows key " ++
+            "metrics.",
+        .properties = &.{.{
+            .name = "count",
+            .description = "Number of recent " ++
+                "records to return " ++
+                "(default 5, max 20)",
+            .type = .integer,
+            .required = false,
+        }},
+    },
+    // ---- File inspection ----
+    .{
+        .name = "show",
+        .subcommand = "show",
+        .description = "View an engine source file " ++
+            "as structured JSON with line numbers.",
+        .properties = &.{.{
+            .name = "file",
+            .description = "Source file path, " ++
+                "e.g. nn/src/metal.zig",
+        }},
+    },
+    .{
+        .name = "show_function",
+        .subcommand = "show-function",
+        .description = "Extract a specific function " ++
+            "from a source file with line numbers.",
+        .properties = &.{
+            .{
+                .name = "file",
+                .description = "Source file path",
+            },
+            .{
+                .name = "function_name",
+                .description = "Function name to extract",
+            },
+        },
+    },
+    .{
+        .name = "read_file",
+        .subcommand = "read-file",
+        .description = "Read raw contents of a " ++
+            "project file. Locked to project " ++
+            "directory.",
+        .properties = &.{.{
+            .name = "path",
+            .description = "File path relative to " ++
+                "project root, " ++
+                "e.g. nn/src/metal.zig",
+        }},
+    },
+    // ---- File mutation ----
+    .{
+        .name = "write_file",
+        .subcommand = "write-file",
+        .description = "Replace entire contents of " ++
+            "an engine source file. Use edit_file " ++
+            "for small changes instead.",
+        .properties = &.{
+            .{
+                .name = "path",
+                .description = "Engine file path, " ++
+                    "e.g. nn/src/metal.zig",
+            },
+            .{
+                .name = "content",
+                .description = "Complete new file contents",
+            },
+        },
+    },
+    .{
+        .name = "edit_file",
+        .subcommand = "edit-file",
+        .description = "Targeted find-and-replace " ++
+            "in an engine source file. More " ++
+            "efficient than write_file for small " ++
+            "edits. The old_content must match " ++
+            "exactly.",
+        .properties = &.{
+            .{
+                .name = "path",
+                .description = "Engine file path, " ++
+                    "e.g. nn/src/metal.zig",
+            },
+            .{
+                .name = "old_content",
+                .description = "Exact text to find " ++
+                    "(must match exactly)",
+            },
+            .{
+                .name = "new_content",
+                .description = "Replacement text",
+            },
+        },
+    },
+    // ---- Filesystem / shell ----
+    .{
+        .name = "list_directory",
+        .subcommand = "list-dir",
+        .description = "List files and " ++
+            "subdirectories in a project directory.",
+        .properties = &.{.{
+            .name = "path",
+            .description = "Directory path relative " ++
+                "to project root, e.g. nn/src/ " ++
+                "or nn/src/shaders",
+        }},
+    },
+    .{
+        .name = "cwd",
+        .subcommand = "cwd",
+        .description = "Return the absolute path of " ++
+            "the working directory used by " ++
+            "run_command and list_directory. " ++
+            "Useful for orienting yourself in " ++
+            "the filesystem.",
+    },
+    .{
+        .name = "run_command",
+        .subcommand = "run-cmd",
+        .description = "Execute a shell command in " ++
+            "the project root directory via " ++
+            "/bin/sh. 120s timeout. Use for grep, " ++
+            "wc, head, tail, find, cat, etc. Do " ++
+            "NOT run long-lived processes. A " ++
+            "non-zero exit code does NOT mean " ++
+            "the tool failed.",
+        .properties = &.{.{
+            .name = "command",
+            .description = "Shell command to " ++
+                "execute. Use single quotes " ++
+                "for patterns.",
+        }},
+        .shape_override = .json_payload,
+    },
+    // ---- Git / bookkeeping ----
+    .{
+        .name = "commit",
+        .subcommand = "commit",
+        .description = "Git commit all current " ++
+            "changes. Call after a successful KEEP " ++
+            "decision to preserve the optimization." ++
+            " The message should summarize what " ++
+            "was optimized and the throughput " ++
+            "improvement.",
+        .properties = &.{.{
+            .name = "message",
+            .description = "Commit message " ++
+                "summarizing the optimization",
+        }},
+        .shape_override = .json_payload,
+    },
+    .{
+        .name = "add_summary",
+        .subcommand = "add-summary",
+        .description = "Record a concise summary " ++
+            "of what was tried and why it " ++
+            "succeeded or failed. Call after " ++
+            "every rollback or KEEP. Summaries " ++
+            "are injected into every future " ++
+            "experiment.",
+        .properties = &.{.{
+            .name = "summary",
+            .description = "Concise summary: what " ++
+                "was tried, the throughput " ++
+                "result, and why it succeeded " ++
+                "or failed.",
+        }},
+        .shape_override = .json_payload,
+    },
 };
 
 // ============================================================
@@ -79,9 +312,14 @@ const config = core.AgentConfig{
     .toolbox_path = "./zig-out/bin/bonsai_research",
     .history_dir = HISTORY_DIR,
     .system_prompt_path = "programs/bonsai_system.md",
-    .tool_schemas_path = "programs/bonsai_tools.json",
-    .tool_map = &bonsai_tools,
+    .tool_schemas = core.toolSchemas(&bonsai_tools),
+    .tool_map = core.toolMappings(&bonsai_tools),
     .persist_tools = &.{ "bench", "bench_infer" },
+    .history_fields = &.{
+        .{ .json_key = "decode_tok_per_sec", .label = "tok/s" },
+        .{ .json_key = "prefill_tok_per_sec", .label = "prefill" },
+        .{ .json_key = "decode_p99_us", .label = "p99_us" },
+    },
     .build_context_fn = &buildBonsaiContext,
 };
 
@@ -90,7 +328,7 @@ const config = core.AgentConfig{
 // ============================================================
 
 pub fn main() void {
-    mainInner() catch |err| {
+    core.run(&config) catch |err| {
         api.log(
             "\nFATAL: agent crashed: {s}\n",
             .{@errorName(err)},
@@ -106,21 +344,14 @@ pub fn main() void {
     };
 }
 
-fn mainInner() !void {
-    // Check for two-tier mode first.
-    const local_model = loadLocalModel();
-    if (local_model) |executor_model| {
-        return runTwoTierMode(executor_model);
-    }
-    // Single-tier: use the generic loop.
-    return core.run(&config);
-}
-
 // ============================================================
-// Context builder callback
+// Context builder
 //
-// Builds the initial user message with orientation,
-// engineering rules, benchmark history, and summaries.
+// Assembles the first user message from:
+//   1. Orientation (working directory, git state).
+//   2. Engineering rules from CLAUDE.md.
+//   3. Compact benchmark history.
+//   4. Agent-written summaries from prior runs.
 // ============================================================
 
 fn buildBonsaiContext(
@@ -131,7 +362,7 @@ fn buildBonsaiContext(
     const rules = loadEngineeringRules(arena);
     const history = core.buildHistorySummary(
         arena,
-        cfg.history_dir,
+        cfg,
     );
     const summaries = core.buildSummariesSection(
         arena,
@@ -234,727 +465,4 @@ fn loadEngineeringRules(arena: Allocator) []const u8 {
         .{ content.len / 1024, path },
     );
     return content;
-}
-
-// ============================================================
-// Local model loader
-// ============================================================
-
-/// Load the local LLM executor model from
-/// LOCAL_LLM_MODEL.  Returns null when not set
-/// (single-tier mode).  Falls back to
-/// DEFAULT_LOCAL_MODEL if set to "default".
-fn loadLocalModel() ?[]const u8 {
-    const val = std.posix.getenv("LOCAL_LLM_MODEL");
-    if (val) |model| {
-        std.debug.assert(model.len > 0);
-        if (api.eql(model, "default")) {
-            return DEFAULT_LOCAL_MODEL;
-        }
-        return model;
-    }
-    return null;
-}
-
-// ============================================================
-// Two-tier mode
-//
-// Opus strategist designs experiments (one API call
-// per experiment, high-quality reasoning).  A local
-// Ollama model executes the plan by driving the tool
-// loop (free, fast, many tool calls).
-// ============================================================
-
-/// Two-tier execution statistics.
-const ExecutionResult = struct {
-    turns: u32,
-    tool_calls: u32,
-    api_ms: i64,
-    tool_ms: i64,
-    input_tokens: u64,
-    output_tokens: u64,
-    completed: bool,
-};
-
-/// Accumulated statistics across two-tier experiments.
-const TwoTierStats = struct {
-    experiments: u32 = 0,
-    turns: u32 = 0,
-    tool_calls: u32 = 0,
-    api_errors: u32 = 0,
-    api_ms: i64 = 0,
-    tool_ms: i64 = 0,
-    opus_in_tokens: u64 = 0,
-    opus_out_tokens: u64 = 0,
-};
-
-/// Entry point for two-tier mode.  Sets up arena,
-/// keys, and toolbox, then delegates to the outer
-/// experiment loop.
-fn runTwoTierMode(ollama_model: []const u8) !void {
-    std.debug.assert(ollama_model.len > 0);
-
-    var arena_state = std.heap.ArenaAllocator.init(
-        std.heap.page_allocator,
-    );
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const run_start = core.timestampMs();
-
-    core.printHeader("bonsai (two-tier)");
-    core.ensureHistoryDir(arena, HISTORY_DIR);
-
-    const api_key = core.loadApiKey() orelse {
-        api.fatal(
-            "Set ANTHROPIC_API_KEY env var.\n" ++
-                "  export ANTHROPIC_API_KEY=sk-ant-...\n",
-        );
-        unreachable;
-    };
-    const opus_model = core.loadModel();
-    api.log("Opus model:  {s}\n", .{opus_model});
-    api.log("Local model: {s}\n", .{ollama_model});
-
-    if (!core.buildToolbox(arena)) {
-        api.fatal("zig build failed.\n");
-        unreachable;
-    }
-
-    // Load tool schemas and convert to OpenAI format
-    // once at startup (Rule 8 — amortise upfront).
-    const tool_schemas = core.loadPromptFile(
-        arena,
-        config.tool_schemas_path,
-    );
-    const openai_tools = ollama.convertAnthropicTools(
-        arena,
-        tool_schemas,
-    ) catch {
-        api.fatal("Failed to convert tool schemas.\n");
-        unreachable;
-    };
-
-    // Load engineering rules once.
-    const rules = loadEngineeringRules(arena);
-
-    // Load hot-path source files once so the strategist
-    // can design concrete, line-level experiments.
-    const code_context = loadCodeContext(arena);
-    api.log(
-        "Code context: {d} KB from {d} files\n",
-        .{
-            code_context.len / 1024,
-            CODE_CONTEXT_FILES.len,
-        },
-    );
-
-    runTwoTierLoop(
-        arena,
-        run_start,
-        api_key,
-        opus_model,
-        ollama_model,
-        rules,
-        code_context,
-        openai_tools,
-    );
-}
-
-/// Outer loop for two-tier mode.  Alternates between
-/// Opus strategy calls and Ollama execution loops.
-fn runTwoTierLoop(
-    arena: Allocator,
-    run_start: i64,
-    api_key: []const u8,
-    opus_model: []const u8,
-    ollama_model: []const u8,
-    rules: []const u8,
-    code_context: []const u8,
-    openai_tools: []const u8,
-) void {
-    std.debug.assert(opus_model.len > 0);
-    std.debug.assert(ollama_model.len > 0);
-
-    var stats = TwoTierStats{};
-
-    var experiment: u32 = 0;
-    while (experiment < MAX_EXPERIMENTS) : (experiment += 1) {
-        // Per-experiment arena — freed at the end of each
-        // iteration to prevent unbounded memory growth
-        // across 50 experiments (Rule 2).
-        var experiment_arena = std.heap.ArenaAllocator.init(
-            std.heap.page_allocator,
-        );
-        defer experiment_arena.deinit();
-
-        api.log(
-            "\n" ++
-                "======================================" ++
-                "========\n" ++
-                "  Experiment {d}/{d} (two-tier)\n" ++
-                "======================================" ++
-                "========\n",
-            .{ experiment + 1, MAX_EXPERIMENTS },
-        );
-
-        const should_stop = runOneStrategyExperiment(
-            experiment_arena.allocator(),
-            api_key,
-            opus_model,
-            ollama_model,
-            rules,
-            code_context,
-            openai_tools,
-            experiment,
-            &stats,
-        );
-        stats.experiments += 1;
-        if (should_stop) break;
-    }
-
-    printTwoTierSummary(arena, run_start, &stats);
-}
-
-/// Call Opus strategist and process the result.
-/// Returns the plan text, or null on failure.
-fn callAndProcessStrategy(
-    arena: Allocator,
-    api_key: []const u8,
-    opus_model: []const u8,
-    rules: []const u8,
-    code_context: []const u8,
-    stats: *TwoTierStats,
-) ?[]const u8 {
-    const history = core.buildHistorySummary(
-        arena,
-        HISTORY_DIR,
-    );
-    const summaries = core.buildSummariesSection(
-        arena,
-        HISTORY_DIR,
-    );
-
-    api.log("  Phase 1: Opus strategy...\n", .{});
-    const strat_start = core.timestampMs();
-    const plan_resp = callOpusStrategist(
-        arena,
-        api_key,
-        opus_model,
-        history,
-        summaries,
-        rules,
-        code_context,
-    );
-    const strat_ms = core.timestampMs() - strat_start;
-    stats.api_ms += strat_ms;
-    stats.opus_in_tokens += plan_resp.input_tokens;
-    stats.opus_out_tokens += plan_resp.output_tokens;
-
-    if (!plan_resp.success or
-        plan_resp.text.len == 0)
-    {
-        api.log(
-            "  Strategist failed ({s}): {s}\n",
-            .{
-                core.nanosToMsStr(
-                    arena,
-                    strat_ms * 1_000_000,
-                ),
-                plan_resp.error_message,
-            },
-        );
-        stats.api_errors += 1;
-        return null;
-    }
-
-    api.log(
-        "  Plan received ({s}):\n",
-        .{
-            core.nanosToMsStr(
-                arena,
-                strat_ms * 1_000_000,
-            ),
-        },
-    );
-    return plan_resp.text;
-}
-
-/// Run one strategy→execution cycle.  Returns true if
-/// the outer loop should stop (strategist failure).
-fn runOneStrategyExperiment(
-    arena: Allocator,
-    api_key: []const u8,
-    opus_model: []const u8,
-    ollama_model: []const u8,
-    rules: []const u8,
-    code_context: []const u8,
-    openai_tools: []const u8,
-    experiment: u32,
-    stats: *TwoTierStats,
-) bool {
-    std.debug.assert(api_key.len > 0);
-    std.debug.assert(ollama_model.len > 0);
-
-    // Phase 1: Opus designs the experiment.
-    const plan = callAndProcessStrategy(
-        arena,
-        api_key,
-        opus_model,
-        rules,
-        code_context,
-        stats,
-    ) orelse return true;
-
-    api.logClaudeText(plan);
-
-    // Phase 2: Local LLM executes the plan.
-    api.log(
-        "\n  Phase 2: Local LLM executor...\n",
-        .{},
-    );
-    const exec = runLocalExecution(
-        arena,
-        ollama_model,
-        plan,
-        openai_tools,
-    );
-
-    stats.turns += exec.turns;
-    stats.tool_calls += exec.tool_calls;
-    stats.api_ms += exec.api_ms;
-    stats.tool_ms += exec.tool_ms;
-    if (!exec.completed) stats.api_errors += 1;
-
-    api.log(
-        "  Experiment {d} done " ++
-            "({d} turns, {d} tool calls).\n",
-        .{
-            experiment + 1,
-            exec.turns,
-            exec.tool_calls,
-        },
-    );
-    return false;
-}
-
-/// Call Opus to design a single experiment plan.
-/// Returns the full ApiResponse with the plan in
-/// .text.  Uses the strategist prompt (no tools).
-fn callOpusStrategist(
-    arena: Allocator,
-    api_key: []const u8,
-    model: []const u8,
-    history: []const u8,
-    summaries: []const u8,
-    rules: []const u8,
-    code_context: []const u8,
-) core.ApiResponse {
-    std.debug.assert(api_key.len > 0);
-    std.debug.assert(model.len > 0);
-
-    const context = buildStrategyContext(
-        arena,
-        history,
-        summaries,
-        rules,
-        code_context,
-    );
-    const user_msg = api.wrapUserTextMessage(
-        arena,
-        context,
-    );
-    const messages = [_][]const u8{user_msg};
-
-    const strategist_prompt = core.loadPromptFile(
-        arena,
-        "programs/bonsai_strategist.md",
-    );
-
-    // Strategist: custom prompt, no tools (text only).
-    return core.callApiWithRetry(
-        arena,
-        api_key,
-        model,
-        &messages,
-        strategist_prompt,
-        "[]",
-        HISTORY_DIR,
-        config.max_tokens_str,
-        config.thinking_budget_str,
-    );
-}
-
-/// Build the user message for the strategist.
-/// Includes benchmark history, summaries, engineering
-/// rules, and source code context.
-fn buildStrategyContext(
-    arena: Allocator,
-    history: []const u8,
-    summaries: []const u8,
-    rules: []const u8,
-    code_context: []const u8,
-) []const u8 {
-    std.debug.assert(rules.len > 0);
-
-    const hist_header = if (history.len > 0)
-        "## Benchmark history\n\n"
-    else
-        "No benchmark history yet.\n\n";
-
-    const code_section = if (code_context.len > 0)
-        code_context
-    else
-        "(code context unavailable)\n";
-
-    return std.fmt.allocPrint(
-        arena,
-        "{s}{s}{s}" ++
-            "## Engineering rules (CLAUDE.md)\n\n" ++
-            "{s}\n\n" ++
-            "## Source code (hot path)\n\n" ++
-            "Below are the current source files for " ++
-            "the engine hot path. Use these to design " ++
-            "specific, line-level changes. Reference " ++
-            "exact function names, buffer indices, " ++
-            "thread counts, and kernel parameters." ++
-            "\n\n{s}\n\n" ++
-            "Design the next experiment.",
-        .{
-            hist_header,
-            if (history.len > 0) history else "",
-            if (summaries.len > 0) summaries else "",
-            rules,
-            code_section,
-        },
-    ) catch "Design an experiment to improve throughput.";
-}
-
-// ============================================================
-// Code context loader
-// ============================================================
-
-/// Read all hot-path source files into a single code
-/// context string with file headers.  Each file is
-/// wrapped with a delimiter so the strategist can
-/// reference specific locations.
-fn loadCodeContext(arena: Allocator) []const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-
-    for (&CODE_CONTEXT_FILES) |path| {
-        const content = readFileContent(
-            arena,
-            path,
-        ) orelse continue;
-
-        // File header with path and line count.
-        var line_count: u32 = 1;
-        for (content) |c| {
-            if (c == '\n') line_count += 1;
-        }
-
-        const header = std.fmt.allocPrint(
-            arena,
-            "### {s} ({d} lines)\n```\n",
-            .{ path, line_count },
-        ) catch continue;
-        buf.appendSlice(arena, header) catch continue;
-        buf.appendSlice(arena, content) catch continue;
-        buf.appendSlice(
-            arena,
-            "\n```\n\n",
-        ) catch continue;
-
-        // Guard against runaway context size.
-        if (buf.items.len > MAX_CODE_CONTEXT) {
-            api.log(
-                "  Code context truncated at " ++
-                    "{d} KB (limit {d} KB)\n",
-                .{
-                    buf.items.len / 1024,
-                    MAX_CODE_CONTEXT / 1024,
-                },
-            );
-            break;
-        }
-    }
-
-    std.debug.assert(
-        buf.items.len <= MAX_CODE_CONTEXT + MAX_FILE_SIZE,
-    );
-    return buf.items;
-}
-
-/// Read a file from a monorepo-relative path.
-fn readFileContent(
-    arena: Allocator,
-    path: []const u8,
-) ?[]const u8 {
-    std.debug.assert(path.len > 0);
-
-    const fs_path = core.resolveToFs(
-        arena,
-        path,
-    ) orelse return null;
-
-    const file = std.fs.cwd().openFile(
-        fs_path,
-        .{},
-    ) catch return null;
-    defer file.close();
-
-    const content = file.readToEndAlloc(
-        arena,
-        MAX_FILE_SIZE,
-    ) catch return null;
-
-    std.debug.assert(content.len <= MAX_FILE_SIZE);
-    return content;
-}
-
-// ============================================================
-// Local LLM execution loop
-// ============================================================
-
-/// Execute an experiment plan using the local LLM.
-/// Drives the tool-calling loop: snapshot, edit, check,
-/// test, bench, report.
-fn runLocalExecution(
-    arena: Allocator,
-    model: []const u8,
-    plan: []const u8,
-    openai_tools: []const u8,
-) ExecutionResult {
-    std.debug.assert(model.len > 0);
-    std.debug.assert(plan.len > 0);
-
-    const executor_prompt = core.loadPromptFile(
-        arena,
-        "programs/bonsai_executor.md",
-    );
-    const first_msg = buildExecutorInitialMsg(
-        arena,
-        plan,
-    );
-    const history_dir = "../" ++ HISTORY_DIR;
-
-    var msgs: [MAX_MESSAGES][]const u8 = undefined;
-    var count: u32 = 0;
-    msgs[0] = first_msg;
-    count = 1;
-
-    var r = ExecutionResult{
-        .turns = 0,
-        .tool_calls = 0,
-        .api_ms = 0,
-        .tool_ms = 0,
-        .input_tokens = 0,
-        .output_tokens = 0,
-        .completed = false,
-    };
-
-    var turn: u32 = 0;
-    while (turn < MAX_TURNS_PER_EXECUTION) : (turn += 1) {
-        const should_stop = runOneExecutorTurn(
-            arena,
-            model,
-            executor_prompt,
-            openai_tools,
-            history_dir,
-            &msgs,
-            &count,
-            turn,
-            &r,
-        );
-        if (should_stop) break;
-    }
-
-    r.turns = turn + 1;
-    return r;
-}
-
-/// Execute tool calls and append results in OpenAI
-/// message format.  Returns true if the message
-/// buffer is full.
-fn executeAndAppendExecutorTools(
-    arena: Allocator,
-    resp: core.ApiResponse,
-    msgs: *[MAX_MESSAGES][]const u8,
-    count: *u32,
-    r: *ExecutionResult,
-) bool {
-    const t1 = core.timestampMs();
-    const results = core.executeTools(
-        &config,
-        arena,
-        resp.tool_calls,
-    );
-    r.tool_ms += core.timestampMs() - t1;
-    r.tool_calls += @intCast(resp.tool_calls.len);
-
-    for (results) |tr| {
-        if (count.* >= MAX_MESSAGES - 1) break;
-        msgs[count.*] = ollama.buildToolResultMsg(
-            arena,
-            tr,
-        );
-        count.* += 1;
-    }
-    return count.* >= MAX_MESSAGES - 2;
-}
-
-/// Run one turn of the local executor loop.
-/// Returns true if the loop should break.
-fn runOneExecutorTurn(
-    arena: Allocator,
-    model: []const u8,
-    executor_prompt: []const u8,
-    openai_tools: []const u8,
-    history_dir: []const u8,
-    msgs: *[MAX_MESSAGES][]const u8,
-    count: *u32,
-    turn: u32,
-    r: *ExecutionResult,
-) bool {
-    api.log(
-        "\n  --- Executor turn {d} ---\n",
-        .{turn + 1},
-    );
-    const t0 = core.timestampMs();
-    const resp = ollama.callApi(
-        arena,
-        model,
-        executor_prompt,
-        msgs[0..count.*],
-        openai_tools,
-        LOCAL_LLM_MAX_TOKENS_STR,
-        history_dir,
-    );
-    r.api_ms += core.timestampMs() - t0;
-
-    if (!resp.success) {
-        api.log(
-            "  Local LLM error: {s}\n",
-            .{resp.error_message},
-        );
-        return true;
-    }
-
-    r.input_tokens += resp.input_tokens;
-    r.output_tokens += resp.output_tokens;
-    if (resp.text.len > 0) api.logClaudeText(resp.text);
-
-    // Append assistant message (OpenAI format).
-    msgs[count.*] = ollama.buildAssistantMsg(
-        arena,
-        resp,
-    );
-    count.* += 1;
-
-    // Model chose to stop — no tool calls.
-    if (!api.eql(resp.stop_reason, "tool_use") or
-        resp.tool_calls.len == 0)
-    {
-        r.completed = true;
-        return true;
-    }
-
-    return executeAndAppendExecutorTools(
-        arena,
-        resp,
-        msgs,
-        count,
-        r,
-    );
-}
-
-/// Build the initial user message for the executor,
-/// containing filesystem orientation and the plan
-/// from the Opus strategist.
-fn buildExecutorInitialMsg(
-    arena: Allocator,
-    plan: []const u8,
-) []const u8 {
-    std.debug.assert(plan.len > 0);
-
-    const orientation = core.buildOrientation(arena);
-    const text = std.fmt.allocPrint(
-        arena,
-        "{s}\n\n## Experiment plan\n\n" ++
-            "A senior strategist designed this " ++
-            "experiment for you. Follow it " ++
-            "precisely:\n\n{s}\n\n" ++
-            "## Begin\n\n" ++
-            "Execute this plan now. Start by " ++
-            "calling snapshot to create a restore " ++
-            "point, then proceed step by step.",
-        .{ orientation, plan },
-    ) catch "Execute the experiment plan.";
-
-    return ollama.buildUserTextMsg(arena, text);
-}
-
-// ============================================================
-// Two-tier summary
-// ============================================================
-
-/// Print the run summary for two-tier mode.
-fn printTwoTierSummary(
-    arena: Allocator,
-    run_start: i64,
-    stats: *const TwoTierStats,
-) void {
-    const run_elapsed = core.timestampMs() - run_start;
-
-    // Opus pricing: $5/MTok in, $25/MTok out.
-    // Ollama is free (local).
-    const cost_cents =
-        (stats.opus_in_tokens * 5 +
-            stats.opus_out_tokens * 25) / 10_000;
-    const cost_str = std.fmt.allocPrint(
-        arena,
-        "${d}.{d:0>2}",
-        .{ cost_cents / 100, cost_cents % 100 },
-    ) catch "$?.??";
-
-    api.log(
-        "\n" ++
-            "======================================" ++
-            "========\n" ++
-            "  Run summary (two-tier, bonsai)\n" ++
-            "======================================" ++
-            "========\n" ++
-            "  Experiments:    {d}\n" ++
-            "  Total turns:    {d} (Ollama)\n" ++
-            "  Tool calls:     {d}\n" ++
-            "  API errors:     {d}\n" ++
-            "  Opus tokens:    {d} in, {d} out\n" ++
-            "  Est. cost:      {s} (Opus only)\n" ++
-            "  API time:       {s}\n" ++
-            "  Tool time:      {s}\n" ++
-            "  Total time:     {s}\n" ++
-            "======================================" ++
-            "========\n",
-        .{
-            stats.experiments,
-            stats.turns,
-            stats.tool_calls,
-            stats.api_errors,
-            stats.opus_in_tokens,
-            stats.opus_out_tokens,
-            cost_str,
-            core.nanosToMsStr(
-                arena,
-                stats.api_ms * 1_000_000,
-            ),
-            core.nanosToMsStr(
-                arena,
-                stats.tool_ms * 1_000_000,
-            ),
-            core.nanosToMsStr(
-                arena,
-                run_elapsed * 1_000_000,
-            ),
-        },
-    );
 }

@@ -900,3 +900,202 @@ kernel void qmv_spec_mg_f16io_resadd(
         if (row1_valid) residual[row1] += accum1;
     }
 }
+
+// ====================================================================
+// Kernel 6: qmv_spec_fused_pair_silu_f16io — gate/up + SiLU fused
+// ====================================================================
+/// Fused gate+up projection with SiLU activation and elementwise
+/// multiply: output[row] = silu(gate_row) * up_row.  Eliminates
+/// the separate SiLU+elementwise_mul dispatch and two barriers
+/// per block (56 barriers saved for 28-layer Bonsai).
+///
+/// Dispatch: threadgroups = ceil(M / 32), threads = 512.
+kernel void qmv_spec_fused_pair_silu_f16io(
+    device const uint8_t* packed_a  [[buffer(0)]],
+    device const half*    scales_a  [[buffer(1)]],
+    constant half*        input     [[buffer(2)]],
+    device half*          output    [[buffer(3)]],
+    device const uint8_t* packed_b  [[buffer(4)]],
+    device const half*    scales_b  [[buffer(5)]],
+    // buffer(6) unused — single output replaces two.
+    constant QMVDims&     dims      [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint K = SPEC_HIDDEN_K;
+    constexpr uint group_size = SPEC_GS;
+    static_assert(K % 32 == 0, "K must be SIMD-aligned.");
+    static_assert(K % group_size == 0, "K must be group-aligned.");
+    static_assert(K / 32 <= group_size, "Single-group requirement.");
+    const uint M = dims.M;
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+    const uint row0 = tgid * 32 + simdgroup_idx * 2;
+    const uint row1 = row0 + 1;
+
+    constexpr uint groups_per_row = K / group_size;
+    constexpr uint cols_per_lane = K / 32;
+    const uint col_start = lane * cols_per_lane;
+    constexpr uint bytes_per_lane = cols_per_lane / 8;
+    const uint col_byte_off = col_start / 8;
+    const uint grp = col_start / group_size;
+    constexpr uint bytes_per_row = K / 8;
+
+    float sig_a0 = 0.0f, sig_b0 = 0.0f;
+    float sig_a1 = 0.0f, sig_b1 = 0.0f;
+    const bool row0_valid = row0 < M;
+    const bool row1_valid = row1 < M;
+    const uint base_a0 = row0 * bytes_per_row + col_byte_off;
+    const uint base_b0 = row0 * bytes_per_row + col_byte_off;
+    const uint base_a1 = row1 * bytes_per_row + col_byte_off;
+    const uint base_b1 = row1 * bytes_per_row + col_byte_off;
+
+    constexpr uint words_per_lane = bytes_per_lane / 4;
+    device const uint32_t* w32_a0 =
+        (device const uint32_t*)(packed_a + base_a0);
+    device const uint32_t* w32_b0 =
+        (device const uint32_t*)(packed_b + base_b0);
+    device const uint32_t* w32_a1 =
+        (device const uint32_t*)(packed_a + base_a1);
+    device const uint32_t* w32_b1 =
+        (device const uint32_t*)(packed_b + base_b1);
+
+    #pragma clang loop unroll(disable)
+    for (uint w = 0; w < words_per_lane; w++) {
+        const uint32_t wa0 = row0_valid ? w32_a0[w] : 0;
+        const uint32_t wb0 = row0_valid ? w32_b0[w] : 0;
+        const uint32_t wa1 = row1_valid ? w32_a1[w] : 0;
+        const uint32_t wb1 = row1_valid ? w32_b1[w] : 0;
+
+        for (uint bi = 0; bi < 4; bi++) {
+            const uint ci = col_start + w * 32 + bi * 8;
+            const float x0 = float(input[ci]);
+            const float x1 = float(input[ci + 1]);
+            const float x2 = float(input[ci + 2]);
+            const float x3 = float(input[ci + 3]);
+            const float x4 = float(input[ci + 4]);
+            const float x5 = float(input[ci + 5]);
+            const float x6 = float(input[ci + 6]);
+            const float x7 = float(input[ci + 7]);
+            const uint sh = bi * 8;
+            const uint ba0 = (wa0 >> sh) & 0xFFu;
+            const uint bb0 = (wb0 >> sh) & 0xFFu;
+            const uint ba1 = (wa1 >> sh) & 0xFFu;
+            const uint bb1 = (wb1 >> sh) & 0xFFu;
+            sig_a0 += select(-x0, x0, bool(ba0 & 1));
+            sig_a0 += select(-x1, x1, bool(ba0 & 2));
+            sig_a0 += select(-x2, x2, bool(ba0 & 4));
+            sig_a0 += select(-x3, x3, bool(ba0 & 8));
+            sig_a0 += select(-x4, x4, bool(ba0 & 16));
+            sig_a0 += select(-x5, x5, bool(ba0 & 32));
+            sig_a0 += select(-x6, x6, bool(ba0 & 64));
+            sig_a0 += select(-x7, x7, bool(ba0 & 128));
+            sig_b0 += select(-x0, x0, bool(bb0 & 1));
+            sig_b0 += select(-x1, x1, bool(bb0 & 2));
+            sig_b0 += select(-x2, x2, bool(bb0 & 4));
+            sig_b0 += select(-x3, x3, bool(bb0 & 8));
+            sig_b0 += select(-x4, x4, bool(bb0 & 16));
+            sig_b0 += select(-x5, x5, bool(bb0 & 32));
+            sig_b0 += select(-x6, x6, bool(bb0 & 64));
+            sig_b0 += select(-x7, x7, bool(bb0 & 128));
+            sig_a1 += select(-x0, x0, bool(ba1 & 1));
+            sig_a1 += select(-x1, x1, bool(ba1 & 2));
+            sig_a1 += select(-x2, x2, bool(ba1 & 4));
+            sig_a1 += select(-x3, x3, bool(ba1 & 8));
+            sig_a1 += select(-x4, x4, bool(ba1 & 16));
+            sig_a1 += select(-x5, x5, bool(ba1 & 32));
+            sig_a1 += select(-x6, x6, bool(ba1 & 64));
+            sig_a1 += select(-x7, x7, bool(ba1 & 128));
+            sig_b1 += select(-x0, x0, bool(bb1 & 1));
+            sig_b1 += select(-x1, x1, bool(bb1 & 2));
+            sig_b1 += select(-x2, x2, bool(bb1 & 4));
+            sig_b1 += select(-x3, x3, bool(bb1 & 8));
+            sig_b1 += select(-x4, x4, bool(bb1 & 16));
+            sig_b1 += select(-x5, x5, bool(bb1 & 32));
+            sig_b1 += select(-x6, x6, bool(bb1 & 64));
+            sig_b1 += select(-x7, x7, bool(bb1 & 128));
+        }
+    }
+
+    // Tail bytes — dead code when bytes_per_lane % 4 == 0.
+    #pragma clang loop unroll(disable)
+    for (uint b = words_per_lane * 4; b < bytes_per_lane; b++) {
+        const uint ci = col_start + b * 8;
+        const float x0 = float(input[ci]);
+        const float x1 = float(input[ci + 1]);
+        const float x2 = float(input[ci + 2]);
+        const float x3 = float(input[ci + 3]);
+        const float x4 = float(input[ci + 4]);
+        const float x5 = float(input[ci + 5]);
+        const float x6 = float(input[ci + 6]);
+        const float x7 = float(input[ci + 7]);
+        if (row0_valid) {
+            const uint bva0 = packed_a[base_a0 + b];
+            sig_a0 += select(-x0, x0, bool(bva0 & 1));
+            sig_a0 += select(-x1, x1, bool(bva0 & 2));
+            sig_a0 += select(-x2, x2, bool(bva0 & 4));
+            sig_a0 += select(-x3, x3, bool(bva0 & 8));
+            sig_a0 += select(-x4, x4, bool(bva0 & 16));
+            sig_a0 += select(-x5, x5, bool(bva0 & 32));
+            sig_a0 += select(-x6, x6, bool(bva0 & 64));
+            sig_a0 += select(-x7, x7, bool(bva0 & 128));
+            const uint bvb0 = packed_b[base_b0 + b];
+            sig_b0 += select(-x0, x0, bool(bvb0 & 1));
+            sig_b0 += select(-x1, x1, bool(bvb0 & 2));
+            sig_b0 += select(-x2, x2, bool(bvb0 & 4));
+            sig_b0 += select(-x3, x3, bool(bvb0 & 8));
+            sig_b0 += select(-x4, x4, bool(bvb0 & 16));
+            sig_b0 += select(-x5, x5, bool(bvb0 & 32));
+            sig_b0 += select(-x6, x6, bool(bvb0 & 64));
+            sig_b0 += select(-x7, x7, bool(bvb0 & 128));
+        }
+        if (row1_valid) {
+            const uint bva1 = packed_a[base_a1 + b];
+            sig_a1 += select(-x0, x0, bool(bva1 & 1));
+            sig_a1 += select(-x1, x1, bool(bva1 & 2));
+            sig_a1 += select(-x2, x2, bool(bva1 & 4));
+            sig_a1 += select(-x3, x3, bool(bva1 & 8));
+            sig_a1 += select(-x4, x4, bool(bva1 & 16));
+            sig_a1 += select(-x5, x5, bool(bva1 & 32));
+            sig_a1 += select(-x6, x6, bool(bva1 & 64));
+            sig_a1 += select(-x7, x7, bool(bva1 & 128));
+            const uint bvb1 = packed_b[base_b1 + b];
+            sig_b1 += select(-x0, x0, bool(bvb1 & 1));
+            sig_b1 += select(-x1, x1, bool(bvb1 & 2));
+            sig_b1 += select(-x2, x2, bool(bvb1 & 4));
+            sig_b1 += select(-x3, x3, bool(bvb1 & 8));
+            sig_b1 += select(-x4, x4, bool(bvb1 & 16));
+            sig_b1 += select(-x5, x5, bool(bvb1 & 32));
+            sig_b1 += select(-x6, x6, bool(bvb1 & 64));
+            sig_b1 += select(-x7, x7, bool(bvb1 & 128));
+        }
+    }
+
+    const uint sc_off0 = row0 * groups_per_row + grp;
+    const uint sc_off1 = row1 * groups_per_row + grp;
+
+    // Fused SiLU(gate) * up: apply SiLU to gate (matrix A),
+    // multiply by up (matrix B), write single f16 output.
+    if (row0_valid) {
+        float g0 = float(scales_a[sc_off0]) * sig_a0;
+        float u0 = float(scales_b[sc_off0]) * sig_b0;
+        g0 = simd_sum(g0);
+        u0 = simd_sum(u0);
+        if (lane == 0) {
+            const float silu = g0 / (1.0f + exp(-g0));
+            output[row0] = half(silu * u0);
+        }
+    }
+
+    if (row1_valid) {
+        float g1 = float(scales_a[sc_off1]) * sig_a1;
+        float u1 = float(scales_b[sc_off1]) * sig_b1;
+        g1 = simd_sum(g1);
+        u1 = simd_sum(u1);
+        if (lane == 0) {
+            const float silu = g1 / (1.0f + exp(-g1));
+            output[row1] = half(silu * u1);
+        }
+    }
+}

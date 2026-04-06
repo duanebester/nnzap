@@ -11,8 +11,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const api_client_module = b.createModule(.{
-        .root_source_file = b.path("src/api_client.zig"),
+    const toolbox_module = b.createModule(.{
+        .root_source_file = b.path("src/toolbox.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -20,12 +20,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const ollama_client_module = b.createModule(.{
-        .root_source_file = b.path("src/ollama_client.zig"),
+    const api_client_module = b.createModule(.{
+        .root_source_file = b.path("src/api_client.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "api_client.zig", .module = api_client_module },
+            .{ .name = "tools.zig", .module = tools_module },
         },
     });
 
@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "tools.zig", .module = tools_module },
+                .{ .name = "toolbox.zig", .module = toolbox_module },
             },
         }),
     });
@@ -70,6 +71,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "tools.zig", .module = tools_module },
+                .{ .name = "toolbox.zig", .module = toolbox_module },
             },
         }),
     });
@@ -114,7 +116,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "agent_core.zig", .module = agent_core_module },
-                .{ .name = "ollama_client.zig", .module = ollama_client_module },
             },
         }),
     });

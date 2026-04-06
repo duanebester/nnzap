@@ -9,60 +9,60 @@ nn/
 ├── build.zig                    152 lines   Build config
 ├── build.zig.zon                             Package manifest
 ├── examples/
-│   ├── bonsai.zig               544 lines   Bonsai tree classifier
-│   ├── bonsai_bench.zig         752 lines   Bonsai benchmarking
+│   ├── bonsai.zig               553 lines   Bonsai tree classifier
+│   ├── bonsai_bench.zig         636 lines   Bonsai benchmarking
 │   ├── inference_bench.zig      681 lines   Inference benchmarking
 │   ├── mnist.zig              1,042 lines   MNIST training
 │   └── mnist_1bit.zig          803 lines   1-bit MNIST variant
 ├── src/
 │   ├── benchmark.zig            706 lines   Benchmarking infra
 │   ├── layout.zig               636 lines   Comptime network layout
-│   ├── metal.zig              1,424 lines   Metal GPU bindings
+│   ├── metal.zig              1,568 lines   Metal GPU bindings
 │   ├── mnist.zig                407 lines   MNIST data loading
-│   ├── model.zig              1,254 lines   Model (safetensors/loading)
+│   ├── model.zig              1,276 lines   Model (safetensors/loading)
 │   ├── network.zig            3,308 lines   Core network (forward/backward/train)
-│   ├── root.zig                  48 lines   Public re-exports
+│   ├── root.zig                  49 lines   Public re-exports
 │   ├── safetensors.zig          736 lines   Safetensors format parser
 │   ├── shaders/
-│   │   ├── compute.metal      2,587 lines   GPU compute kernels
-│   │   └── transformer.metal    610 lines   Transformer-specific kernels
+│   │   ├── compute.metal      4,675 lines   GPU compute kernels
+│   │   ├── qmv_specialized.metal  902 lines   Quantized matmul kernels
+│   │   └── transformer.metal  1,343 lines   Transformer-specific kernels
+│   ├── specialized_qmv.zig     132 lines   Specialized quantized matmul
 │   ├── tokenizer.zig          1,574 lines   Tokenizer
-│   └── transformer.zig       5,278 lines   Transformer implementation
+│   └── transformer.zig       5,982 lines   Transformer implementation
 ├── benchmarks/                               JSON benchmark results
 └── data/mnist/                               MNIST raw dataset
                               ──────
-                              22,542 lines total
+                              27,161 lines total
 
 zap/
 ├── build.zig                                 Build config
 ├── build.zig.zon                             Package manifest
 ├── src/
-│   ├── agent_core.zig        1,940 lines   Shared agent framework
-│   ├── api_client.zig          802 lines   Anthropic HTTP client
-│   ├── bonsai_agent.zig        939 lines   Bonsai profile + two-tier
-│   ├── bonsai_research.zig   2,181 lines   Bonsai toolbox binary
-│   ├── mnist_agent.zig         132 lines   MNIST profile config
-│   ├── mnist_research.zig    1,100 lines   MNIST toolbox binary
-│   ├── ollama_client.zig     1,065 lines   Local LLM client
-│   └── tools.zig               630 lines   Shared CLI/file utilities
+│   ├── agent_core.zig        2,271 lines   Shared agent framework
+│   ├── api_client.zig          786 lines   Anthropic HTTP client
+│   ├── bonsai_agent.zig        468 lines   Bonsai agent profile
+│   ├── bonsai_research.zig      93 lines   Bonsai toolbox config
+│   ├── mnist_agent.zig         529 lines   MNIST agent profile
+│   ├── mnist_research.zig      885 lines   MNIST toolbox config + custom tools
+│   ├── toolbox.zig            2,399 lines   Generic toolbox (shared)
+│   └── tools.zig               699 lines   Shared CLI/file utilities
 ├── programs/
-│   ├── bonsai_executor.md                    Bonsai two-tier executor prompt
+│   ├── autoresearch_framework.md             Autoresearch framework prompt
 │   ├── bonsai_program.md                     Bonsai skill file
-│   ├── bonsai_strategist.md                  Bonsai two-tier strategist prompt
 │   ├── bonsai_system.md                      Bonsai system prompt
-│   ├── bonsai_tools.json                     Bonsai tool schemas
 │   ├── mnist_program.md                      MNIST skill file
 │   ├── mnist_system.md                       MNIST system prompt
-│   ├── mnist_tools.json                      MNIST tool schemas
 │   └── program.md                            Shared conventions
 ├── benchmarks/                               JSON benchmark results
 └── data/mnist/                               MNIST raw dataset
 ```
 
-Heavy hitters: `transformer.zig`, `network.zig`, `compute.metal` (~11k lines, half the nn codebase).
+Heavy hitters: `transformer.zig`, `network.zig`, `compute.metal` (~14k lines, half the nn codebase).
 Comptime spine: `layout.zig` resolves all buffer shapes at compile time.
-Two shader files: `compute.metal` (general NN kernels) and `transformer.metal` (attention-specific).
+Three shader files: `compute.metal` (general NN kernels), `transformer.metal` (attention-specific), `qmv_specialized.metal` (quantized matmul).
 Agent spine: `agent_core.zig` provides the shared experiment loop; profiles (`mnist_agent.zig`, `bonsai_agent.zig`) configure it.
+Toolbox spine: `toolbox.zig` provides all generic CLI tools; domain binaries (`bonsai_research.zig`, `mnist_research.zig`) are thin config wrappers.
 
 ### 0. **Simplicity and Elegance**
 
