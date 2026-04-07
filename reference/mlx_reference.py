@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""MLX reference implementation for nnzap MNIST benchmark.
+"""MLX reference implementation for nnmetal MNIST benchmark.
 
 MLX is Apple's array framework for Apple Silicon — it runs on
-the same Metal GPU with unified memory that nnzap targets.
+the same Metal GPU with unified memory that nnmetal targets.
 This makes it the fairest high-level comparison.
 
 Architecture: 784 → 128 (ReLU) → 64 (ReLU) → 10 (raw logits)
 Loss:         softmax + cross-entropy
 Optimiser:    mini-batch SGD (no momentum, no weight decay)
 
-Hyperparameters match nn/examples/mnist.zig exactly:
+Hyperparameters match examples/mnist.zig exactly:
   - seed:          42
   - batch_size:    64
   - learning_rate: 0.2
@@ -19,18 +19,18 @@ Hyperparameters match nn/examples/mnist.zig exactly:
   - val split:     10,000 (last 10k of shuffled 60k)
   - test split:    10,000
 
-Weight init matches nnzap's heInit():
+Weight init matches nnmetal's heInit():
   w ~ U(-limit, limit),  limit = sqrt(6 / fan_in)
   b = 0
 
 MNIST data is loaded directly from the IDX binary files in
-data/mnist/ — the same files nnzap reads. No torchvision
+data/mnist/ — the same files nnmetal reads. No torchvision
 download required.
 
 Usage:
   python scripts/mlx_reference.py
 
-  # Compare against nnzap and/or PyTorch benchmarks:
+  # Compare against nnmetal and/or PyTorch benchmarks:
   python scripts/mlx_reference.py --compare "benchmarks/mnist_*.json"
 
   # Save results:
@@ -63,7 +63,7 @@ import mlx.utils
 class MnistNet(nn.Module):
     """784 → 128 (ReLU) → 64 (ReLU) → 10 (raw logits).
 
-    Matches nnzap's NetworkLayout exactly. The last layer
+    Matches nnmetal's NetworkLayout exactly. The last layer
     has no activation — softmax is fused into the loss.
     """
 
@@ -90,7 +90,7 @@ class MnistNet(nn.Module):
 # ── Initialisation ────────────────────────────────────────────
 
 def he_init(model: MnistNet) -> None:
-    """He uniform init matching nnzap's heInit().
+    """He uniform init matching nnmetal's heInit().
 
     For each linear layer:
       weights ~ U(-limit, limit),  limit = sqrt(6 / fan_in)
@@ -113,7 +113,7 @@ def he_init(model: MnistNet) -> None:
 
 # ── MNIST IDX loader ─────────────────────────────────────────
 #
-# Reads the same binary files nnzap uses (data/mnist/).
+# Reads the same binary files nnmetal uses (data/mnist/).
 # No torchvision dependency required.
 
 def _read_idx_images(path: str) -> mx.array:
@@ -204,7 +204,7 @@ def evaluate(
     """Evaluate accuracy and mean CE loss.
 
     Iterates in batches to avoid a single giant allocation.
-    Matches nnzap's evaluate() semantics.
+    Matches nnmetal's evaluate() semantics.
     """
     count = images.shape[0]
     assert count > 0
@@ -260,7 +260,7 @@ def train_epoch(
 ) -> float:
     """Train for one epoch, return last-batch mean loss.
 
-    nnzap reports train_loss as the loss of the final batch
+    nnmetal reports train_loss as the loss of the final batch
     (not the epoch average). We match that here.
     """
     count = indices.shape[0]
@@ -292,12 +292,12 @@ def train_epoch(
 # ── Comparison ────────────────────────────────────────────────
 
 def find_benchmarks() -> dict[str, str]:
-    """Find the most recent nnzap and PyTorch benchmarks."""
+    """Find the most recent nnmetal and PyTorch benchmarks."""
     found = {}
 
-    nnzap_files = sorted(glob.glob("benchmarks/mnist_*.json"))
-    if nnzap_files:
-        found["nnzap"] = nnzap_files[-1]
+    nnmetal_files = sorted(glob.glob("benchmarks/mnist_*.json"))
+    if nnmetal_files:
+        found["nnmetal"] = nnmetal_files[-1]
 
     pytorch_files = sorted(glob.glob("benchmarks/pytorch_mnist_*.json"))
     if pytorch_files:
@@ -399,14 +399,14 @@ def compare_all(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="MLX reference for nnzap MNIST benchmark",
+        description="MLX reference for nnmetal MNIST benchmark",
     )
     parser.add_argument(
         "--data-dir",
         default="data/mnist",
         help=(
             "Directory containing MNIST IDX files "
-            "(default: data/mnist — same as nnzap)"
+            "(default: data/mnist — same as nnmetal)"
         ),
     )
     parser.add_argument(
@@ -421,7 +421,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # ── Hyperparameters (match nnzap exactly) ──
+    # ── Hyperparameters (match nnmetal exactly) ──
 
     seed = 42
     num_epochs = 20
@@ -476,7 +476,7 @@ def main() -> None:
     print("done.")
 
     # Shuffle all 60k indices with a fixed seed, then
-    # freeze the partition (same strategy as nnzap).
+    # freeze the partition (same strategy as nnmetal).
     mx.random.seed(seed)
     all_indices = mx.random.permutation(total_train)
     mx.eval(all_indices)
@@ -502,7 +502,7 @@ def main() -> None:
     print()
 
     # ── Optimizer ──
-    # Plain SGD: no momentum, no weight decay — matches nnzap.
+    # Plain SGD: no momentum, no weight decay — matches nnmetal.
 
     optimizer = optim.SGD(learning_rate=learning_rate)
 
@@ -534,7 +534,7 @@ def main() -> None:
     for epoch in range(1, num_epochs + 1):
         epoch_start = time.perf_counter()
 
-        # Reshuffle training indices each epoch (nnzap does
+        # Reshuffle training indices each epoch (nnmetal does
         # this too — random.shuffle in trainEpoch).
         shuffled = mx.random.permutation(train_count)
         epoch_indices = train_indices[shuffled]
@@ -551,7 +551,7 @@ def main() -> None:
         )
 
         # Validate every val_interval epochs and on the
-        # last epoch — matches nnzap's val_interval=5.
+        # last epoch — matches nnmetal's val_interval=5.
         is_val_epoch = (
             epoch % val_interval == 0 or epoch == num_epochs
         )
@@ -718,7 +718,7 @@ def main() -> None:
             if "pytorch" in p:
                 benchmark_paths["pytorch"] = p
             elif "mlx" not in p:
-                benchmark_paths["nnzap"] = p
+                benchmark_paths["nnmetal"] = p
         if benchmark_paths:
             compare_all(results, benchmark_paths)
     else:

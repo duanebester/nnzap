@@ -1,20 +1,15 @@
 //! Generic research toolbox — shared CLI tool
 //! implementations for AI agent research binaries.
 //!
-//! Provides sandboxed file I/O, snapshot/rollback,
-//! build/test/bench dispatch, benchmark management,
-//! git commit, and experiment history tracking.
+//! Provides sandboxed file I/O, git-based experiment
+//! branching, build/test/bench dispatch, benchmark
+//! management, and experiment history tracking.
 //!
 //! Domain-specific binaries configure this module via
 //! ToolboxConfig and optionally handle custom tools
 //! through the custom_dispatch callback.
 //!
 //! Tools provided:
-//!   snapshot            Save engine files to snapshot
-//!   snapshot-list       List all snapshots
-//!   rollback            Restore from a snapshot
-//!   rollback-latest     Restore most recent snapshot
-//!   diff                Diff current vs snapshot
 //!   check               Compile-only validation
 //!   test                Run test suite
 //!   bench               Run primary benchmark
@@ -22,7 +17,7 @@
 //!   bench-list          List benchmark files
 //!   bench-latest        Output latest benchmark
 //!   bench-clean         Delete old benchmark files
-//!   show                Show engine source file
+//!   show                Show a source file
 //!   show-function       Extract a function body
 //!   read-file           Read a project file
 //!   write-file          Write to a project file
@@ -31,6 +26,10 @@
 //!   cwd                 Print working directory
 //!   run-cmd             Run a shell command
 //!   commit              Git add and commit
+//!   git-start           Create experiment branch
+//!   git-diff            Show uncommitted changes
+//!   git-finish          Merge experiment to main
+//!   git-abandon         Discard changes, return to main
 //!   add-summary         Record experiment summary
 //!   history             Show recent experiments
 
@@ -67,9 +66,6 @@ pub const ToolboxConfig = struct {
     /// the prefix scope.
     read_files: []const []const u8,
 
-    /// Files to include in snapshots.
-    engine_files: []const []const u8,
-
     /// Build check command (compile-only validation).
     check_command: []const []const u8,
 
@@ -99,9 +95,6 @@ pub const ToolboxConfig = struct {
     /// History directory (monorepo-relative).
     history_dir: []const u8,
 
-    /// Snapshot directory (monorepo-relative).
-    snapshot_dir: []const u8,
-
     /// Optional domain-specific tool dispatch.
     /// Return true if the command was handled.
     custom_dispatch: ?*const fn (
@@ -121,23 +114,14 @@ pub const ExtraBench = struct {
 // Constants (Rule 4 — hard limits)
 // ============================================================
 
-const MAX_SNAPSHOTS: u32 = 128;
-const MAX_DIFF_LINES: u32 = 200_000;
 const MAX_FUNCTION_NAME: u32 = 256;
 const MAX_PATH_LEN: u32 = 512;
-const TIMESTAMP_LEN: u32 = 19; // "2025-01-15T14-30-00"
 const MAX_HISTORY_SIZE: usize = 2 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT: usize = 1 * 1024 * 1024;
 
 // ============================================================
 // Internal result types
 // ============================================================
-
-const DiffFileResult = struct {
-    changed: bool,
-    additions: u32,
-    deletions: u32,
-};
 
 const FunctionBounds = struct {
     start_line: u32,
@@ -198,7 +182,6 @@ fn getJsonString(
 /// Parses CLI args, dispatches to the matching tool,
 /// and handles errors.  Does not return on failure.
 pub fn run(config: *const ToolboxConfig) void {
-    std.debug.assert(config.engine_files.len > 0);
     std.debug.assert(config.write_scope.len > 0);
     std.debug.assert(config.read_scope.len > 0);
     std.debug.assert(config.bench_command.len > 0);
@@ -242,21 +225,6 @@ fn dispatch(
 
     if (tools.eql(cmd, "help")) {
         return toolHelp(config);
-    }
-    if (tools.eql(cmd, "snapshot")) {
-        return toolSnapshot(config, arena);
-    }
-    if (tools.eql(cmd, "snapshot-list")) {
-        return toolSnapshotList(config, arena);
-    }
-    if (tools.eql(cmd, "rollback")) {
-        return toolRollback(config, arena, args);
-    }
-    if (tools.eql(cmd, "rollback-latest")) {
-        return toolRollbackLatest(config, arena);
-    }
-    if (tools.eql(cmd, "diff")) {
-        return toolDiff(config, arena, args);
     }
     if (tools.eql(cmd, "check")) {
         return toolCheck(config, arena);
@@ -304,6 +272,18 @@ fn dispatch(
     if (tools.eql(cmd, "commit")) {
         return toolCommit(config, arena, args);
     }
+    if (tools.eql(cmd, "git-start")) {
+        return toolGitStart(config, arena, args);
+    }
+    if (tools.eql(cmd, "git-diff")) {
+        return toolGitDiff(arena);
+    }
+    if (tools.eql(cmd, "git-finish")) {
+        return toolGitFinish(arena);
+    }
+    if (tools.eql(cmd, "git-abandon")) {
+        return toolGitAbandon(arena);
+    }
     if (tools.eql(cmd, "add-summary")) {
         return toolAddSummary(config, arena, args);
     }
@@ -335,417 +315,18 @@ fn toolHelp(config: *const ToolboxConfig) !void {
     _ = config;
     try tools.writeStdout(
         "{\"tools\": [" ++
-            "\"snapshot\", \"snapshot-list\", " ++
-            "\"rollback\", \"rollback-latest\", " ++
-            "\"diff\", \"check\", \"test\", " ++
+            "\"check\", \"test\", " ++
             "\"bench\", \"bench-compare\", " ++
             "\"bench-list\", \"bench-latest\", " ++
             "\"bench-clean\", \"show\", " ++
             "\"show-function\", \"read-file\", " ++
             "\"write-file\", \"edit-file\", " ++
             "\"list-dir\", \"cwd\", \"run-cmd\", " ++
-            "\"commit\", \"add-summary\", " ++
+            "\"commit\", \"git-start\", " ++
+            "\"git-diff\", \"git-finish\", " ++
+            "\"git-abandon\", \"add-summary\", " ++
             "\"history\"]}\n",
     );
-}
-
-// ============================================================
-// Tool: snapshot — copy engine sources to timestamped dir
-// ============================================================
-
-fn toolSnapshot(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) !void {
-    var ts_buf: [32]u8 = undefined;
-    const timestamp = formatTimestamp(&ts_buf);
-    std.debug.assert(timestamp.len == TIMESTAMP_LEN);
-
-    const snap_dir = try std.fmt.allocPrint(
-        arena,
-        "{s}/{s}",
-        .{ config.snapshot_dir, timestamp },
-    );
-    const snap_dir_fs = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        snap_dir,
-    );
-
-    // Create the snapshot root directory.
-    try std.fs.cwd().makePath(snap_dir_fs);
-
-    const count = try snapshotCopyFiles(
-        config,
-        arena,
-        snap_dir_fs,
-    );
-    std.debug.assert(count <= config.engine_files.len);
-
-    const json = try std.fmt.allocPrint(
-        arena,
-        "{{\"status\": \"ok\", " ++
-            "\"snapshot_id\": \"{s}\", " ++
-            "\"files\": {d}}}\n",
-        .{ timestamp, count },
-    );
-    try tools.writeStdout(json);
-}
-
-/// Copy each engine file into the snapshot directory,
-/// preserving the relative path structure.
-fn snapshotCopyFiles(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    snap_dir_fs: []const u8,
-) !u32 {
-    std.debug.assert(snap_dir_fs.len > 0);
-    var count: u32 = 0;
-
-    for (config.engine_files) |file| {
-        std.debug.assert(file.len > 0);
-
-        // Ensure parent directories exist inside snapshot.
-        const dest = try std.fmt.allocPrint(
-            arena,
-            "{s}/{s}",
-            .{ snap_dir_fs, file },
-        );
-        if (std.fs.path.dirname(dest)) |parent| {
-            try std.fs.cwd().makePath(parent);
-        }
-
-        const file_fs = try tools.resolveToFs(
-            arena,
-            config.fs_root,
-            file,
-        );
-        tools.copyFile(file_fs, dest) catch |err| {
-            std.debug.print(
-                "{s}: skip {s}: {s}\n",
-                .{
-                    config.name,
-                    file,
-                    @errorName(err),
-                },
-            );
-            continue;
-        };
-        count += 1;
-    }
-    return count;
-}
-
-// ============================================================
-// Tool: snapshot-list — enumerate all snapshot directories
-// ============================================================
-
-fn toolSnapshotList(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) !void {
-    const dirs = try listSnapshotDirs(config, arena);
-    var buf: std.ArrayList(u8) = .empty;
-
-    try buf.appendSlice(arena, "{\"status\": \"ok\", ");
-    try buf.appendSlice(arena, "\"snapshots\": [");
-
-    for (dirs, 0..) |name, i| {
-        if (i > 0) try buf.appendSlice(arena, ", ");
-        try buf.appendSlice(arena, "\"");
-        try buf.appendSlice(arena, name);
-        try buf.appendSlice(arena, "\"");
-    }
-
-    try buf.appendSlice(arena, "]}\n");
-    std.debug.assert(buf.items.len > 0);
-    try tools.writeStdout(buf.items);
-}
-
-// ============================================================
-// Tool: rollback — restore engine files from a snapshot
-// ============================================================
-
-fn toolRollback(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    args: []const []const u8,
-) !void {
-    if (args.len < 1) {
-        try tools.writeStdout(
-            "{\"status\": \"error\", " ++
-                "\"error\": \"usage: rollback " ++
-                "<snapshot_id>\"}\n",
-        );
-        return;
-    }
-
-    const snapshot_id = args[0];
-    std.debug.assert(snapshot_id.len > 0);
-    try restoreSnapshot(config, arena, snapshot_id);
-}
-
-fn toolRollbackLatest(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) !void {
-    const latest = try findLatestSnapshot(
-        config,
-        arena,
-    );
-    std.debug.assert(latest.len > 0);
-    try restoreSnapshot(config, arena, latest);
-}
-
-/// Restore all engine files from a named snapshot.
-fn restoreSnapshot(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    snapshot_id: []const u8,
-) !void {
-    std.debug.assert(snapshot_id.len > 0);
-
-    const snap_dir = try std.fmt.allocPrint(
-        arena,
-        "{s}/{s}",
-        .{ config.snapshot_dir, snapshot_id },
-    );
-    const snap_dir_fs = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        snap_dir,
-    );
-
-    // Verify the snapshot directory exists.
-    std.fs.cwd().access(snap_dir_fs, .{}) catch {
-        const json = try std.fmt.allocPrint(
-            arena,
-            "{{\"status\": \"error\", " ++
-                "\"error\": \"snapshot not " ++
-                "found: {s}\"}}\n",
-            .{snapshot_id},
-        );
-        try tools.writeStdout(json);
-        return;
-    };
-
-    var count: u32 = 0;
-    for (config.engine_files) |file| {
-        const source = try std.fmt.allocPrint(
-            arena,
-            "{s}/{s}",
-            .{ snap_dir_fs, file },
-        );
-        const file_fs = try tools.resolveToFs(
-            arena,
-            config.fs_root,
-            file,
-        );
-        tools.copyFile(source, file_fs) catch continue;
-        count += 1;
-    }
-
-    std.debug.assert(count <= config.engine_files.len);
-    const json = try std.fmt.allocPrint(
-        arena,
-        "{{\"status\": \"ok\", " ++
-            "\"snapshot_id\": \"{s}\", " ++
-            "\"files_restored\": {d}}}\n",
-        .{ snapshot_id, count },
-    );
-    try tools.writeStdout(json);
-}
-
-// ============================================================
-// Tool: diff — compare current files against a snapshot
-// ============================================================
-
-fn toolDiff(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    args: []const []const u8,
-) !void {
-    if (args.len < 1) {
-        try tools.writeStdout(
-            "{\"status\": \"error\", " ++
-                "\"error\": \"usage: diff " ++
-                "<snapshot_id>\"}\n",
-        );
-        return;
-    }
-
-    const snapshot_id = args[0];
-    std.debug.assert(snapshot_id.len > 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    const header = try std.fmt.allocPrint(
-        arena,
-        "{{\"status\": \"ok\", " ++
-            "\"snapshot_id\": \"{s}\", " ++
-            "\"files\": [\n",
-        .{snapshot_id},
-    );
-    try buf.appendSlice(arena, header);
-
-    for (config.engine_files, 0..) |file, i| {
-        if (i > 0) try buf.appendSlice(arena, ",\n");
-        const entry = try formatDiffEntry(
-            config,
-            arena,
-            snapshot_id,
-            file,
-        );
-        try buf.appendSlice(arena, entry);
-    }
-
-    try buf.appendSlice(arena, "\n]}\n");
-    try tools.writeStdout(buf.items);
-}
-
-/// Run diff(1) on a single file, return JSON fragment.
-fn formatDiffEntry(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    snapshot_id: []const u8,
-    file: []const u8,
-) ![]const u8 {
-    std.debug.assert(snapshot_id.len > 0);
-    std.debug.assert(file.len > 0);
-
-    const result = diffOneFile(
-        config,
-        arena,
-        snapshot_id,
-        file,
-    );
-
-    if (result.changed) {
-        return std.fmt.allocPrint(
-            arena,
-            "  {{\"file\": \"{s}\", " ++
-                "\"changed\": true, " ++
-                "\"additions\": {d}, " ++
-                "\"deletions\": {d}}}",
-            .{
-                file,
-                result.additions,
-                result.deletions,
-            },
-        );
-    }
-
-    return std.fmt.allocPrint(
-        arena,
-        "  {{\"file\": \"{s}\", " ++
-            "\"changed\": false}}",
-        .{file},
-    );
-}
-
-/// Shell out to diff(1) for a single file pair.
-/// Returns change counts; never fails (defaults to
-/// changed if something goes wrong).
-fn diffOneFile(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    snapshot_id: []const u8,
-    file: []const u8,
-) DiffFileResult {
-    const snap_rel = std.fmt.allocPrint(
-        arena,
-        "{s}/{s}/{s}",
-        .{ config.snapshot_dir, snapshot_id, file },
-    ) catch return .{
-        .changed = true,
-        .additions = 0,
-        .deletions = 0,
-    };
-
-    const snap_path = tools.resolveToFs(
-        arena,
-        config.fs_root,
-        snap_rel,
-    ) catch return .{
-        .changed = true,
-        .additions = 0,
-        .deletions = 0,
-    };
-
-    const file_fs = tools.resolveToFs(
-        arena,
-        config.fs_root,
-        file,
-    ) catch return .{
-        .changed = true,
-        .additions = 0,
-        .deletions = 0,
-    };
-
-    const result = std.process.Child.run(.{
-        .allocator = arena,
-        .argv = &[_][]const u8{
-            "diff", "-u", snap_path, file_fs,
-        },
-        .max_output_bytes = tools.MAX_OUTPUT_BYTES,
-    }) catch return .{
-        .changed = true,
-        .additions = 0,
-        .deletions = 0,
-    };
-
-    const code: u8 = switch (result.term) {
-        .Exited => |c| c,
-        else => return .{
-            .changed = true,
-            .additions = 0,
-            .deletions = 0,
-        },
-    };
-
-    // diff exit codes: 0 = identical, 1 = different,
-    // 2+ = error.
-    if (code == 0) {
-        return .{
-            .changed = false,
-            .additions = 0,
-            .deletions = 0,
-        };
-    }
-
-    const changes = countDiffChanges(result.stdout);
-    return .{
-        .changed = true,
-        .additions = changes[0],
-        .deletions = changes[1],
-    };
-}
-
-/// Count additions (+) and deletions (-) in unified diff
-/// output, skipping the --- and +++ header lines.
-fn countDiffChanges(output: []const u8) [2]u32 {
-    std.debug.assert(
-        output.len <= tools.MAX_OUTPUT_BYTES,
-    );
-    var additions: u32 = 0;
-    var deletions: u32 = 0;
-
-    var iter = std.mem.splitScalar(
-        u8,
-        output,
-        '\n',
-    );
-    while (iter.next()) |line| {
-        if (line.len == 0) continue;
-        // Skip unified diff headers.
-        if (tools.startsWith(line, "---")) continue;
-        if (tools.startsWith(line, "+++")) continue;
-        if (line[0] == '+') additions += 1;
-        if (line[0] == '-') deletions += 1;
-    }
-
-    std.debug.assert(additions <= MAX_DIFF_LINES);
-    std.debug.assert(deletions <= MAX_DIFF_LINES);
-    return .{ additions, deletions };
 }
 
 // ============================================================
@@ -1144,23 +725,40 @@ fn toolShow(
         return;
     }
 
-    const short_name = args[0];
-    const path = resolveEnginePath(config, short_name);
-    if (path == null) {
-        try writeFileNotFound(
-            config,
+    const path = args[0];
+    std.debug.assert(path.len > 0);
+
+    if (!isAllowedReadPath(config, path)) {
+        const err_msg = try std.fmt.allocPrint(
             arena,
-            short_name,
+            "{{\"status\": \"error\", " ++
+                "\"error\": \"read not allowed " ++
+                "for '{s}'\"}}\n",
+            .{path},
         );
+        try tools.writeStdout(err_msg);
         return;
     }
 
     const path_fs = try tools.resolveToFs(
         arena,
         config.fs_root,
-        path.?,
+        path,
     );
-    const content = try tools.readFile(arena, path_fs);
+    const content = tools.readFile(
+        arena,
+        path_fs,
+    ) catch {
+        const err_msg = try std.fmt.allocPrint(
+            arena,
+            "{{\"status\": \"error\", " ++
+                "\"error\": \"cannot read " ++
+                "'{s}'\"}}\n",
+            .{path},
+        );
+        try tools.writeStdout(err_msg);
+        return;
+    };
     const lines = countLines(content);
     const escaped = try tools.jsonEscape(
         arena,
@@ -1173,40 +771,9 @@ fn toolShow(
             "\"file\": \"{s}\", " ++
             "\"lines\": {d}, " ++
             "\"content\": \"{s}\"}}\n",
-        .{ short_name, lines, escaped },
+        .{ path, lines, escaped },
     );
     std.debug.assert(json.len > 0);
-    try tools.writeStdout(json);
-}
-
-/// Emit a "file not found" JSON error with the list of
-/// valid file names the user can choose from.
-fn writeFileNotFound(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    short_name: []const u8,
-) !void {
-    std.debug.assert(short_name.len > 0);
-    std.debug.assert(config.engine_files.len > 0);
-
-    var names_buf: std.ArrayList(u8) = .empty;
-    for (config.engine_files, 0..) |file, i| {
-        if (i > 0) {
-            names_buf.appendSlice(
-                arena,
-                ", ",
-            ) catch {};
-        }
-        names_buf.appendSlice(arena, file) catch {};
-    }
-
-    const json = try std.fmt.allocPrint(
-        arena,
-        "{{\"status\": \"error\", " ++
-            "\"error\": \"unknown file: {s}. " ++
-            "Valid: {s}\"}}\n",
-        .{ short_name, names_buf.items },
-    );
     try tools.writeStdout(json);
 }
 
@@ -1229,26 +796,42 @@ fn toolShowFunction(
         return;
     }
 
-    const short_name = args[0];
+    const path = args[0];
     const function_name = args[1];
+    std.debug.assert(path.len > 0);
     std.debug.assert(function_name.len > 0);
 
-    const path = resolveEnginePath(config, short_name);
-    if (path == null) {
-        try writeFileNotFound(
-            config,
+    if (!isAllowedReadPath(config, path)) {
+        const err_msg = try std.fmt.allocPrint(
             arena,
-            short_name,
+            "{{\"status\": \"error\", " ++
+                "\"error\": \"read not allowed " ++
+                "for '{s}'\"}}\n",
+            .{path},
         );
+        try tools.writeStdout(err_msg);
         return;
     }
 
     const path_fs = try tools.resolveToFs(
         arena,
         config.fs_root,
-        path.?,
+        path,
     );
-    const content = try tools.readFile(arena, path_fs);
+    const content = tools.readFile(
+        arena,
+        path_fs,
+    ) catch {
+        const err_msg = try std.fmt.allocPrint(
+            arena,
+            "{{\"status\": \"error\", " ++
+                "\"error\": \"cannot read " ++
+                "'{s}'\"}}\n",
+            .{path},
+        );
+        try tools.writeStdout(err_msg);
+        return;
+    };
     const bounds = findFunctionBounds(
         content,
         function_name,
@@ -1257,7 +840,7 @@ fn toolShowFunction(
     if (bounds == null) {
         try writeFunctionNotFound(
             arena,
-            short_name,
+            path,
             function_name,
         );
         return;
@@ -1271,7 +854,7 @@ fn toolShowFunction(
     );
     try emitFunctionJson(
         arena,
-        short_name,
+        path,
         function_name,
         bounds.?,
         body,
@@ -1549,85 +1132,6 @@ fn formatTimestamp(buf: *[32]u8) []const u8 {
             second,
         },
     ) catch "0000-00-00T00-00-00";
-}
-
-// ============================================================
-// Snapshot directory helpers
-// ============================================================
-
-/// List all snapshot directory names, sorted ascending.
-fn listSnapshotDirs(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) ![]const []const u8 {
-    const snap_fs = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        config.snapshot_dir,
-    );
-    var dir = std.fs.cwd().openDir(
-        snap_fs,
-        .{ .iterate = true },
-    ) catch return &.{};
-    defer dir.close();
-
-    var names: std.ArrayList([]const u8) = .empty;
-    var iter = dir.iterate();
-    var count: u32 = 0;
-
-    while (try iter.next()) |entry| {
-        if (count >= MAX_SNAPSHOTS) break;
-        if (entry.kind != .directory) continue;
-        const dupe = try arena.dupe(u8, entry.name);
-        try names.append(arena, dupe);
-        count += 1;
-    }
-
-    tools.sortStrings(names.items);
-    std.debug.assert(names.items.len <= MAX_SNAPSHOTS);
-    return names.items;
-}
-
-/// Find the lexicographically latest snapshot (most
-/// recent).  Fails with error.NoSnapshots if none exist.
-fn findLatestSnapshot(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) ![]const u8 {
-    const dirs = try listSnapshotDirs(config, arena);
-    std.debug.assert(config.snapshot_dir.len > 0);
-    if (dirs.len == 0) return error.NoSnapshots;
-    return dirs[dirs.len - 1];
-}
-
-// ============================================================
-// Engine file resolution
-// ============================================================
-
-/// Map a short filename ("metal.zig", "compute.metal",
-/// etc.) to its full relative path ("nn/src/metal.zig",
-/// "nn/src/shaders/compute.metal", etc.).
-/// Also accepts full paths like "nn/src/metal.zig".
-fn resolveEnginePath(
-    config: *const ToolboxConfig,
-    short_name: []const u8,
-) ?[]const u8 {
-    std.debug.assert(short_name.len > 0);
-
-    // First, check for exact match against full paths.
-    for (config.engine_files) |path| {
-        if (tools.eql(path, short_name)) return path;
-    }
-
-    // Then, check if any path ends with the short name.
-    for (config.engine_files) |path| {
-        if (std.mem.endsWith(u8, path, short_name)) {
-            return path;
-        }
-    }
-
-    std.debug.assert(config.engine_files.len > 0);
-    return null;
 }
 
 // ============================================================
@@ -2082,6 +1586,197 @@ fn toolCommit(
 }
 
 // ============================================================
+// Tool: git-start — create an experiment branch
+// ============================================================
+
+fn toolGitStart(
+    config: *const ToolboxConfig,
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    _ = config;
+    const obj = readJsonInput(arena, args) orelse {
+        try tools.writeJsonError(error.InvalidInput);
+        std.process.exit(1);
+    };
+    const raw_name = getJsonString(
+        obj,
+        "name",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'name' field",
+        );
+        std.process.exit(1);
+    };
+    if (raw_name.len == 0) {
+        try tools.stdout_file.writeAll(
+            "Error: empty experiment name",
+        );
+        std.process.exit(1);
+    }
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = formatTimestamp(&ts_buf);
+    const safe_name = sanitizeBranchName(
+        arena,
+        raw_name,
+    );
+    const branch = try std.fmt.allocPrint(
+        arena,
+        "experiment/{s}-{s}",
+        .{ ts, safe_name },
+    );
+
+    // Switch to main first, then create the branch.
+    const cmd = try std.fmt.allocPrint(
+        arena,
+        "git checkout main && " ++
+            "git checkout -b '{s}'",
+        .{branch},
+    );
+    try runShellCommand(arena, cmd);
+}
+
+// ============================================================
+// Tool: git-diff — show uncommitted changes
+// ============================================================
+
+fn toolGitDiff(arena: Allocator) !void {
+    try runShellCommand(
+        arena,
+        "git --no-pager diff",
+    );
+}
+
+// ============================================================
+// Tool: git-finish — merge experiment branch to main
+// ============================================================
+
+fn toolGitFinish(arena: Allocator) !void {
+    const branch = captureGitBranch(arena) catch {
+        try tools.stdout_file.writeAll(
+            "Error: cannot determine current branch",
+        );
+        std.process.exit(1);
+    };
+    if (tools.eql(branch, "main")) {
+        try tools.stdout_file.writeAll(
+            "Error: already on main, " ++
+                "nothing to merge",
+        );
+        std.process.exit(1);
+    }
+
+    // Merge the experiment branch into main.
+    const cmd = try std.fmt.allocPrint(
+        arena,
+        "git checkout main && " ++
+            "git merge '{s}'",
+        .{branch},
+    );
+    try runShellCommand(arena, cmd);
+}
+
+// ============================================================
+// Tool: git-abandon — discard changes, return to main
+// ============================================================
+
+fn toolGitAbandon(arena: Allocator) !void {
+    const branch = captureGitBranch(arena) catch {
+        try tools.stdout_file.writeAll(
+            "Error: cannot determine current branch",
+        );
+        std.process.exit(1);
+    };
+    if (tools.eql(branch, "main")) {
+        try tools.stdout_file.writeAll(
+            "Already on main, nothing to abandon.",
+        );
+        return;
+    }
+
+    // Discard uncommitted changes and switch to main.
+    try runShellCommand(
+        arena,
+        "git reset --hard HEAD && " ++
+            "git checkout main",
+    );
+}
+
+// ============================================================
+// Git helpers
+// ============================================================
+
+/// Run `git rev-parse --abbrev-ref HEAD` and return
+/// the current branch name.
+fn captureGitBranch(
+    arena: Allocator,
+) ![]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &.{
+            "git",
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        },
+        .max_output_bytes = MAX_COMMAND_OUTPUT,
+    }) catch return error.GitFailed;
+
+    const ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return error.GitFailed;
+
+    const trimmed = std.mem.trimRight(
+        u8,
+        result.stdout,
+        "\n\r \t",
+    );
+    if (trimmed.len == 0) return error.GitFailed;
+    return trimmed;
+}
+
+/// Sanitize user input for use as a git branch name.
+/// Replaces non-alphanumeric characters with dashes
+/// and collapses consecutive dashes.
+fn sanitizeBranchName(
+    arena: Allocator,
+    raw: []const u8,
+) []const u8 {
+    std.debug.assert(raw.len > 0);
+    const max_len: usize = 60;
+    const limit = @min(raw.len, max_len);
+
+    var buf: std.ArrayList(u8) = .empty;
+    var prev_dash = false;
+
+    for (raw[0..limit]) |c| {
+        const keep = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9');
+        if (keep) {
+            buf.append(arena, c) catch break;
+            prev_dash = false;
+        } else if (!prev_dash) {
+            buf.append(arena, '-') catch break;
+            prev_dash = true;
+        }
+    }
+
+    // Trim trailing dash.
+    if (buf.items.len > 0 and
+        buf.items[buf.items.len - 1] == '-')
+    {
+        buf.items.len -= 1;
+    }
+
+    if (buf.items.len == 0) return "unnamed";
+    return buf.items;
+}
+
+// ============================================================
 // Tool: add-summary — record an experiment summary
 // ============================================================
 
@@ -2392,8 +2087,10 @@ fn isAllowedWritePath(
         return false;
     }
     if (path[0] == '/') return false;
-    for (config.write_scope) |allowed| {
-        if (tools.eql(path, allowed)) return true;
+    for (config.write_scope) |prefix| {
+        if (tools.startsWith(path, prefix)) {
+            return true;
+        }
     }
     return false;
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""MLX inference benchmark for nnzap comparison.
+"""MLX inference benchmark for nnmetal comparison.
 
-Mirrors nnzap's nn/examples/inference_bench.zig — three phases:
+Mirrors nnmetal's examples/inference_bench.zig — three phases:
 
   Phase 1 — GPU batched throughput
     Forward-pass 10,240 samples in batches of 64 using MLX's
@@ -71,7 +71,7 @@ PARAM_COUNT = (784 * 128 + 128) + (128 * 64 + 64) + (64 * 10 + 10)
 class MnistNet(nn.Module):
     """784 → 128 (ReLU) → 64 (ReLU) → 10 (raw logits).
 
-    Matches nnzap's NetworkLayout exactly.  The last layer
+    Matches nnmetal's NetworkLayout exactly.  The last layer
     has no activation — softmax is fused into the loss
     during training, and raw logits are used for inference.
     """
@@ -99,7 +99,7 @@ class MnistNet(nn.Module):
 # ── Initialisation ────────────────────────────────────────────
 
 def he_init(model: MnistNet) -> None:
-    """He uniform init matching nnzap's heInit().
+    """He uniform init matching nnmetal's heInit().
 
     For each linear layer:
       weights ~ U(-limit, limit),  limit = sqrt(6 / fan_in)
@@ -144,7 +144,7 @@ def compute_stats(latencies_us: list[float]) -> dict:
     sorted_us = sorted(latencies_us)
     n = len(sorted_us) - 1  # 0-based max index.
 
-    # Nearest-rank percentile (same as nnzap).
+    # Nearest-rank percentile (same as nnmetal).
     p50_idx = n * 50 // 100
     p99_idx = n * 99 // 100
 
@@ -333,7 +333,7 @@ def compare_benchmarks(
     mlx_results: dict,
     file_paths: list[str],
 ) -> None:
-    """Print comparison table against nnzap benchmark files."""
+    """Print comparison table against nnmetal benchmark files."""
     benchmarks = {"mlx": mlx_results}
 
     for path in sorted(file_paths):
@@ -433,7 +433,7 @@ def assemble_results(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "MLX inference benchmark — mirrors nnzap's "
+            "MLX inference benchmark — mirrors nnmetal's "
             "inference_bench.zig"
         ),
     )
@@ -493,8 +493,8 @@ def main() -> None:
     )
     print(file=sys.stderr)
 
-    # ── Input data (random, same as nnzap) ──
-    # nnzap fills input buffers with random floats in [0, 1).
+    # ── Input data (random, same as nnmetal) ──
+    # nnmetal fills input buffers with random floats in [0, 1).
     # We do the same — the actual values don't matter for
     # benchmarking, only the shapes and computation paths.
 

@@ -311,7 +311,7 @@ pub fn NetworkLayout(comptime arch: []const LayerDesc) type {
                 .{},
             );
             std.debug.print(
-                "|       nnzap Network Layout        |\n",
+                "|      nnmetal Network Layout       |\n",
                 .{},
             );
             std.debug.print(

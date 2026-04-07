@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PyTorch inference benchmark mirroring nnzap's inference_bench.zig.
+"""PyTorch inference benchmark mirroring nnmetal's inference_bench.zig.
 
 Architecture: 784 → 128 (ReLU) → 64 (ReLU) → 10 (raw logits)
 Init:         He uniform — w ~ U(-limit, limit), limit = sqrt(6/fan_in), b = 0
@@ -85,7 +85,7 @@ def _build_model_class():
     class MnistNet(nn.Module):
         """784 → 128 (ReLU) → 64 (ReLU) → 10 (raw logits).
 
-        Matches nnzap's NetworkLayout exactly.  The last
+        Matches nnmetal's NetworkLayout exactly.  The last
         layer has no activation — softmax is fused into
         the loss during training.
         """
@@ -111,7 +111,7 @@ def _build_model_class():
 # ── Initialisation ────────────────────────────────────────────
 
 def he_init(model) -> None:
-    """He uniform init matching nnzap's heInit().
+    """He uniform init matching nnmetal's heInit().
 
     For each linear layer:
       weights ~ U(-limit, limit),  limit = sqrt(6 / fan_in)
@@ -277,7 +277,7 @@ def compute_latency_stats(
     """Compute p50/p99/mean/min/max from nanosecond samples.
 
     Uses nearest-rank percentile on 0-based indices to
-    match nnzap's computeStats().
+    match nnmetal's computeStats().
     """
     assert len(latencies_ns) == count
     assert count > 0
@@ -311,7 +311,7 @@ def _clone_model_to(model, device):
     return clone
 
 
-# ── Printing (to stderr, matching nnzap's debug output) ──────
+# ── Printing (to stderr, matching nnmetal's debug output) ──────
 
 def print_header(param_count: int) -> None:
     """Print the architecture summary banner."""
@@ -418,32 +418,32 @@ def print_skipped(label: str) -> None:
 
 # ── Comparison ────────────────────────────────────────────────
 
-def compare_with_nnzap(
+def compare_with_nnmetal(
     pytorch_results: dict,
-    nnzap_path: str,
+    nnmetal_path: str,
 ) -> None:
-    """Print side-by-side comparison with an nnzap
+    """Print side-by-side comparison with an nnmetal
     inference benchmark JSON.
     """
-    with open(nnzap_path) as f:
-        nnzap = json.load(f)
+    with open(nnmetal_path) as f:
+        nnmetal = json.load(f)
 
     sep = "-" * 58
     print(file=sys.stderr)
     print(
-        f"{'Comparison with nnzap':^58}",
+        f"{'Comparison with nnmetal':^58}",
         file=sys.stderr,
     )
-    print(f"  nnzap file: {nnzap_path}", file=sys.stderr)
+    print(f"  nnmetal file: {nnmetal_path}", file=sys.stderr)
     print(sep, file=sys.stderr)
     print(
-        f"{'Metric':<30} {'nnzap':>12} {'PyTorch':>12}",
+        f"{'Metric':<30} {'nnmetal':>12} {'PyTorch':>12}",
         file=sys.stderr,
     )
     print(sep, file=sys.stderr)
 
     # GPU batched throughput.
-    nz_gpu = nnzap.get("gpu_batched")
+    nz_gpu = nnmetal.get("gpu_batched")
     pt_gpu = pytorch_results.get("gpu_batched")
 
     if nz_gpu and pt_gpu:
@@ -468,7 +468,7 @@ def compare_with_nnzap(
         )
 
     # GPU single-sample latency.
-    nz_gs = nnzap.get("gpu_single_sample")
+    nz_gs = nnmetal.get("gpu_single_sample")
     pt_gs = pytorch_results.get("gpu_single_sample")
 
     if nz_gs and pt_gs:
@@ -486,7 +486,7 @@ def compare_with_nnzap(
         )
 
     # CPU single-sample latency.
-    nz_cs = nnzap.get("cpu_single_sample")
+    nz_cs = nnmetal.get("cpu_single_sample")
     pt_cs = pytorch_results.get("cpu_single_sample")
 
     if nz_cs and pt_cs:
@@ -519,7 +519,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "PyTorch inference benchmark "
-            "(mirrors nnzap inference_bench.zig)"
+            "(mirrors nnmetal inference_bench.zig)"
         ),
     )
     parser.add_argument(
@@ -531,7 +531,7 @@ def main() -> None:
         "--compare",
         default=None,
         help=(
-            "Glob pattern for nnzap benchmark JSON files "
+            "Glob pattern for nnmetal benchmark JSON files "
             "to compare against"
         ),
     )
@@ -673,15 +673,15 @@ def main() -> None:
                 file=sys.stderr,
             )
         else:
-            # Use the most recent nnzap benchmark.
-            compare_with_nnzap(results, paths[-1])
+            # Use the most recent nnmetal benchmark.
+            compare_with_nnmetal(results, paths[-1])
     else:
-        # Auto-detect nnzap inference benchmarks.
-        nnzap_files = sorted(
+        # Auto-detect nnmetal inference benchmarks.
+        nnmetal_files = sorted(
             glob.glob("benchmarks/inference_2*.json"),
         )
-        if nnzap_files:
-            compare_with_nnzap(results, nnzap_files[-1])
+        if nnmetal_files:
+            compare_with_nnmetal(results, nnmetal_files[-1])
 
 
 if __name__ == "__main__":

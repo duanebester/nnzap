@@ -1,4 +1,4 @@
-//! Metal compute backend for nnzap
+//! Metal compute backend for nnmetal
 //!
 //! Wraps Apple's Metal API via zig-objc for GPU compute on Apple Silicon.
 //! Uses shared buffers (zero-copy unified memory) so the same physical memory
@@ -708,8 +708,8 @@ pub const Device = struct {
     library: objc.Object,
     unified_memory: bool,
     /// Half of MTLDevice.recommendedMaxWorkingSetSize — the
-    /// maximum bytes nnzap will allocate via Metal buffers.
-    /// Computed once at init. Keeps nnzap a well-behaved library
+    /// maximum bytes nnmetal will allocate via Metal buffers.
+    /// Computed once at init. Keeps nnmetal a well-behaved library
     /// by leaving the other half for the OS, other apps, and the
     /// CPU data pipeline.
     memory_budget_bytes: u64,
@@ -836,7 +836,7 @@ pub const Device = struct {
         // Half of what Metal itself recommends as the safe working
         // set ceiling. recommendedMaxWorkingSetSize is typically
         // 70-75% of total unified RAM on Apple Silicon — so /2
-        // gives nnzap ~35-37% of total RAM, leaving the rest
+        // gives nnmetal ~35-37% of total RAM, leaving the rest
         // available for the rest of the system.
         const recommended_max: u64 = @intCast(device.msgSend(
             c_ulong,
@@ -981,10 +981,16 @@ pub const Device = struct {
         std.debug.assert(self.command_queue.value != null);
         std.debug.assert(cmd_buf.value != null);
 
+        // MTLDispatchTypeConcurrent = 1: allows the GPU to
+        // overlap independent dispatches between barriers.
+        // Q/KV projections and Q-norm/K-norm-rope dispatches
+        // run concurrently within each block (~28 overlap
+        // opportunities per token).  Barriers already enforce
+        // all data dependencies.
         return cmd_buf.msgSend(
             objc.Object,
-            "computeCommandEncoder",
-            .{},
+            "computeCommandEncoderWithDispatchType:",
+            .{@as(c_ulong, 1)},
         );
     }
 

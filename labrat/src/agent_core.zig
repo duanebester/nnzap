@@ -1666,7 +1666,7 @@ pub fn buildOrientation(arena: Allocator) []const u8 {
 
     const root_ls = runQuietLs(arena, "..") orelse
         "(cannot list)";
-    const nn_ls = runQuietLs(arena, "../nn") orelse
+    const nn_ls = runQuietLs(arena, "../nnmetal") orelse
         "(cannot list)";
 
     return std.fmt.allocPrint(
@@ -1675,7 +1675,7 @@ pub fn buildOrientation(arena: Allocator) []const u8 {
             "run_command cwd: {s}\n" ++
             "Monorepo root is \"../\" from cwd.\n\n" ++
             "Monorepo root contents:\n{s}\n" ++
-            "nn/ contents:\n{s}\n",
+            "nnmetal/ contents:\n{s}\n",
         .{ cwd, root_ls, nn_ls },
     ) catch "(orientation unavailable)\n";
 }
@@ -2184,7 +2184,7 @@ pub fn truncateAtSentence(
 
 pub fn printHeader(name: []const u8) void {
     api.log(
-        "\nnnzap {s} agent" ++
+        "\nlabrat {s} agent" ++
             " — LLM-powered experiment runner\n" ++
             "========================================" ++
             "======\n\n",

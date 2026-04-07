@@ -1,4 +1,4 @@
-//! nnzap inference benchmark
+//! nnmetal inference benchmark
 //!
 //! Measures three inference paths and writes results to JSON:
 //!
@@ -110,8 +110,8 @@ const architecture = blk: {
 
 pub fn main() !void {
     std.debug.print(
-        "\nnnzap inference benchmark\n" ++
-            "=========================\n\n",
+        "\nnnmetal inference benchmark\n" ++
+            "===========================\n\n",
         .{},
     );
 
@@ -240,7 +240,10 @@ fn warmup(
         const cmd = device.beginCommandBufferUnretained();
         const enc = device.beginCompute(cmd);
         net.forwardInferFusedV3(
-            device, enc, input, flag_buf,
+            device,
+            enc,
+            input,
+            flag_buf,
         );
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndSpinOnFlag(cmd, flag_ptr);
@@ -252,7 +255,10 @@ fn warmup(
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
         net.forwardInferFusedBatched(
-            device, enc, input, BATCH_SIZE,
+            device,
+            enc,
+            input,
+            BATCH_SIZE,
         );
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndWait(cmd);
@@ -303,7 +309,11 @@ fn benchGpuBatched(
         const cmd = device.beginCommandBuffer();
         const enc = device.beginCompute(cmd);
         net.forwardInferFusedBatchedExt(
-            device, enc, input, mega_out, this_batch,
+            device,
+            enc,
+            input,
+            mega_out,
+            this_batch,
         );
         enc.msgSend(void, "endEncoding", .{});
         device.commitAndWait(cmd);
@@ -372,7 +382,10 @@ fn benchGpuSingle(
         const cmd = device.beginCommandBufferUnretained();
         const enc = device.beginCompute(cmd);
         net.forwardInferFusedV3(
-            device, enc, input, flag_buf,
+            device,
+            enc,
+            input,
+            flag_buf,
         );
         enc.msgSend(void, "endEncoding", .{});
         // Spin-wait on GPU completion flag instead of

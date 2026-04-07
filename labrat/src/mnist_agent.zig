@@ -1,15 +1,19 @@
-//! Bonsai research agent — optimises Bonsai 1.7B
-//! inference on Apple Silicon.
+//! MNIST training agent — thin profile on agent_core.
 //!
-//! Thin profile on agent_core.  Configures the generic
-//! agent loop for Bonsai inference optimisation.  All
-//! tool logic lives in the bonsai_researcher toolbox
-//! binary.
+//! Configures the generic agent loop for MNIST
+//! hyperparameter optimisation.  All tool logic lives
+//! in the mnist_researcher toolbox binary.
+//!
+//! This profile demonstrates extending the standard
+//! toolset with domain-specific tools.  The four
+//! config_* tools are MNIST-specific (implemented via
+//! custom_dispatch in mnist_researcher.zig); every other
+//! tool is provided by the generic toolbox.
 //!
 //! Usage:
 //!   export ANTHROPIC_API_KEY=sk-ant-...
 //!   zig build
-//!   ./zig-out/bin/bonsai_agent
+//!   ./zig-out/bin/mnist_agent
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -21,99 +25,154 @@ const api = core.api;
 // ============================================================
 
 const MAX_FILE_SIZE: usize = 2 * 1024 * 1024;
-const HISTORY_DIR: []const u8 = ".bonsai_history";
-
-/// Source files comprising the hot path.  Kept here so
-/// the context builder can include them in a future
-/// revision (Rule 8 — amortise upfront).
-const CODE_CONTEXT_FILES = [_][]const u8{
-    "nn/src/shaders/transformer.metal",
-    "nn/src/shaders/compute.metal",
-    "nn/src/transformer.zig",
-    "nn/src/metal.zig",
-    "nn/src/model.zig",
-};
+const HISTORY_DIR: []const u8 = ".mnist_history";
 
 // ============================================================
 // Tool definitions (comptime)
 //
-// Each ToolDef declares the LLM-facing schema and maps
-// to a CLI subcommand on the bonsai_researcher toolbox
-// binary.  toolMappings() and toolSchemas() derive the
-// dispatch table and JSON schemas at comptime.
+// Each ToolDef carries its own schema metadata.  The
+// agent_core helpers toolMappings() and toolSchemas()
+// derive the dispatch table and JSON at comptime.
+//
+// The first four tools (config_*) are MNIST-specific
+// — they manipulate hyperparameters in main.zig via
+// custom_dispatch in mnist_researcher.zig.  Everything
+// else is the standard generic toolset provided by
+// toolbox.zig.
 // ============================================================
 
-const bonsai_tools = [_]core.ToolDef{
-    // ---- Snapshot management ----
+const mnist_tools = [_]core.ToolDef{
+    // ============================================================
+    // Domain-specific tools (MNIST hyperparameter config)
+    //
+    // These are the extension point.  A new domain would
+    // replace these with its own domain-specific tools
+    // and wire them through custom_dispatch.
+    // ============================================================
     .{
-        .name = "snapshot",
-        .subcommand = "snapshot",
-        .description = "Save engine source files as " ++
-            "a restore point. Always call before " ++
-            "editing.",
+        .name = "config_show",
+        .subcommand = "config-show",
+        .description = "Show current hyperparameters " ++
+            "from main.zig. Returns JSON with " ++
+            "architecture, learning_rate, " ++
+            "optimizer, batch_size, epochs, seed.",
     },
     .{
-        .name = "snapshot_list",
-        .subcommand = "snapshot-list",
-        .description = "List all saved snapshots with timestamps.",
-    },
-    .{
-        .name = "rollback",
-        .subcommand = "rollback",
-        .description = "Restore engine files from " ++
-            "a specific snapshot.",
+        .name = "config_set",
+        .subcommand = "config-set",
+        .description = "Modify hyperparameters in " ++
+            "main.zig. Pass key=value pairs as " ++
+            "the settings array. Keys: lr " ++
+            "(float), batch (int, must divide " ++
+            "50000), epochs (int, max 30), seed " ++
+            "(int), optimizer (sgd or adam), " ++
+            "arch (layer spec like " ++
+            "784:256:relu,256:10:none), beta1 " ++
+            "(float), beta2 (float), epsilon " ++
+            "(float).",
         .properties = &.{.{
-            .name = "id",
-            .description = "Snapshot ID from " ++
-                "snapshot or snapshot_list",
+            .name = "settings",
+            .description = "Key=value pairs, " ++
+                "e.g. optimizer=adam, lr=0.001",
+            .type = .string_array,
+            .required = true,
         }},
+        .shape_override = .json_payload,
     },
     .{
-        .name = "rollback_latest",
-        .subcommand = "rollback-latest",
-        .description = "Restore from the most recent " ++
-            "snapshot. Use when check/test/bench " ++
-            "fails.",
+        .name = "config_backup",
+        .subcommand = "config-backup",
+        .description = "Backup main.zig before " ++
+            "making changes. Always call before " ++
+            "config_set so you can revert.",
     },
     .{
-        .name = "diff",
-        .subcommand = "diff",
-        .description = "Show source file changes " ++
-            "since a snapshot.",
+        .name = "config_restore",
+        .subcommand = "config-restore",
+        .description = "Restore main.zig from " ++
+            "backup. Use after an experiment " ++
+            "made things worse.",
+    },
+    // ============================================================
+    // Standard toolset (generic — provided by toolbox.zig)
+    // ============================================================
+
+    // ---- Git experiment management ----
+    .{
+        .name = "git_start",
+        .subcommand = "git-start",
+        .description = "Create a new experiment " ++
+            "branch from main. Call before making " ++
+            "any edits.",
         .properties = &.{.{
-            .name = "id",
-            .description = "Snapshot ID to diff against",
+            .name = "name",
+            .description = "Short experiment " ++
+                "description, e.g. " ++
+                "adam-lr-sweep",
         }},
+        .shape_override = .json_payload,
+    },
+    .{
+        .name = "git_diff",
+        .subcommand = "git-diff",
+        .description = "Show uncommitted changes " ++
+            "(git diff). Use to review edits " ++
+            "before committing.",
+    },
+    .{
+        .name = "git_finish",
+        .subcommand = "git-finish",
+        .description = "Merge the current " ++
+            "experiment branch into main. " ++
+            "Call after a successful experiment " ++
+            "is committed.",
+    },
+    .{
+        .name = "git_abandon",
+        .subcommand = "git-abandon",
+        .description = "Discard uncommitted " ++
+            "changes and switch back to main. " ++
+            "Call after a failed experiment.",
     },
     // ---- Build / test / bench ----
     .{
         .name = "check",
         .subcommand = "check",
         .description = "Compile-only validation " ++
-            "(~2s). Run after every edit. STOP if " ++
-            "this fails.",
+            "(~2s). Run after every edit. STOP " ++
+            "if this fails.",
     },
     .{
         .name = "test",
         .subcommand = "test",
         .description = "Run full test suite for " ++
-            "numerical correctness. STOP if this " ++
-            "fails.",
+            "numerical correctness. STOP if " ++
+            "this fails.",
     },
     .{
-        .name = "bench",
+        .name = "train",
         .subcommand = "bench",
-        .description = "Bonsai 1.7B inference " ++
-            "benchmark (~5s). Returns JSON with " ++
-            "decode_tok_per_sec, " ++
-            "prefill_tok_per_sec, and " ++
-            "decode_p99_us.",
+        .description = "Build and run MNIST " ++
+            "training benchmark (~10s). Returns " ++
+            "JSON with final_test_accuracy_pct, " ++
+            "throughput_images_per_sec, " ++
+            "total_training_ms, per-epoch " ++
+            "validation metrics, and test results.",
     },
     .{
         .name = "bench_compare",
         .subcommand = "bench-compare",
-        .description = "Compare all benchmark " ++
-            "results side by side.",
+        .description = "Compare all saved benchmark " ++
+            "runs side by side. Shows test " ++
+            "accuracy, throughput, optimizer, " ++
+            "learning rate, and architecture " ++
+            "for each past run.",
+    },
+    .{
+        .name = "bench_latest",
+        .subcommand = "bench-latest",
+        .description = "Output the most recent " ++
+            "benchmark result as JSON.",
     },
     .{
         .name = "history",
@@ -137,19 +196,20 @@ const bonsai_tools = [_]core.ToolDef{
     .{
         .name = "show",
         .subcommand = "show",
-        .description = "View an engine source file " ++
-            "as structured JSON with line numbers.",
+        .description = "View a source file as " ++
+            "structured JSON with line numbers.",
         .properties = &.{.{
             .name = "file",
             .description = "Source file path, " ++
-                "e.g. nn/src/metal.zig",
+                "e.g. nnmetal/src/network.zig",
         }},
     },
     .{
         .name = "show_function",
         .subcommand = "show-function",
         .description = "Extract a specific function " ++
-            "from a source file with line numbers.",
+            "from a source file with line " ++
+            "numbers.",
         .properties = &.{
             .{
                 .name = "file",
@@ -157,7 +217,8 @@ const bonsai_tools = [_]core.ToolDef{
             },
             .{
                 .name = "function_name",
-                .description = "Function name to extract",
+                .description = "Function name to " ++
+                    "extract",
             },
         },
     },
@@ -169,27 +230,28 @@ const bonsai_tools = [_]core.ToolDef{
             "directory.",
         .properties = &.{.{
             .name = "path",
-            .description = "File path relative to " ++
-                "project root, " ++
-                "e.g. nn/src/metal.zig",
+            .description = "File path relative " ++
+                "to project root, " ++
+                "e.g. nnmetal/examples/mnist.zig",
         }},
     },
     // ---- File mutation ----
     .{
         .name = "write_file",
         .subcommand = "write-file",
-        .description = "Replace entire contents of " ++
-            "an engine source file. Use edit_file " ++
-            "for small changes instead.",
+        .description = "Replace entire contents " ++
+            "of an engine source file. Use " ++
+            "edit_file for small changes instead.",
         .properties = &.{
             .{
                 .name = "path",
                 .description = "Engine file path, " ++
-                    "e.g. nn/src/metal.zig",
+                    "e.g. nnmetal/examples/mnist.zig",
             },
             .{
                 .name = "content",
-                .description = "Complete new file contents",
+                .description = "Complete new file " ++
+                    "contents",
             },
         },
     },
@@ -198,14 +260,14 @@ const bonsai_tools = [_]core.ToolDef{
         .subcommand = "edit-file",
         .description = "Targeted find-and-replace " ++
             "in an engine source file. More " ++
-            "efficient than write_file for small " ++
-            "edits. The old_content must match " ++
-            "exactly.",
+            "efficient than write_file for " ++
+            "small edits. The old_content must " ++
+            "match exactly.",
         .properties = &.{
             .{
                 .name = "path",
                 .description = "Engine file path, " ++
-                    "e.g. nn/src/metal.zig",
+                    "e.g. nnmetal/examples/mnist.zig",
             },
             .{
                 .name = "old_content",
@@ -223,19 +285,20 @@ const bonsai_tools = [_]core.ToolDef{
         .name = "list_directory",
         .subcommand = "list-dir",
         .description = "List files and " ++
-            "subdirectories in a project directory.",
+            "subdirectories in a project " ++
+            "directory.",
         .properties = &.{.{
             .name = "path",
-            .description = "Directory path relative " ++
-                "to project root, e.g. nn/src/ " ++
-                "or nn/src/shaders",
+            .description = "Directory path " ++
+                "relative to project root, " ++
+                "e.g. nnmetal/src/ or nnmetal/examples",
         }},
     },
     .{
         .name = "cwd",
         .subcommand = "cwd",
-        .description = "Return the absolute path of " ++
-            "the working directory used by " ++
+        .description = "Return the absolute path " ++
+            "of the working directory used by " ++
             "run_command and list_directory. " ++
             "Useful for orienting yourself in " ++
             "the filesystem.",
@@ -243,13 +306,13 @@ const bonsai_tools = [_]core.ToolDef{
     .{
         .name = "run_command",
         .subcommand = "run-cmd",
-        .description = "Execute a shell command in " ++
-            "the project root directory via " ++
-            "/bin/sh. 120s timeout. Use for grep, " ++
-            "wc, head, tail, find, cat, etc. Do " ++
-            "NOT run long-lived processes. A " ++
-            "non-zero exit code does NOT mean " ++
-            "the tool failed.",
+        .description = "Execute a shell command " ++
+            "in the project root directory via " ++
+            "/bin/sh. 120s timeout. Use for " ++
+            "grep, wc, head, tail, find, cat, " ++
+            "etc. Do NOT run long-lived " ++
+            "processes. A non-zero exit code " ++
+            "does NOT mean the tool failed.",
         .properties = &.{.{
             .name = "command",
             .description = "Shell command to " ++
@@ -263,11 +326,11 @@ const bonsai_tools = [_]core.ToolDef{
         .name = "commit",
         .subcommand = "commit",
         .description = "Git commit all current " ++
-            "changes. Call after a successful KEEP " ++
-            "decision to preserve the optimization." ++
-            " The message should summarize what " ++
-            "was optimized and the throughput " ++
-            "improvement.",
+            "changes. Call after a successful " ++
+            "KEEP decision to preserve the " ++
+            "optimization. The message should " ++
+            "summarize what was optimized and " ++
+            "the result.",
         .properties = &.{.{
             .name = "message",
             .description = "Commit message " ++
@@ -281,15 +344,14 @@ const bonsai_tools = [_]core.ToolDef{
         .description = "Record a concise summary " ++
             "of what was tried and why it " ++
             "succeeded or failed. Call after " ++
-            "every rollback or KEEP. Summaries " ++
+            "every experiment. Summaries " ++
             "are injected into every future " ++
             "experiment.",
         .properties = &.{.{
             .name = "summary",
-            .description = "Concise summary: what " ++
-                "was tried, the throughput " ++
-                "result, and why it succeeded " ++
-                "or failed.",
+            .description = "Concise summary: " ++
+                "what was tried, the result, " ++
+                "and why it succeeded or failed.",
         }},
         .shape_override = .json_payload,
     },
@@ -300,20 +362,19 @@ const bonsai_tools = [_]core.ToolDef{
 // ============================================================
 
 const config = core.AgentConfig{
-    .name = "bonsai",
-    .toolbox_path = "./zig-out/bin/bonsai_researcher",
+    .name = "mnist",
+    .toolbox_path = "./zig-out/bin/mnist_researcher",
     .history_dir = HISTORY_DIR,
-    .system_prompt_path = "programs/bonsai_system.md",
-    .tool_schemas = core.toolSchemas(&bonsai_tools),
-    .tool_map = core.toolMappings(&bonsai_tools),
-    .persist_tools = &.{"bench"},
+    .system_prompt_path = "programs/mnist_system.md",
+    .tool_schemas = core.toolSchemas(&mnist_tools),
+    .tool_map = core.toolMappings(&mnist_tools),
+    .persist_tools = &.{"train"},
     .history_fields = &.{
-        .{ .json_key = "decode_tok_per_sec", .label = "tok/s" },
-        .{ .json_key = "prefill_tok_per_sec", .label = "prefill" },
-        .{ .json_key = "decode_p99_us", .label = "p99_us" },
+        .{ .json_key = "throughput_images_per_sec", .label = "throughput" },
+        .{ .json_key = "final_test_accuracy_pct", .label = "acc%" },
+        .{ .json_key = "total_training_ms", .label = "time_ms" },
     },
-    .max_turns_per_experiment = 50,
-    .build_context_fn = &buildBonsaiContext,
+    .build_context_fn = &buildMnistContext,
 };
 
 // ============================================================
@@ -329,8 +390,8 @@ pub fn main() void {
         api.log(
             "Hint: if the agent edited source files " ++
                 "before crashing, run:\n" ++
-                "  ./zig-out/bin/bonsai_researcher " ++
-                "rollback-latest\n",
+                "  git reset --hard HEAD && " ++
+                "git checkout main\n",
             .{},
         );
         std.process.exit(1);
@@ -347,7 +408,7 @@ pub fn main() void {
 //   4. Agent-written summaries from prior runs.
 // ============================================================
 
-fn buildBonsaiContext(
+fn buildMnistContext(
     arena: Allocator,
     cfg: *const core.AgentConfig,
 ) []const u8 {
@@ -382,10 +443,11 @@ fn buildBonsaiContext(
 
     const suffix =
         "\n\n## Begin\n\n" ++
-        "Optimise engine throughput. " ++
-        "Start by calling snapshot to create a " ++
-        "restore point, then read the source " ++
-        "code to understand the baseline.";
+        "Optimise MNIST test accuracy and " ++
+        "throughput. Start by calling " ++
+        "git_start to create an experiment " ++
+        "branch, then config_show to see the " ++
+        "current configuration.";
 
     return std.fmt.allocPrint(
         arena,
@@ -399,7 +461,7 @@ fn buildBonsaiContext(
             summaries,
             suffix,
         },
-    ) catch "Begin optimising.";
+    ) catch "Begin optimizing.";
 }
 
 // ============================================================

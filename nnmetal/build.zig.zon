@@ -1,7 +1,7 @@
 .{
-    .name = .nn,
+    .name = .nnmetal,
     .version = "0.0.0",
-    .fingerprint = 0x10ad1889b318114e,
+    .fingerprint = 0x725b85383738e695,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .zig_objc = .{

@@ -61,7 +61,7 @@ pub fn main() !void {
     const cli = parseArgs();
 
     std.debug.print(
-        "\n\x1b[1m[nnzap] Bonsai 1.7B\x1b[0m\n" ++
+        "\n\x1b[1m[nnmetal] Bonsai 1.7B\x1b[0m\n" ++
             "model:       {s}\n" ++
             "prompt:      \"{s}\"\n" ++
             "max_tokens:  {d}\n" ++

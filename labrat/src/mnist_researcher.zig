@@ -22,8 +22,8 @@ const toolbox = @import("toolbox.zig");
 const MAX_LAYERS: u32 = 16;
 const MAX_ARGS: u32 = 64;
 
-const MAIN_PATH = "nn/examples/mnist.zig";
-const BACKUP_PATH = "nn/examples/mnist.zig.bak";
+const MAIN_PATH = "nnmetal/examples/mnist.zig";
+const BACKUP_PATH = "nnmetal/examples/mnist.zig.bak";
 
 // ============================================================
 // Config types — MNIST-specific
@@ -66,22 +66,18 @@ const ConfigChanges = struct {
 
 const config = toolbox.ToolboxConfig{
     .name = "mnist",
-    .project_root = "../nn",
+    .project_root = "../nnmetal",
     .write_scope = &.{
-        "nn/examples/mnist.zig",
+        "nnmetal/examples/",
     },
     .read_scope = &.{
-        "nn/src/",
-        "nn/examples/",
+        "nnmetal/",
         "benchmarks/",
         ".mnist_history/",
     },
     .read_files = &.{
-        "nn/build.zig",
-        "nn/build.zig.zon",
-    },
-    .engine_files = &.{
-        "nn/examples/mnist.zig",
+        "nnmetal/build.zig",
+        "nnmetal/build.zig.zon",
     },
     .check_command = &.{ "zig", "build" },
     .test_command = &.{ "zig", "build", "test" },
@@ -90,7 +86,6 @@ const config = toolbox.ToolboxConfig{
     .bench_dir = "benchmarks",
     .bench_prefixes = &.{ "mnist_", "inference_" },
     .history_dir = ".mnist_history",
-    .snapshot_dir = ".mnist_snapshots",
     .custom_dispatch = &mnistDispatch,
 };
 
@@ -793,7 +788,7 @@ fn buildLayoutBlock(
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(
         arena,
-        "const MnistLayout = nnzap.NetworkLayout(&.{",
+        "const MnistLayout = nn.NetworkLayout(&.{",
     );
 
     var layer_iter = std.mem.splitScalar(

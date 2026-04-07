@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""MLX inference benchmark for Bonsai 1.7B — nnzap comparison.
+"""MLX inference benchmark for Bonsai 1.7B — nnmetal comparison.
 
-Mirrors nnzap's nn/examples/bonsai_bench.zig — three phases:
+Mirrors nnmetal's examples/bonsai_bench.zig — three phases:
 
   1. Load the model and tokenizer from a local safetensors directory.
   2. Prefill the prompt (chunked by MLX internally).
@@ -344,7 +344,7 @@ def compare_benchmarks(
     mlx_results: dict,
     file_paths: list[str],
 ) -> None:
-    """Print a side-by-side comparison table against nnzap results."""
+    """Print a side-by-side comparison table against nnmetal results."""
     benchmarks = {"mlx": mlx_results}
 
     for path in sorted(file_paths):
@@ -358,7 +358,7 @@ def compare_benchmarks(
             )
             continue
 
-        framework = data.get("framework", "nnzap")
+        framework = data.get("framework", "nnmetal")
         if framework in benchmarks:
             framework = f"{framework} ({Path(path).name})"
         benchmarks[framework] = data
@@ -415,7 +415,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "MLX Bonsai 1.7B inference benchmark — "
-            "mirrors nnzap's bonsai_bench.zig"
+            "mirrors nnmetal's bonsai_bench.zig"
         ),
     )
     parser.add_argument(

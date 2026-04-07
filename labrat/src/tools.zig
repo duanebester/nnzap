@@ -1,4 +1,4 @@
-//! nnzap tools — shared utilities for AI agent toolboxes.
+//! labrat tools — shared utilities for AI agent toolboxes.
 //!
 //! Common infrastructure used by `bonsai_researcher.zig`
 //! and `mnist_researcher.zig`: benchmark JSON types, file
@@ -319,13 +319,10 @@ pub fn writeIndented(
 // ============================================================
 
 /// Convert a monorepo-root-relative path to a filesystem
-/// path relative to the current working directory.
-/// `root` is the prefix to prepend (e.g. ".." when running
-/// from a subdirectory of the monorepo).
-///
-/// Paths already local to zap/ (src/, programs/, build.zig,
-/// build.zig.zon) pass through unchanged.  Everything else
-/// gets a "{root}/" prefix to reach the monorepo root.
+/// path by prepending the fs_root prefix.  All config
+/// paths (read_scope, write_scope, read_files, bench_dir,
+/// history_dir, etc.) are monorepo-relative.  This
+/// function makes them resolvable from CWD.
 pub fn resolveToFs(
     arena: Allocator,
     root: []const u8,
@@ -333,15 +330,6 @@ pub fn resolveToFs(
 ) ![]const u8 {
     std.debug.assert(path.len > 0);
     std.debug.assert(root.len > 0);
-
-    // Paths local to zap/ need no prefix.
-    if (startsWith(path, "src/") or
-        startsWith(path, "programs/") or
-        eql(path, "build.zig") or
-        eql(path, "build.zig.zon"))
-    {
-        return path;
-    }
 
     return try std.fmt.allocPrint(
         arena,

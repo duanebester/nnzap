@@ -5,7 +5,7 @@ We are using `claude-opus-4-6`!
 ## Project Map
 
 ```
-nn/
+nnmetal/
 ├── build.zig                    152 lines   Build config
 ├── build.zig.zon                             Package manifest
 ├── examples/
@@ -35,7 +35,7 @@ nn/
                               ──────
                               27,161 lines total
 
-zap/
+labrat/
 ├── build.zig                                 Build config
 ├── build.zig.zon                             Package manifest
 ├── src/
@@ -54,7 +54,7 @@ zap/
 └── data/mnist/                               MNIST raw dataset
 ```
 
-Heavy hitters: `transformer.zig`, `network.zig`, `compute.metal` (~14k lines, half the nn codebase).
+Heavy hitters: `transformer.zig`, `network.zig`, `compute.metal` (~14k lines, half the nnmetal codebase).
 Comptime spine: `layout.zig` resolves all buffer shapes at compile time.
 Three shader files: `compute.metal` (general NN kernels), `transformer.metal` (attention-specific), `qmv_specialized.metal` (quantized matmul).
 Agent spine: `agent_core.zig` provides the shared experiment loop; profiles (`mnist_agent.zig`, `bonsai_agent.zig`) configure it.
@@ -66,7 +66,7 @@ Simplicity is not a free pass or a first attempt — it is the hardest revision.
 
 > "Simplicity and elegance are unpopular because they require hard work and discipline to achieve." — Edsger Dijkstra
 
-It's easy to say "let's do something simple", but to do that in practice takes thought, multiple passes, many sketches, and still we may have to throw one away. For nnzap, this means: don't settle on the first kernel dispatch strategy or buffer layout that works. Sketch alternatives. The elegant design will be the one where the Metal buffer layout, the comptime network description, and the kernel dispatch strategy all reinforce each other.
+It's easy to say "let's do something simple", but to do that in practice takes thought, multiple passes, many sketches, and still we may have to throw one away. For nnmetal, this means: don't settle on the first kernel dispatch strategy or buffer layout that works. Sketch alternatives. The elegant design will be the one where the Metal buffer layout, the comptime network description, and the kernel dispatch strategy all reinforce each other.
 
 ### 1. **Zero Technical Debt Policy**
 
@@ -81,11 +81,11 @@ This is huge for a GPU compute library:
 - Use fixed-capacity arrays/pools instead of growing `ArrayList`s during training
 - Use comptime-known sizes from `NetworkLayout` to determine buffer capacities at compile time
 
-For nnzap, this means: parameter buffers, gradient buffers, and activation buffers should have fixed upper bounds allocated at init time. This eliminates allocation jitter during forward/backward passes and prevents GPU stalls caused by buffer reallocation.
+For nnmetal, this means: parameter buffers, gradient buffers, and activation buffers should have fixed upper bounds allocated at init time. This eliminates allocation jitter during forward/backward passes and prevents GPU stalls caused by buffer reallocation.
 
 ### 3. **Assertion Density**
 
-**Minimum 2 assertions per function**. For nnzap:
+**Minimum 2 assertions per function**. For nnmetal:
 
 - Assert buffer sizes match comptime-known layout dimensions before kernel dispatch
 - Assert matrix dimensions are compatible before matmul (`W` is `[M x K]`, `x` is `[K x N]`)
@@ -128,7 +128,7 @@ Hard limit. Split large compute dispatch or training loop functions by:
 - Avoid `async`/suspend patterns that hide control flow — Metal command buffers already handle asynchrony explicitly
 - **Split compound conditions**: split complex `else if` chains into nested `else { if {} }` trees to make branches and cases explicit. Consider whether a single `if` also needs a matching `else` branch to ensure positive and negative spaces are handled or asserted
 - **Functions must run to completion** without suspending, so that precondition assertions remain true throughout the lifetime of the function
-- **Don't do things directly in reaction to external events.** Your program should run at its own pace — not react to external signals or callbacks synchronously. This keeps control flow under your control, improves performance through batching instead of context switching on every event, and makes it easier to maintain bounds on work done per time period. For nnzap, this means the training loop drives the tempo: it pulls batches and dispatches kernels on its schedule, not in reaction to Metal completion handlers or data-loading callbacks
+- **Don't do things directly in reaction to external events.** Your program should run at its own pace — not react to external signals or callbacks synchronously. This keeps control flow under your control, improves performance through batching instead of context switching on every event, and makes it easier to maintain bounds on work done per time period. For nnmetal, this means the training loop drives the tempo: it pulls batches and dispatches kernels on its schedule, not in reaction to Metal completion handlers or data-loading callbacks
 
 ### 7. **Back-of-Envelope Performance Sketches**
 
@@ -207,7 +207,7 @@ Prefer the positive form.
 
 ### 12. **Minimal Dependencies**
 
-nnzap depends on:
+nnmetal depends on:
 
 - **zig-objc** — Objective-C runtime bindings for Metal API calls (necessary; Metal has no C API)
 - **Apple Metal framework** — the GPU compute backend (the whole point)
@@ -230,7 +230,7 @@ This avoids stack growth and copy-move allocations. In-place initializations are
 
 ### 14. **Comptime All the Things**
 
-nnzap's `NetworkLayout` resolves all buffer sizes, weight/bias offsets, and activation sizes at compile time. Lean into this:
+nnmetal's `NetworkLayout` resolves all buffer sizes, weight/bias offsets, and activation sizes at compile time. Lean into this:
 
 - **Never compute at runtime what can be computed at comptime**. Layer dimensions, parameter counts, and buffer offsets are all known statically
 - **Use comptime assertions** to validate network architecture (e.g., layer `i`'s output must match layer `i+1`'s input)
@@ -329,7 +329,7 @@ Appreciate **all compiler warnings at the compiler's strictest setting** from da
 
 ### 25. **Tooling**
 
-Our primary tool is Zig. It may not be the best for everything, but it's good enough for most things. When you need a script, write it in `zap/src/*.zig` instead of as a shell script — this makes scripts cross-platform, type-safe, and increases the probability they'll work for everyone on the team. Standardizing on Zig for tooling reduces dimensionality as the team and range of personal tastes grows.
+Our primary tool is Zig. It may not be the best for everything, but it's good enough for most things. When you need a script, write it in `labrat/src/*.zig` instead of as a shell script — this makes scripts cross-platform, type-safe, and increases the probability they'll work for everyone on the team. Standardizing on Zig for tooling reduces dimensionality as the team and range of personal tastes grows.
 
 > "The right tool for the job is often the tool you are already using — adding new tools has a higher cost than many people appreciate." — John Carmack
 

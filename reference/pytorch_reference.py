@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""PyTorch reference implementation for nnzap MNIST benchmark.
+"""PyTorch reference implementation for nnmetal MNIST benchmark.
 
 Architecture: 784 → 128 (ReLU) → 64 (ReLU) → 10 (none / raw logits)
 Loss:         softmax + cross-entropy (PyTorch fuses these)
 Optimiser:    mini-batch SGD (no momentum, no weight decay)
 
-Hyperparameters and dataset split match nn/examples/mnist.zig exactly:
+Hyperparameters and dataset split match examples/mnist.zig exactly:
   - seed:          42
   - batch_size:    64
   - learning_rate: 0.2
@@ -15,7 +15,7 @@ Hyperparameters and dataset split match nn/examples/mnist.zig exactly:
   - val split:     10,000 (last 10k of shuffled 60k)
   - test split:    10,000
 
-Weight init matches nnzap's heInit():
+Weight init matches nnmetal's heInit():
   w ~ U(-limit, limit),  limit = sqrt(6 / fan_in)
   b = 0
 
@@ -25,7 +25,7 @@ Usage:
   # With a specific data directory:
   python scripts/pytorch_reference.py --data-dir ./data/mnist_torch
 
-  # Compare against a specific nnzap benchmark:
+  # Compare against a specific nnmetal benchmark:
   python scripts/pytorch_reference.py --compare benchmarks/mnist_*.json
 
 Requires: torch, torchvision
@@ -55,7 +55,7 @@ from torchvision import datasets, transforms
 class MnistNet(nn.Module):
     """784 → 128 (ReLU) → 64 (ReLU) → 10 (raw logits).
 
-    Matches nnzap's NetworkLayout exactly. The last layer
+    Matches nnmetal's NetworkLayout exactly. The last layer
     has no activation — softmax is fused into the loss.
     """
 
@@ -78,7 +78,7 @@ class MnistNet(nn.Module):
 # ── Initialisation ────────────────────────────────────────────
 
 def he_init(model: MnistNet) -> None:
-    """He uniform init matching nnzap's heInit().
+    """He uniform init matching nnmetal's heInit().
 
     For each linear layer:
       weights ~ U(-limit, limit),  limit = sqrt(6 / fan_in)
@@ -86,7 +86,7 @@ def he_init(model: MnistNet) -> None:
 
     This is equivalent to Kaiming uniform with gain=sqrt(3),
     which differs from PyTorch's default (gain adjusted for
-    leaky_relu slope).  We set it manually to match nnzap.
+    leaky_relu slope).  We set it manually to match nnmetal.
     """
     for module in model.modules():
         if isinstance(module, nn.Linear):
@@ -106,7 +106,7 @@ def load_datasets(
 ) -> tuple[Subset, Subset, datasets.MNIST]:
     """Load MNIST and split into train/val/test.
 
-    Mirrors nnzap's split strategy:
+    Mirrors nnmetal's split strategy:
       1. Shuffle all 60k training indices with a fixed seed.
       2. First 50k → training set (reshuffled each epoch).
       3. Last 10k  → validation set (fixed).
@@ -134,7 +134,7 @@ def load_datasets(
     )
 
     # Deterministic shuffle of all 60k indices, then freeze
-    # the partition (same strategy as nnzap).
+    # the partition (same strategy as nnmetal).
     generator = torch.Generator().manual_seed(seed)
     all_indices = torch.randperm(
         len(full_train), generator=generator,
@@ -163,7 +163,7 @@ def evaluate(
 ) -> dict:
     """Evaluate accuracy and mean CE loss over a dataset.
 
-    Matches nnzap's evaluate(): iterates in batches, sums
+    Matches nnmetal's evaluate(): iterates in batches, sums
     per-sample CE loss, counts argmax-correct predictions,
     then computes mean loss and accuracy percentage.
     """
@@ -187,7 +187,7 @@ def evaluate(
         logits = model(images)
 
         # Per-sample CE loss (sum, not mean — we average
-        # manually to match nnzap's accumulation).
+        # manually to match nnmetal's accumulation).
         loss = F.cross_entropy(
             logits, labels, reduction="sum",
         )
@@ -218,7 +218,7 @@ def train_epoch(
 ) -> float:
     """Train for one epoch, return last-batch loss.
 
-    nnzap reports train_loss as the loss of the final batch
+    nnmetal reports train_loss as the loss of the final batch
     in each epoch (not the epoch average).  We match that
     here for apples-to-apples comparison.
     """
@@ -244,49 +244,49 @@ def train_epoch(
 
 # ── Comparison helper ─────────────────────────────────────────
 
-def compare_with_nnzap(
+def compare_with_nnmetal(
     pytorch_results: dict,
-    nnzap_path: str,
+    nnmetal_path: str,
 ) -> None:
-    """Print side-by-side comparison with an nnzap benchmark."""
-    with open(nnzap_path) as f:
-        nnzap = json.load(f)
+    """Print side-by-side comparison with an nnmetal benchmark."""
+    with open(nnmetal_path) as f:
+        nnmetal = json.load(f)
 
     sep = "-" * 54
-    print(f"\n{'Comparison with nnzap':^54}")
+    print(f"\n{'Comparison with nnmetal':^54}")
     print(sep)
-    print(f"{'Metric':<30} {'nnzap':>10} {'PyTorch':>10}")
+    print(f"{'Metric':<30} {'nnmetal':>10} {'PyTorch':>10}")
     print(sep)
 
-    nz_val_acc = nnzap["final_validation_accuracy_pct"]
+    nz_val_acc = nnmetal["final_validation_accuracy_pct"]
     pt_val_acc = pytorch_results["final_validation_accuracy_pct"]
     print(
         f"{'Final val accuracy (%)':<30} "
         f"{nz_val_acc:>10.2f} {pt_val_acc:>10.2f}"
     )
 
-    nz_val_loss = nnzap["final_validation_loss"]
+    nz_val_loss = nnmetal["final_validation_loss"]
     pt_val_loss = pytorch_results["final_validation_loss"]
     print(
         f"{'Final val loss':<30} "
         f"{nz_val_loss:>10.4f} {pt_val_loss:>10.4f}"
     )
 
-    nz_test_acc = nnzap["final_test_accuracy_pct"]
+    nz_test_acc = nnmetal["final_test_accuracy_pct"]
     pt_test_acc = pytorch_results["final_test_accuracy_pct"]
     print(
         f"{'Test accuracy (%)':<30} "
         f"{nz_test_acc:>10.2f} {pt_test_acc:>10.2f}"
     )
 
-    nz_time = nnzap["total_training_ms"]
+    nz_time = nnmetal["total_training_ms"]
     pt_time = pytorch_results["total_training_ms"]
     print(
         f"{'Training time (ms)':<30} "
         f"{nz_time:>10.0f} {pt_time:>10.0f}"
     )
 
-    nz_tput = nnzap["throughput_images_per_sec"]
+    nz_tput = nnmetal["throughput_images_per_sec"]
     pt_tput = pytorch_results["throughput_images_per_sec"]
     print(
         f"{'Throughput (img/s)':<30} "
@@ -299,12 +299,12 @@ def compare_with_nnzap(
     print(f"\n{'Per-epoch validation accuracy':^54}")
     print(sep)
     print(
-        f"{'Epoch':<8} {'nnzap acc':>10} {'PT acc':>10}"
-        f" {'nnzap ms':>10} {'PT ms':>10}"
+        f"{'Epoch':<8} {'nnmetal acc':>10} {'PT acc':>10}"
+        f" {'nnmetal ms':>10} {'PT ms':>10}"
     )
     print(sep)
 
-    nz_epochs = nnzap["epochs"]
+    nz_epochs = nnmetal["epochs"]
     pt_epochs = pytorch_results["epochs"]
 
     for nz_ep, pt_ep in zip(nz_epochs, pt_epochs):
@@ -323,7 +323,7 @@ def compare_with_nnzap(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="PyTorch reference for nnzap MNIST benchmark",
+        description="PyTorch reference for nnmetal MNIST benchmark",
     )
     parser.add_argument(
         "--data-dir",
@@ -333,7 +333,7 @@ def main() -> None:
     parser.add_argument(
         "--compare",
         default=None,
-        help="Path to nnzap benchmark JSON for comparison",
+        help="Path to nnmetal benchmark JSON for comparison",
     )
     parser.add_argument(
         "--save",
@@ -347,7 +347,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # ── Hyperparameters (match nnzap exactly) ──
+    # ── Hyperparameters (match nnmetal exactly) ──
 
     seed = 42
     num_epochs = 20
@@ -357,7 +357,7 @@ def main() -> None:
     val_count = 10_000
     train_count = total_train - val_count  # 50,000
     test_count = 10_000
-    val_interval = 5  # Validate every N epochs (matches nnzap).
+    val_interval = 5  # Validate every N epochs (matches nnmetal).
 
     # ── Device ──
 
@@ -427,7 +427,7 @@ def main() -> None:
     print()
 
     # ── Optimizer ──
-    # Plain SGD: no momentum, no weight decay — matches nnzap.
+    # Plain SGD: no momentum, no weight decay — matches nnmetal.
 
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -472,7 +472,7 @@ def main() -> None:
         )
 
         # Validate every val_interval epochs and on the
-        # last epoch — matches nnzap's val_interval logic.
+        # last epoch — matches nnmetal's val_interval logic.
         is_val_epoch = (
             epoch % val_interval == 0 or epoch == num_epochs
         )
@@ -634,21 +634,21 @@ def main() -> None:
                 file=sys.stderr,
             )
         else:
-            # Use the most recent nnzap benchmark.
-            nnzap_path = sorted(paths)[-1]
-            print(f"Comparing with: {nnzap_path}")
-            compare_with_nnzap(results, nnzap_path)
+            # Use the most recent nnmetal benchmark.
+            nnmetal_path = sorted(paths)[-1]
+            print(f"Comparing with: {nnmetal_path}")
+            compare_with_nnmetal(results, nnmetal_path)
     else:
-        # Auto-detect nnzap benchmarks for comparison.
+        # Auto-detect nnmetal benchmarks for comparison.
         import glob
 
-        nnzap_files = sorted(
+        nnmetal_files = sorted(
             glob.glob("benchmarks/mnist_*.json"),
         )
-        if nnzap_files:
-            nnzap_path = nnzap_files[-1]
-            print(f"Auto-comparing with: {nnzap_path}")
-            compare_with_nnzap(results, nnzap_path)
+        if nnmetal_files:
+            nnmetal_path = nnmetal_files[-1]
+            print(f"Auto-comparing with: {nnmetal_path}")
+            compare_with_nnmetal(results, nnmetal_path)
 
 
 if __name__ == "__main__":

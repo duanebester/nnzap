@@ -1,12 +1,12 @@
-# ⚡ nnzap
+# ⚡ nnmetal + labrat
 
 Give an AI agent a real 1.7B inference engine and let it optimise
 Metal kernels autonomously overnight.
 
-nnzap is a GPU-accelerated neural network library + autonomous
+nnmetal is a GPU-accelerated neural network library + autonomous
 experiment runner for Apple Silicon, written in Zig. The neural
-network library (`nn/`) exploits unified memory for zero-copy
-GPU compute. The experiment runner (`zap/`) wraps it in an LLM
+network library (`nnmetal/`) exploits unified memory for zero-copy
+GPU compute. The experiment runner (`labrat/`) wraps it in an LLM
 agent loop that reads code, edits shaders, benchmarks, and
 iterates — no human in the loop.
 
@@ -58,8 +58,8 @@ Each experiment follows a strict protocol:
 ### 1. Build
 
 ```bash
-cd nn && zig build
-cd ../zap && zig build
+cd nnmetal && zig build
+cd ../labrat && zig build
 ```
 
 ### 2. Run baseline benchmark
@@ -123,7 +123,7 @@ barrier-to-barrier segment so there's little to overlap.
 
 ## Quick start: MNIST training
 
-nnzap also trains small networks from scratch. This is the
+nnmetal also trains small networks from scratch. This is the
 pedagogical path — useful for understanding the library before
 diving into transformer inference.
 
@@ -148,12 +148,12 @@ python3 -c "from torchvision.datasets import MNIST; MNIST('data/mnist_torch', do
 ### 2. Train
 
 ```bash
-cd nn && zig build run
+cd nnmetal && zig build run
 ```
 
 ```
 +-----------------------------------+
-|       nn Network Layout           |
+|       nnmetal Network Layout      |
 +-----------------------------------+
 |  Layer 0:  784 -> 128   (relu    ) |
 |  Layer 1:  128 -> 64    (relu    ) |
@@ -172,7 +172,7 @@ Epoch 20/20 | loss 0.0274 | val acc 97.85% | 259 ms
 ### 3. Run tests
 
 ```bash
-cd nn && zig build test
+cd nnmetal && zig build test
 ```
 
 ### 4. MNIST autoresearch (optional)
@@ -181,7 +181,7 @@ The MNIST agent optimises hyperparameters (learning rate,
 architecture, optimizer, batch size) rather than kernel code:
 
 ```bash
-cd zap && zig build
+cd labrat && zig build
 export ANTHROPIC_API_KEY=sk-ant-...
 ./zig-out/bin/mnist_agent
 ```
@@ -190,7 +190,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 On Apple Silicon, CPU and GPU share the same physical memory.
 Most ML frameworks still copy buffers around as if they're
-talking to a discrete GPU over PCIe. nnzap exploits unified
+talking to a discrete GPU over PCIe. nnmetal exploits unified
 memory directly — the `[]f32` slice your Zig code writes to
 _is_ the GPU buffer.
 
@@ -229,7 +229,7 @@ shared buffer IS the Zig slice.
 
 ## Autoresearch framework
 
-Zap is built around two generic engines and thin domain configs:
+Labrat is built around two generic engines and thin domain configs:
 
 ```
                    ┌───────────────────┐
@@ -276,8 +276,8 @@ copy-pasting thousands of lines of tool logic.
 ## Project structure
 
 ```
-nnzap/
-├── nn/                              # Neural network library
+nnmetal + labrat/
+├── nnmetal/                         # Neural network library
 │   ├── src/
 │   │   ├── metal.zig                # Metal compute backend
 │   │   ├── layout.zig               # Comptime network layout
@@ -296,7 +296,7 @@ nnzap/
 │       ├── mnist.zig                # MNIST training
 │       ├── bonsai.zig               # Bonsai inference
 │       └── bonsai_bench.zig         # Bonsai benchmarking
-├── zap/                             # Autonomous experiment runner
+├── labrat/                          # Autonomous experiment runner
 │   ├── src/
 │   │   ├── agent_core.zig           # Generic agent framework
 │   │   ├── toolbox.zig              # Generic toolbox (23 tools)
