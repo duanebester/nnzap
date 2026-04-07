@@ -34,6 +34,46 @@ const CODE_CONTEXT_FILES = [_][]const u8{
     "nnmetal/src/model.zig",
 };
 
+/// Critical hot-path functions to include verbatim
+/// in the initial context.  Each entry specifies a
+/// file, a label, and a line range.  These are the
+/// per-layer dispatch functions where all optimization
+/// decisions live — including them eliminates 15+
+/// turns of sed commands the agent would otherwise
+/// spend re-reading the same code every experiment.
+const HotPathSnippet = struct {
+    file: []const u8,
+    label: []const u8,
+    start_line: u32,
+    end_line: u32,
+};
+
+const HOT_PATH_SNIPPETS = [_]HotPathSnippet{
+    .{
+        .file = "nnmetal/src/transformer.zig",
+        .label = "encodeAttentionProjections " ++
+            "— RMSNorm, Q/K/V QMV, norms, " ++
+            "RoPE, KV cache",
+        .start_line = 1947,
+        .end_line = 2041,
+    },
+    .{
+        .file = "nnmetal/src/transformer.zig",
+        .label = "encodeAttentionGather " ++
+            "— GQA attention, O-proj + resadd",
+        .start_line = 2089,
+        .end_line = 2156,
+    },
+    .{
+        .file = "nnmetal/src/transformer.zig",
+        .label = "encodeMLPHalf " ++
+            "— RMSNorm, gate/up QMV, SiLU, " ++
+            "down-proj + resadd",
+        .start_line = 2161,
+        .end_line = 2280,
+    },
+};
+
 // ============================================================
 // Tool definitions (comptime)
 //
@@ -324,6 +364,7 @@ fn buildBonsaiContext(
     );
     const has_history = history.len > 0;
     const outline = buildHotPathOutline(arena);
+    const hot_code = buildHotPathCode(arena);
     const last_bench = loadLastBench(arena);
 
     const rules_section =
@@ -348,16 +389,16 @@ fn buildBonsaiContext(
     const suffix =
         "\n\n## Begin\n\n" ++
         "Optimise engine throughput. " ++
-        "Start by calling experiment_start " ++
-        "to create an experiment branch. The " ++
-        "hot-path map above shows function " ++
-        "names and line numbers — use " ++
-        "run_command with sed/grep to read " ++
-        "specific sections.";
+        "Call experiment_start with your " ++
+        "hypothesis, then edit. The " ++
+        "hot-path dispatch code above is " ++
+        "the full per-layer pipeline — " ++
+        "you should NOT need to re-read " ++
+        "these functions.";
 
     return std.fmt.allocPrint(
         arena,
-        "{s}\n{s}{s}\n\n{s}{s}{s}{s}{s}",
+        "{s}\n{s}{s}\n\n{s}{s}{s}{s}{s}{s}",
         .{
             orientation,
             rules_section,
@@ -365,6 +406,7 @@ fn buildBonsaiContext(
             hist_section,
             if (has_history) history else "",
             outline,
+            hot_code,
             last_bench,
             suffix,
         },
@@ -408,6 +450,89 @@ fn buildHotPathOutline(arena: Allocator) []const u8 {
     }
 
     return buf.items;
+}
+
+// ============================================================
+// Hot-path code snippets
+//
+// Includes the critical per-layer dispatch functions
+// verbatim so the agent can edit without reading them
+// first.  These ~280 lines eliminate 15+ turns of sed.
+// ============================================================
+
+fn buildHotPathCode(arena: Allocator) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(
+        arena,
+        "\n## Hot-path dispatch code (verbatim)\n\n" ++
+            "The 3 functions below are the " ++
+            "per-layer decode dispatch pipeline. " ++
+            "Every kernel dispatch decision " ++
+            "(fusion, barriers, grid sizes, " ++
+            "pipeline selection) lives here. " ++
+            "You do NOT need to re-read these " ++
+            "with sed — they are current as of " ++
+            "this context.\n\n",
+    ) catch return "";
+
+    for (&HOT_PATH_SNIPPETS) |*snip| {
+        appendCodeSnippet(arena, &buf, snip);
+    }
+
+    return buf.items;
+}
+
+/// Read a specific line range from a source file and
+/// append it as a labelled code block.
+fn appendCodeSnippet(
+    arena: Allocator,
+    buf: *std.ArrayList(u8),
+    snip: *const HotPathSnippet,
+) void {
+    std.debug.assert(snip.start_line > 0);
+    std.debug.assert(snip.end_line >= snip.start_line);
+
+    const fs_path = core.resolveToFs(
+        arena,
+        snip.file,
+    ) orelse return;
+
+    const content = std.fs.cwd().readFileAlloc(
+        arena,
+        fs_path,
+        MAX_FILE_SIZE,
+    ) catch return;
+    if (content.len == 0) return;
+
+    // Extract the requested line range.
+    const short = shortName(snip.file);
+    const header = std.fmt.allocPrint(
+        arena,
+        "### {s} (L{d}–{d})\n```{s}\n",
+        .{
+            snip.label,
+            snip.start_line,
+            snip.end_line,
+            short,
+        },
+    ) catch return;
+    buf.appendSlice(arena, header) catch return;
+
+    var line_number: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        line_number += 1;
+        if (line_number < snip.start_line) continue;
+        if (line_number > snip.end_line) break;
+        buf.appendSlice(arena, line) catch return;
+        buf.append(arena, '\n') catch return;
+    }
+
+    buf.appendSlice(arena, "```\n\n") catch {};
 }
 
 /// Append a single file's function outline to buf.

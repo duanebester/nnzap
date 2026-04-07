@@ -49,41 +49,49 @@ and norm scales — these are already f16.
 
 ## Protocol
 
-1. experiment_start — create an experiment branch.
-2. Read history to understand what has been tried.
-   Do NOT repeat failed approaches.
-3. Read code, make your change, check, test, bench.
-4. experiment_finish with decision and summary:
+1. **Hypothesis first.** Call experiment_start and
+   state your hypothesis: what you will change, why
+   it should improve throughput.
+
+2. **Read only what you need.** The initial context
+   includes the 3 critical dispatch functions
+   verbatim (encodeAttentionProjections,
+   encodeAttentionGather, encodeMLPHalf). Use
+   run_command with grep/sed only for code NOT
+   already in context.
+
+3. **Edit, then validate.** Make your change, then
+   run check → test → bench. If check fails, fix
+   within 2 attempts or abandon.
+
+4. **Finish.** Call experiment_finish with decision:
    - keep: >= 5% improvement.
    - abandon: regression or flat.
-5. STOP when done. Outer loop starts next experiment.
 
-You may make multiple related edits in one experiment
-when they form a coherent optimisation (e.g. fusing
-two kernels requires editing both the shader and the
-dispatch code). The key constraint is that the
-experiment tests ONE hypothesis.
+5. **STOP.** Outer loop starts the next experiment.
 
-## Turn budget
+## Turn economy
 
-Be economical with turns. Every turn costs time and
-tokens. Prefer action over exploration:
+Every tool call costs time and tokens. The initial
+context already includes the per-layer dispatch code
+verbatim — use it.
 
-- The initial context includes a hot-path map with
-  function names and line numbers. Use it.
-- Do NOT read entire large files with show. Use
-  run_command with grep/sed to read specific sections.
-- Make your edit as soon as you understand the target
-  area. Do not read every file first.
-- If check fails, fix it within 2 attempts or abandon.
+- Do NOT re-read code that is already in context.
+- Do NOT re-read code you read in an earlier turn.
+- Prefer one targeted sed command over several
+  exploratory reads.
+- Each experiment should test ONE hypothesis. If you
+  find yourself reading broadly without a clear edit
+  target, stop and commit to a direction.
 
 ## Navigation
 
-Use run_command with CLI tools for code navigation:
+When you need code NOT already in context, use
+run_command with CLI tools:
 
-- Outline: grep -n 'fn ' <file>
 - Read range: sed -n '100,150p' <file>
 - Search: grep -rn 'pattern' nnmetal/src/
+- Outline: grep -n 'fn ' <file>
 - Find files: find nnmetal/src -name '\*.zig'
 
 Use show only for files under ~200 lines.
@@ -95,6 +103,7 @@ nnmetal/src/transformer.zig — dispatch, decode loop
 nnmetal/src/model.zig — buffers, weight loading
 nnmetal/src/metal.zig — Metal device, pipelines
 nnmetal/src/shaders/compute.metal — qmv kernels
+nnmetal/src/shaders/qmv_specialized.metal — specialized QMV
 nnmetal/src/shaders/transformer.metal — rms, rope, etc
 nnmetal/examples/bonsai_bench.zig — benchmark binary
 
