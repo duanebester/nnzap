@@ -271,10 +271,6 @@ pub const AgentConfig = struct {
     // Tool dispatch table.
     tool_map: []const ToolMapping,
 
-    // Tool names whose output gets persisted to
-    // experiments.jsonl on success.
-    persist_tools: []const []const u8 = &.{},
-
     /// Metrics to extract from benchmark JSON for the
     /// compact history.  Walked by formatHistoryLine
     /// instead of hardcoded field names.
@@ -1483,24 +1479,6 @@ pub fn executeSingleTool(
         },
     );
 
-    // Persist output for configured tool names.
-    if (output.success) {
-        for (config.persist_tools) |pt| {
-            if (api.eql(call.name, pt)) {
-                appendExperiment(
-                    arena,
-                    config.history_dir,
-                    output.stdout,
-                );
-                api.log(
-                    "    -> {s} result persisted\n",
-                    .{call.name},
-                );
-                break;
-            }
-        }
-    }
-
     return .{
         .tool_use_id = call.id,
         .content = api.truncate(
@@ -1629,10 +1607,6 @@ fn buildDefaultContext(
         arena,
         config,
     );
-    const summaries = buildSummariesSection(
-        arena,
-        config.history_dir,
-    );
     const orientation = buildOrientation(arena);
     const has_history = history.len > 0;
 
@@ -1648,12 +1622,11 @@ fn buildDefaultContext(
 
     return std.fmt.allocPrint(
         arena,
-        "{s}\n{s}{s}{s}{s}",
+        "{s}\n{s}{s}{s}",
         .{
             orientation,
             hist_section,
             if (has_history) history else "",
-            summaries,
             suffix,
         },
     ) catch "Begin optimizing.";
@@ -1726,40 +1699,6 @@ pub fn ensureHistoryDir(
             );
         }
     };
-}
-
-/// Append a benchmark result to experiments.jsonl.
-pub fn appendExperiment(
-    arena: Allocator,
-    history_dir: []const u8,
-    benchmark_json: []const u8,
-) void {
-    std.debug.assert(benchmark_json.len > 0);
-
-    const line = api.collapseToLine(
-        arena,
-        benchmark_json,
-    ) catch return;
-
-    const hist_path = std.fmt.allocPrint(
-        arena,
-        "{s}/experiments.jsonl",
-        .{history_dir},
-    ) catch return;
-    const fs_path = resolveToFs(
-        arena,
-        hist_path,
-    ) orelse return;
-
-    const file = std.fs.cwd().createFile(
-        fs_path,
-        .{ .truncate = false },
-    ) catch return;
-    defer file.close();
-
-    file.seekFromEnd(0) catch return;
-    file.writeAll(line) catch return;
-    file.writeAll("\n") catch {};
 }
 
 /// Build a compact summary table from experiments.jsonl.
@@ -1863,8 +1802,8 @@ fn formatHistoryLines(
 }
 
 /// Extract key metrics from one JSONL line into a
-/// compact human-readable row.  Walks config.history_fields
-/// so each domain controls which metrics appear.
+/// compact human-readable row.  Now includes decision
+/// and summary from the enriched experiment format.
 fn formatHistoryLine(
     config: *const AgentConfig,
     arena: Allocator,
@@ -1885,22 +1824,23 @@ fn formatHistoryLine(
         else => return null,
     };
 
-    const ts = getStrOr(obj, "timestamp_utc", "?");
+    const decision = getStrOr(obj, "decision", "?");
+    const summary = getStrOr(obj, "summary", "");
 
     // Fallback: no fields configured — show raw line.
     if (config.history_fields.len == 0) {
         return std.fmt.allocPrint(
             arena,
-            "  {d}. {s}  (raw) {s}\n",
-            .{ index, ts, line },
+            "  {d}. [{s}] (raw) {s}\n",
+            .{ index, decision, line },
         ) catch null;
     }
 
     var buf: std.ArrayList(u8) = .empty;
     const prefix = std.fmt.allocPrint(
         arena,
-        "  {d}. {s}",
-        .{ index, ts },
+        "  {d}. [{s}]",
+        .{ index, decision },
     ) catch return null;
     buf.appendSlice(arena, prefix) catch return null;
 
@@ -1917,91 +1857,23 @@ fn formatHistoryLine(
         ) catch continue;
         buf.appendSlice(arena, part) catch continue;
     }
-    buf.appendSlice(arena, "\n") catch return null;
-    return buf.items;
-}
 
-/// Load experiment summaries from summaries.jsonl.
-pub fn buildSummariesSection(
-    arena: Allocator,
-    history_dir: []const u8,
-) []const u8 {
-    const sum_path = std.fmt.allocPrint(
-        arena,
-        "{s}/summaries.jsonl",
-        .{history_dir},
-    ) catch return "";
-    const fs_path = resolveToFs(
-        arena,
-        sum_path,
-    ) orelse return "";
-
-    const file = std.fs.cwd().openFile(
-        fs_path,
-        .{},
-    ) catch return "";
-    defer file.close();
-
-    const content = file.readToEndAlloc(
-        arena,
-        MAX_HISTORY_SIZE,
-    ) catch return "";
-    if (content.len == 0) return "";
-
-    var buf: std.ArrayList(u8) = .empty;
-    buf.appendSlice(
-        arena,
-        "\n## Previous experiment summaries\n\n" ++
-            "These describe what was tried and " ++
-            "why it succeeded or failed. Do NOT " ++
-            "repeat failed approaches.\n\n",
-    ) catch return "";
-
-    var iter = std.mem.splitScalar(
-        u8,
-        content,
-        '\n',
-    );
-    while (iter.next()) |line| {
-        if (line.len < 2) continue;
-        formatSummaryLine(arena, &buf, line);
+    // Append truncated summary.
+    if (summary.len > 0) {
+        const trunc = truncateAtSentence(
+            summary,
+            80,
+        );
+        const suf = std.fmt.allocPrint(
+            arena,
+            "  {s}",
+            .{trunc},
+        ) catch "";
+        buf.appendSlice(arena, suf) catch {};
     }
 
-    // Header was added but no summaries parsed.
-    if (buf.items.len < 80) return "";
-
-    std.debug.assert(buf.items.len > 0);
+    buf.appendSlice(arena, "\n") catch return null;
     return buf.items;
-}
-
-/// Format one summary JSONL line and append to buffer.
-fn formatSummaryLine(
-    arena: Allocator,
-    buf: *std.ArrayList(u8),
-    line: []const u8,
-) void {
-    const root = std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena,
-        line,
-        .{},
-    ) catch return;
-    const obj = switch (root) {
-        .object => |o| o,
-        else => return,
-    };
-    const exp_num = getNumStr(arena, obj, "experiment");
-    const summary = switch (obj.get("summary") orelse return) {
-        .string => |s| s,
-        else => return,
-    };
-
-    const row = std.fmt.allocPrint(
-        arena,
-        "  Experiment {s}: {s}\n",
-        .{ exp_num, summary },
-    ) catch return;
-    buf.appendSlice(arena, row) catch {};
 }
 
 // ============================================================

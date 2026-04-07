@@ -45,8 +45,6 @@ const config = toolbox.ToolboxConfig{
         "-Doptimize=ReleaseFast",
     },
     .extra_bench = &.{},
-    .bench_dir = "nnmetal/benchmarks",
-    .bench_prefixes = &.{"bonsai_bench_"},
     .history_dir = ".bonsai_history",
 };
 

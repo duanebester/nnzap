@@ -1,9 +1,9 @@
 //! Generic research toolbox — shared CLI tool
 //! implementations for AI agent research binaries.
 //!
-//! Provides sandboxed file I/O, git-based experiment
-//! branching, build/test/bench dispatch, benchmark
-//! management, and experiment history tracking.
+//! Provides sandboxed file I/O, experiment branching,
+//! build/test/bench dispatch, and experiment history
+//! tracking.
 //!
 //! Domain-specific binaries configure this module via
 //! ToolboxConfig and optionally handle custom tools
@@ -13,10 +13,6 @@
 //!   check               Compile-only validation
 //!   test                Run test suite
 //!   bench               Run primary benchmark
-//!   bench-compare       Compare benchmark results
-//!   bench-list          List benchmark files
-//!   bench-latest        Output latest benchmark
-//!   bench-clean         Delete old benchmark files
 //!   show                Show a source file
 //!   show-function       Extract a function body
 //!   read-file           Read a project file
@@ -25,12 +21,9 @@
 //!   list-dir            List directory contents
 //!   cwd                 Print working directory
 //!   run-cmd             Run a shell command
-//!   commit              Git add and commit
-//!   git-start           Create experiment branch
-//!   git-diff            Show uncommitted changes
-//!   git-finish          Merge experiment to main
-//!   git-abandon         Discard changes, return to main
-//!   add-summary         Record experiment summary
+//!   experiment-start    Create experiment branch
+//!   diff                Show uncommitted changes
+//!   experiment-finish   Conclude an experiment
 //!   history             Show recent experiments
 
 const std = @import("std");
@@ -78,19 +71,6 @@ pub const ToolboxConfig = struct {
     /// Additional benchmark commands keyed by
     /// subcommand name.
     extra_bench: []const ExtraBench = &.{},
-
-    /// When true, the bench command writes JSON to a
-    /// file in bench_dir.  The toolbox cleans old
-    /// files, runs the command, then reads the new
-    /// file.  When false (default), the bench command
-    /// writes JSON to stdout directly.
-    bench_output_file: bool = false,
-
-    /// Benchmark directory (monorepo-relative).
-    bench_dir: []const u8,
-
-    /// Benchmark filename prefixes.
-    bench_prefixes: []const []const u8,
 
     /// History directory (monorepo-relative).
     history_dir: []const u8,
@@ -235,18 +215,6 @@ fn dispatch(
     if (tools.eql(cmd, "bench")) {
         return toolBench(config, arena);
     }
-    if (tools.eql(cmd, "bench-compare")) {
-        return toolBenchCompare(config, arena);
-    }
-    if (tools.eql(cmd, "bench-list")) {
-        return toolBenchList(config, arena);
-    }
-    if (tools.eql(cmd, "bench-latest")) {
-        return toolBenchLatest(config, arena);
-    }
-    if (tools.eql(cmd, "bench-clean")) {
-        return toolBenchClean(config, arena);
-    }
     if (tools.eql(cmd, "show")) {
         return toolShow(config, arena, args);
     }
@@ -269,23 +237,22 @@ fn dispatch(
     if (tools.eql(cmd, "run-cmd")) {
         return toolRunCmd(arena, args);
     }
-    if (tools.eql(cmd, "commit")) {
-        return toolCommit(config, arena, args);
+    if (tools.eql(cmd, "experiment-start")) {
+        return toolExperimentStart(
+            config,
+            arena,
+            args,
+        );
     }
-    if (tools.eql(cmd, "git-start")) {
-        return toolGitStart(config, arena, args);
+    if (tools.eql(cmd, "diff")) {
+        return toolDiff(arena);
     }
-    if (tools.eql(cmd, "git-diff")) {
-        return toolGitDiff(arena);
-    }
-    if (tools.eql(cmd, "git-finish")) {
-        return toolGitFinish(arena);
-    }
-    if (tools.eql(cmd, "git-abandon")) {
-        return toolGitAbandon(arena);
-    }
-    if (tools.eql(cmd, "add-summary")) {
-        return toolAddSummary(config, arena, args);
+    if (tools.eql(cmd, "experiment-finish")) {
+        return toolExperimentFinish(
+            config,
+            arena,
+            args,
+        );
     }
     if (tools.eql(cmd, "history")) {
         return toolHistory(config, arena, args);
@@ -316,15 +283,13 @@ fn toolHelp(config: *const ToolboxConfig) !void {
     try tools.writeStdout(
         "{\"tools\": [" ++
             "\"check\", \"test\", " ++
-            "\"bench\", \"bench-compare\", " ++
-            "\"bench-list\", \"bench-latest\", " ++
-            "\"bench-clean\", \"show\", " ++
+            "\"bench\", \"show\", " ++
             "\"show-function\", \"read-file\", " ++
             "\"write-file\", \"edit-file\", " ++
             "\"list-dir\", \"cwd\", \"run-cmd\", " ++
-            "\"commit\", \"git-start\", " ++
-            "\"git-diff\", \"git-finish\", " ++
-            "\"git-abandon\", \"add-summary\", " ++
+            "\"experiment-start\", " ++
+            "\"diff\", " ++
+            "\"experiment-finish\", " ++
             "\"history\"]}\n",
     );
 }
@@ -429,25 +394,10 @@ fn toolTest(
 // Tool: bench — run primary benchmark
 // ============================================================
 
-/// Run the primary benchmark command.
-/// Handles both stdout-capture and file-based output
-/// depending on config.bench_output_file.
 fn toolBench(
     config: *const ToolboxConfig,
     arena: Allocator,
 ) !void {
-    if (config.bench_output_file) {
-        const bench_fs = try tools.resolveToFs(
-            arena,
-            config.fs_root,
-            config.bench_dir,
-        );
-        _ = tools.cleanBenchmarkFiles(
-            bench_fs,
-            config.bench_prefixes,
-        );
-    }
-
     std.debug.print(
         "{s}: running bench...\n",
         .{config.name},
@@ -490,52 +440,49 @@ fn toolBench(
         return;
     }
 
-    if (config.bench_output_file) {
-        // Find the new benchmark file on disk.
-        const bench_fs = try tools.resolveToFs(
-            arena,
-            config.fs_root,
-            config.bench_dir,
-        );
-        const name = tools.findOneBenchmark(
-            arena,
-            bench_fs,
-            config.bench_prefixes,
-        );
-        if (name) |n| {
-            const path = try std.fmt.allocPrint(
-                arena,
-                "{s}/{s}",
-                .{ bench_fs, n },
-            );
-            const content = try tools.readFile(
-                arena,
-                path,
-            );
-            try tools.writeStdout(content);
-        } else {
-            try tools.writeStdout(
-                "{\"status\": \"error\", " ++
-                    "\"error\": \"no benchmark " ++
-                    "produced\"}\n",
-            );
-        }
+    // Capture stdout from the benchmark command.
+    if (result.stdout.len > 0) {
+        cacheBenchResult(config, arena, result.stdout);
+        try tools.writeStdout(result.stdout);
     } else {
-        // Capture stdout from the benchmark command.
-        if (result.stdout.len > 0) {
-            try tools.writeStdout(result.stdout);
-        } else {
-            try tools.writeStdout(
-                "{\"status\": \"error\", " ++
-                    "\"error\": \"no benchmark " ++
-                    "output\"}\n",
-            );
-        }
+        try tools.writeStdout(
+            "{\"status\": \"error\", " ++
+                "\"error\": \"no benchmark " ++
+                "output\"}\n",
+        );
     }
 }
 
+/// Cache the latest benchmark JSON to a temp file
+/// so experiment_finish can read it.
+fn cacheBenchResult(
+    config: *const ToolboxConfig,
+    arena: Allocator,
+    json: []const u8,
+) void {
+    std.debug.assert(json.len > 0);
+
+    const path_rel = std.fmt.allocPrint(
+        arena,
+        "{s}/_last_bench.json",
+        .{config.history_dir},
+    ) catch return;
+    const fs_path = tools.resolveToFs(
+        arena,
+        config.fs_root,
+        path_rel,
+    ) catch return;
+    const file = std.fs.cwd().createFile(
+        fs_path,
+        .{},
+    ) catch return;
+    defer file.close();
+    file.writeAll(json) catch {};
+}
+
 /// Run an extra benchmark command (always captures
-/// stdout).
+/// stdout).  Does not cache results — only the primary
+/// bench tool caches to _last_bench.json.
 fn runExtraBench(
     config: *const ToolboxConfig,
     arena: Allocator,
@@ -592,119 +539,6 @@ fn runExtraBench(
                 "output\"}\n",
         );
     }
-}
-
-// ============================================================
-// Tool: bench-compare — compare all benchmark results
-// ============================================================
-
-fn toolBenchCompare(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        config.bench_dir,
-    );
-    try tools.toolBenchCompare(
-        arena,
-        bench_fs,
-        config.bench_prefixes,
-    );
-}
-
-// ============================================================
-// Tool: bench-list — list benchmark files
-// ============================================================
-
-/// List all benchmark JSON filenames.
-fn toolBenchList(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        config.bench_dir,
-    );
-    const names = try tools.listBenchmarkFiles(
-        arena,
-        bench_fs,
-        config.bench_prefixes,
-    );
-    var buf: std.ArrayList(u8) = .empty;
-
-    try buf.appendSlice(arena, "{\"files\": [");
-    for (names, 0..) |name, i| {
-        if (i > 0) {
-            try buf.appendSlice(arena, ", ");
-        }
-        try buf.appendSlice(arena, "\"");
-        try buf.appendSlice(arena, name);
-        try buf.appendSlice(arena, "\"");
-    }
-    try buf.appendSlice(arena, "]}\n");
-    try tools.writeStdout(buf.items);
-}
-
-// ============================================================
-// Tool: bench-latest — output latest benchmark
-// ============================================================
-
-/// Output the most recent benchmark result as JSON.
-fn toolBenchLatest(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        config.bench_dir,
-    );
-    const names = try tools.listBenchmarkFiles(
-        arena,
-        bench_fs,
-        config.bench_prefixes,
-    );
-    if (names.len == 0) return error.NoBenchmarkFiles;
-
-    const latest = names[names.len - 1];
-    const path = try std.fmt.allocPrint(
-        arena,
-        "{s}/{s}",
-        .{ bench_fs, latest },
-    );
-    const content = try tools.readFile(arena, path);
-    try tools.writeStdout(content);
-}
-
-// ============================================================
-// Tool: bench-clean — delete old benchmark files
-// ============================================================
-
-/// Delete all benchmark JSON files.
-fn toolBenchClean(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) !void {
-    const bench_fs = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        config.bench_dir,
-    );
-    const count = tools.cleanBenchmarkFiles(
-        bench_fs,
-        config.bench_prefixes,
-    );
-    var buf: [128]u8 = undefined;
-    const json = std.fmt.bufPrint(
-        &buf,
-        "{{\"status\": \"ok\", " ++
-            "\"files_deleted\": {d}}}\n",
-        .{count},
-    ) catch unreachable;
-    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -1134,6 +968,45 @@ fn formatTimestamp(buf: *[32]u8) []const u8 {
     ) catch "0000-00-00T00-00-00";
 }
 
+/// Format the current UTC time as ISO 8601 with colons:
+/// "2025-01-15T14:30:00Z".  Used for JSONL records.
+fn formatTimestampUtc(buf: *[32]u8) []const u8 {
+    const ts: u64 = @intCast(std.time.timestamp());
+    std.debug.assert(ts > 0);
+
+    const es = std.time.epoch.EpochSeconds{
+        .secs = ts,
+    };
+    const epoch_day = es.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = es.getDaySeconds();
+
+    const year = year_day.year;
+    const month = month_day.month.numeric();
+    const day: u32 =
+        @as(u32, month_day.day_index) + 1;
+    const hour = day_secs.getHoursIntoDay();
+    const minute = day_secs.getMinutesIntoHour();
+    const second = day_secs.getSecondsIntoMinute();
+
+    std.debug.assert(month >= 1);
+    std.debug.assert(month <= 12);
+    return std.fmt.bufPrint(
+        buf,
+        "{d:0>4}-{d:0>2}-{d:0>2}T" ++
+            "{d:0>2}:{d:0>2}:{d:0>2}Z",
+        .{
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        },
+    ) catch "0000-00-00T00:00:00Z";
+}
+
 // ============================================================
 // Line counting
 // ============================================================
@@ -1530,66 +1403,10 @@ fn runShellCommand(
 }
 
 // ============================================================
-// Tool: commit — git add -A and commit
+// Tool: experiment-start — create an experiment branch
 // ============================================================
 
-fn toolCommit(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    args: []const []const u8,
-) !void {
-    const obj = readJsonInput(arena, args) orelse {
-        try tools.writeJsonError(error.InvalidInput);
-        std.process.exit(1);
-    };
-    const msg = getJsonString(
-        obj,
-        "message",
-    ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'message' field",
-        );
-        std.process.exit(1);
-    };
-    if (msg.len == 0) {
-        try tools.stdout_file.writeAll(
-            "Error: empty commit message",
-        );
-        std.process.exit(1);
-    }
-    // Write commit message to temp file to avoid
-    // shell quoting issues.
-    const msg_path_rel = try std.fmt.allocPrint(
-        arena,
-        "{s}/_commit_msg.txt",
-        .{config.history_dir},
-    );
-    const msg_path = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        msg_path_rel,
-    );
-    const msg_file = try std.fs.cwd().createFile(
-        msg_path,
-        .{},
-    );
-    try msg_file.writeAll(msg);
-    msg_file.close();
-
-    const cmd = try std.fmt.allocPrint(
-        arena,
-        "git add -A && git commit -F '{s}' " ++
-            "&& rm -f '{s}'",
-        .{ msg_path, msg_path },
-    );
-    try runShellCommand(arena, cmd);
-}
-
-// ============================================================
-// Tool: git-start — create an experiment branch
-// ============================================================
-
-fn toolGitStart(
+fn toolExperimentStart(
     config: *const ToolboxConfig,
     arena: Allocator,
     args: []const []const u8,
@@ -1638,10 +1455,10 @@ fn toolGitStart(
 }
 
 // ============================================================
-// Tool: git-diff — show uncommitted changes
+// Tool: diff — show uncommitted changes
 // ============================================================
 
-fn toolGitDiff(arena: Allocator) !void {
+fn toolDiff(arena: Allocator) !void {
     try runShellCommand(
         arena,
         "git --no-pager diff",
@@ -1649,10 +1466,67 @@ fn toolGitDiff(arena: Allocator) !void {
 }
 
 // ============================================================
-// Tool: git-finish — merge experiment branch to main
+// Tool: experiment-finish — conclude an experiment
 // ============================================================
 
-fn toolGitFinish(arena: Allocator) !void {
+/// Single tool to conclude an experiment. Replaces
+/// the former git_finish/git_abandon/commit/add_summary
+/// multi-step workflow.
+///
+/// JSON input: {"decision": "keep"|"abandon", "summary": "..."}
+///
+/// Steps:
+///   1. Read current git branch (error if on main).
+///   2. Read cached bench result from _last_bench.json.
+///   3. Append one enriched record to experiments.jsonl.
+///   4. If keep: git add, commit, merge to main.
+///   5. If abandon: git reset --hard, checkout main.
+///   6. Clean up _last_bench.json.
+fn toolExperimentFinish(
+    config: *const ToolboxConfig,
+    arena: Allocator,
+    args: []const []const u8,
+) !void {
+    const obj = readJsonInput(arena, args) orelse {
+        try tools.writeJsonError(error.InvalidInput);
+        std.process.exit(1);
+    };
+    const decision = getJsonString(
+        obj,
+        "decision",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'decision' field",
+        );
+        std.process.exit(1);
+    };
+    const summary = getJsonString(
+        obj,
+        "summary",
+    ) orelse {
+        try tools.stdout_file.writeAll(
+            "Error: missing 'summary' field",
+        );
+        std.process.exit(1);
+    };
+
+    const is_keep = tools.eql(decision, "keep");
+    const is_abandon = tools.eql(decision, "abandon");
+    if (!is_keep and !is_abandon) {
+        try tools.stdout_file.writeAll(
+            "Error: decision must be " ++
+                "'keep' or 'abandon'",
+        );
+        std.process.exit(1);
+    }
+    if (summary.len == 0) {
+        try tools.stdout_file.writeAll(
+            "Error: empty summary",
+        );
+        std.process.exit(1);
+    }
+
+    // 1. Read current branch.
     const branch = captureGitBranch(arena) catch {
         try tools.stdout_file.writeAll(
             "Error: cannot determine current branch",
@@ -1662,45 +1536,316 @@ fn toolGitFinish(arena: Allocator) !void {
     if (tools.eql(branch, "main")) {
         try tools.stdout_file.writeAll(
             "Error: already on main, " ++
-                "nothing to merge",
+                "no experiment to finish",
         );
         std.process.exit(1);
     }
 
-    // Merge the experiment branch into main.
-    const cmd = try std.fmt.allocPrint(
+    // 2. Read cached bench result (optional).
+    const bench_json = readLastBench(config, arena);
+
+    // 3. Write enriched record to experiments.jsonl.
+    const exp_num =
+        countExperimentLines(config, arena) + 1;
+    appendEnrichedExperiment(
+        config,
         arena,
-        "git checkout main && " ++
-            "git merge '{s}'",
-        .{branch},
+        exp_num,
+        branch,
+        decision,
+        summary,
+        bench_json,
     );
-    try runShellCommand(arena, cmd);
+
+    // 4/5. Git operations.
+    if (is_keep) {
+        const msg_path_rel = try std.fmt.allocPrint(
+            arena,
+            "{s}/_commit_msg.txt",
+            .{config.history_dir},
+        );
+        const msg_path = try tools.resolveToFs(
+            arena,
+            config.fs_root,
+            msg_path_rel,
+        );
+        const msg_file = try std.fs.cwd().createFile(
+            msg_path,
+            .{},
+        );
+        try msg_file.writeAll(summary);
+        msg_file.close();
+
+        const cmd = try std.fmt.allocPrint(
+            arena,
+            "git add -A && " ++
+                "git commit -F '{s}' && " ++
+                "rm -f '{s}' && " ++
+                "git checkout main && " ++
+                "git merge '{s}'",
+            .{ msg_path, msg_path, branch },
+        );
+        try runShellCommand(arena, cmd);
+    } else {
+        try runShellCommand(
+            arena,
+            "git reset --hard HEAD && " ++
+                "git checkout main",
+        );
+    }
+
+    // 6. Clean up cached bench result.
+    cleanLastBench(config, arena);
+
+    const out = try std.fmt.allocPrint(
+        arena,
+        "Experiment #{d} {s}.",
+        .{ exp_num, decision },
+    );
+    try tools.writeStdout(out);
 }
 
-// ============================================================
-// Tool: git-abandon — discard changes, return to main
-// ============================================================
+/// Read the cached benchmark result from
+/// {history_dir}/_last_bench.json.  Returns null
+/// if the file does not exist or is empty.
+fn readLastBench(
+    config: *const ToolboxConfig,
+    arena: Allocator,
+) ?[]const u8 {
+    const path_rel = std.fmt.allocPrint(
+        arena,
+        "{s}/_last_bench.json",
+        .{config.history_dir},
+    ) catch return null;
+    const fs_path = tools.resolveToFs(
+        arena,
+        config.fs_root,
+        path_rel,
+    ) catch return null;
+    const content = tools.readFile(
+        arena,
+        fs_path,
+    ) catch return null;
+    if (content.len == 0) return null;
+    return content;
+}
 
-fn toolGitAbandon(arena: Allocator) !void {
-    const branch = captureGitBranch(arena) catch {
-        try tools.stdout_file.writeAll(
-            "Error: cannot determine current branch",
-        );
-        std.process.exit(1);
-    };
-    if (tools.eql(branch, "main")) {
-        try tools.stdout_file.writeAll(
-            "Already on main, nothing to abandon.",
-        );
-        return;
+/// Count existing experiment lines in experiments.jsonl.
+fn countExperimentLines(
+    config: *const ToolboxConfig,
+    arena: Allocator,
+) u32 {
+    const path_rel = std.fmt.allocPrint(
+        arena,
+        "{s}/experiments.jsonl",
+        .{config.history_dir},
+    ) catch return 0;
+    const fs_path = tools.resolveToFs(
+        arena,
+        config.fs_root,
+        path_rel,
+    ) catch return 0;
+    const file = std.fs.cwd().openFile(
+        fs_path,
+        .{},
+    ) catch return 0;
+    defer file.close();
+    const content = file.readToEndAlloc(
+        arena,
+        MAX_HISTORY_SIZE,
+    ) catch return 0;
+    var count: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        if (line.len >= 2) count += 1;
+    }
+    return count;
+}
+
+/// Append one enriched experiment record to
+/// experiments.jsonl.  Merges experiment metadata
+/// with bench results into a single JSON line.
+fn appendEnrichedExperiment(
+    config: *const ToolboxConfig,
+    arena: Allocator,
+    experiment_number: u32,
+    branch: []const u8,
+    decision: []const u8,
+    summary: []const u8,
+    bench_json: ?[]const u8,
+) void {
+    std.debug.assert(experiment_number > 0);
+    std.debug.assert(branch.len > 0);
+    std.debug.assert(summary.len > 0);
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = formatTimestampUtc(&ts_buf);
+
+    const trimmed = truncateAtSentence(summary, 500);
+
+    var buf: std.ArrayList(u8) = .empty;
+
+    // Experiment metadata.
+    const num_str = std.fmt.allocPrint(
+        arena,
+        "{d}",
+        .{experiment_number},
+    ) catch return;
+    buf.appendSlice(
+        arena,
+        "{\"experiment\":",
+    ) catch return;
+    buf.appendSlice(arena, num_str) catch return;
+    buf.appendSlice(
+        arena,
+        ",\"branch\":\"",
+    ) catch return;
+    buf.appendSlice(arena, branch) catch return;
+    buf.appendSlice(
+        arena,
+        "\",\"decision\":\"",
+    ) catch return;
+    buf.appendSlice(arena, decision) catch return;
+    buf.appendSlice(
+        arena,
+        "\",\"summary\":\"",
+    ) catch return;
+
+    // Escape summary text.
+    for (trimmed) |c| {
+        switch (c) {
+            '"' => buf.appendSlice(
+                arena,
+                "\\\"",
+            ) catch return,
+            '\\' => buf.appendSlice(
+                arena,
+                "\\\\",
+            ) catch return,
+            '\n' => buf.append(arena, ' ') catch return,
+            '\r' => {},
+            else => buf.append(arena, c) catch return,
+        }
+    }
+    buf.append(arena, '"') catch return;
+
+    // Merge bench fields if available.
+    if (bench_json) |bj| {
+        mergeBenchFields(arena, &buf, bj);
     }
 
-    // Discard uncommitted changes and switch to main.
-    try runShellCommand(
+    // Timestamp and close.
+    buf.appendSlice(
         arena,
-        "git reset --hard HEAD && " ++
-            "git checkout main",
-    );
+        ",\"timestamp_utc\":\"",
+    ) catch return;
+    buf.appendSlice(arena, ts) catch return;
+    buf.appendSlice(arena, "\"}\n") catch return;
+
+    // Append to experiments.jsonl.
+    const path_rel = std.fmt.allocPrint(
+        arena,
+        "{s}/experiments.jsonl",
+        .{config.history_dir},
+    ) catch return;
+    const fs_path = tools.resolveToFs(
+        arena,
+        config.fs_root,
+        path_rel,
+    ) catch return;
+    const file = std.fs.cwd().createFile(
+        fs_path,
+        .{ .truncate = false },
+    ) catch return;
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(buf.items) catch return;
+}
+
+/// Parse bench JSON and append each field (except
+/// timestamp_utc) to the output buffer as ",key:value".
+fn mergeBenchFields(
+    arena: Allocator,
+    buf: *std.ArrayList(u8),
+    bench_json: []const u8,
+) void {
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        bench_json,
+        .{},
+    ) catch return;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return,
+    };
+    var iter = obj.iterator();
+    while (iter.next()) |entry| {
+        // Skip timestamp — we generate our own.
+        if (tools.eql(
+            entry.key_ptr.*,
+            "timestamp_utc",
+        )) continue;
+
+        buf.appendSlice(arena, ",\"") catch return;
+        buf.appendSlice(
+            arena,
+            entry.key_ptr.*,
+        ) catch return;
+        buf.appendSlice(arena, "\":") catch return;
+
+        switch (entry.value_ptr.*) {
+            .string => |s| {
+                buf.append(arena, '"') catch return;
+                buf.appendSlice(arena, s) catch return;
+                buf.append(arena, '"') catch return;
+            },
+            .float => |f| {
+                const fs = std.fmt.allocPrint(
+                    arena,
+                    "{d:.1}",
+                    .{f},
+                ) catch return;
+                buf.appendSlice(arena, fs) catch return;
+            },
+            .integer => |i| {
+                const is = std.fmt.allocPrint(
+                    arena,
+                    "{d}",
+                    .{i},
+                ) catch return;
+                buf.appendSlice(arena, is) catch return;
+            },
+            else => {
+                buf.appendSlice(
+                    arena,
+                    "null",
+                ) catch return;
+            },
+        }
+    }
+}
+
+/// Delete the cached _last_bench.json file.
+fn cleanLastBench(
+    config: *const ToolboxConfig,
+    arena: Allocator,
+) void {
+    const path_rel = std.fmt.allocPrint(
+        arena,
+        "{s}/_last_bench.json",
+        .{config.history_dir},
+    ) catch return;
+    const fs_path = tools.resolveToFs(
+        arena,
+        config.fs_root,
+        path_rel,
+    ) catch return;
+    std.fs.cwd().deleteFile(fs_path) catch {};
 }
 
 // ============================================================
@@ -1774,147 +1919,6 @@ fn sanitizeBranchName(
 
     if (buf.items.len == 0) return "unnamed";
     return buf.items;
-}
-
-// ============================================================
-// Tool: add-summary — record an experiment summary
-// ============================================================
-
-fn toolAddSummary(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    args: []const []const u8,
-) !void {
-    const obj = readJsonInput(arena, args) orelse {
-        try tools.writeJsonError(error.InvalidInput);
-        std.process.exit(1);
-    };
-    const summary = getJsonString(
-        obj,
-        "summary",
-    ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'summary' field",
-        );
-        std.process.exit(1);
-    };
-    if (summary.len == 0) {
-        try tools.stdout_file.writeAll(
-            "Error: empty summary",
-        );
-        std.process.exit(1);
-    }
-    const next_id =
-        countSummaryLines(config, arena) + 1;
-    try appendSummary(config, arena, next_id, summary);
-    const out = try std.fmt.allocPrint(
-        arena,
-        "Summary #{d} recorded.",
-        .{next_id},
-    );
-    try tools.writeStdout(out);
-}
-
-/// Count existing summary lines in the summaries file.
-fn countSummaryLines(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-) u32 {
-    const sum_path_rel = std.fmt.allocPrint(
-        arena,
-        "{s}/summaries.jsonl",
-        .{config.history_dir},
-    ) catch return 0;
-    const fs_path = tools.resolveToFs(
-        arena,
-        config.fs_root,
-        sum_path_rel,
-    ) catch return 0;
-    const file = std.fs.cwd().openFile(
-        fs_path,
-        .{},
-    ) catch return 0;
-    defer file.close();
-    const content = file.readToEndAlloc(
-        arena,
-        MAX_HISTORY_SIZE,
-    ) catch return 0;
-    var count: u32 = 0;
-    var iter = std.mem.splitScalar(
-        u8,
-        content,
-        '\n',
-    );
-    while (iter.next()) |line| {
-        if (line.len >= 2) count += 1;
-    }
-    return count;
-}
-
-/// Append a JSON summary line to the summaries file.
-fn appendSummary(
-    config: *const ToolboxConfig,
-    arena: Allocator,
-    experiment_number: u32,
-    text: []const u8,
-) !void {
-    std.debug.assert(text.len > 0);
-    std.debug.assert(experiment_number > 0);
-
-    var ts_buf: [32]u8 = undefined;
-    const ts = formatTimestamp(&ts_buf);
-
-    // Truncate at sentence boundary (max 500 chars).
-    const trimmed = truncateAtSentence(text, 500);
-
-    var buf: std.ArrayList(u8) = .empty;
-    try buf.appendSlice(arena, "{\"experiment\":");
-    const num_str = try std.fmt.allocPrint(
-        arena,
-        "{d}",
-        .{experiment_number},
-    );
-    try buf.appendSlice(arena, num_str);
-    try buf.appendSlice(arena, ",\"timestamp\":\"");
-    try buf.appendSlice(arena, ts);
-    try buf.appendSlice(
-        arena,
-        "\",\"summary\":\"",
-    );
-    for (trimmed) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(
-                arena,
-                "\\\"",
-            ),
-            '\\' => try buf.appendSlice(
-                arena,
-                "\\\\",
-            ),
-            '\n' => try buf.append(arena, ' '),
-            '\r' => {},
-            else => try buf.append(arena, c),
-        }
-    }
-    try buf.appendSlice(arena, "\"}\n");
-
-    const sum_path_rel = try std.fmt.allocPrint(
-        arena,
-        "{s}/summaries.jsonl",
-        .{config.history_dir},
-    );
-    const fs_path = try tools.resolveToFs(
-        arena,
-        config.fs_root,
-        sum_path_rel,
-    );
-    const file = std.fs.cwd().createFile(
-        fs_path,
-        .{ .truncate = false },
-    ) catch return;
-    defer file.close();
-    file.seekFromEnd(0) catch return;
-    file.writeAll(buf.items) catch return;
 }
 
 /// Truncate text at a sentence boundary (. ! ? or ))

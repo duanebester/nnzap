@@ -215,8 +215,8 @@ pub fn main() !void {
     // ── Print summary to stderr ──────────────────────
     printSummary(&results, prompt_len);
 
-    // ── Write JSON to benchmarks/ ────────────────────
-    try writeJsonResults(&results, prompt_len);
+    // ── Emit JSON to stdout ──────────────────────────
+    try emitJsonResults(&results, prompt_len);
 }
 
 // ============================================================
@@ -352,26 +352,16 @@ fn printSummary(
 }
 
 // ============================================================
-// Output — JSON file
+// Output — JSON stdout
 // ============================================================
 
-/// Write structured JSON results to
-/// nn/benchmarks/bonsai_bench_<epoch_ns>.json.
-fn writeJsonResults(
+/// Emit structured JSON results to stdout.
+fn emitJsonResults(
     r: *const BenchResults,
     prompt_len: u32,
 ) !void {
     std.debug.assert(r.measured_tokens > 0);
     std.debug.assert(prompt_len > 0);
-
-    // Ensure the benchmarks directory exists.
-    std.fs.cwd().makePath("benchmarks") catch |err| {
-        std.debug.print(
-            "error: cannot create benchmarks/: {}\n",
-            .{err},
-        );
-        return err;
-    };
 
     // Build the timestamp string from epoch nanos.
     // We use the raw nanosecond epoch to avoid needing
@@ -382,14 +372,6 @@ fn writeJsonResults(
     );
     var ts_buf: [64]u8 = undefined;
     const ts_str = formatEpochUtc(epoch_secs, &ts_buf);
-
-    // Build the filename.
-    var fname_buf: [MAX_PATH_LEN]u8 = undefined;
-    const fname = std.fmt.bufPrint(
-        &fname_buf,
-        "benchmarks/bonsai_bench_{d}.json",
-        .{epoch_secs},
-    ) catch unreachable;
 
     // Format JSON into a stack buffer.
     var json_buf: [2048]u8 = undefined;
@@ -422,38 +404,11 @@ fn writeJsonResults(
         },
     ) catch unreachable;
 
-    // Write the file.
-    const file = std.fs.cwd().createFile(
-        fname,
-        .{},
-    ) catch |err| {
-        std.debug.print(
-            "error: cannot create {s}: {}\n",
-            .{ fname, err },
-        );
-        return err;
-    };
-    defer file.close();
-
-    file.writeAll(json) catch |err| {
-        std.debug.print(
-            "error: write failed for {s}: {}\n",
-            .{ fname, err },
-        );
-        return err;
-    };
-
-    // Also write JSON to stdout so engine_research can
-    // capture it without needing to find the file.
+    // Write JSON to stdout.
     _ = std.posix.write(
         std.posix.STDOUT_FILENO,
         json,
     ) catch {};
-
-    std.debug.print(
-        "Results written to {s}\n",
-        .{fname},
-    );
 }
 
 // ============================================================

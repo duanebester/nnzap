@@ -82,9 +82,7 @@ const config = toolbox.ToolboxConfig{
     .check_command = &.{ "zig", "build" },
     .test_command = &.{ "zig", "build", "test" },
     .bench_command = &.{ "zig", "build", "run" },
-    .bench_output_file = true,
-    .bench_dir = "benchmarks",
-    .bench_prefixes = &.{ "mnist_", "inference_" },
+
     .history_dir = ".mnist_history",
     .custom_dispatch = &mnistDispatch,
 };

@@ -44,10 +44,10 @@ const CODE_CONTEXT_FILES = [_][]const u8{
 // ============================================================
 
 const bonsai_tools = [_]core.ToolDef{
-    // ---- Git experiment management ----
+    // ---- Experiment lifecycle ----
     .{
-        .name = "git_start",
-        .subcommand = "git-start",
+        .name = "experiment_start",
+        .subcommand = "experiment-start",
         .description = "Create a new experiment " ++
             "branch from main. Call before making " ++
             "any edits.",
@@ -60,26 +60,35 @@ const bonsai_tools = [_]core.ToolDef{
         .shape_override = .json_payload,
     },
     .{
-        .name = "git_diff",
-        .subcommand = "git-diff",
+        .name = "diff",
+        .subcommand = "diff",
         .description = "Show uncommitted changes " ++
             "(git diff). Use to review edits " ++
-            "before committing.",
+            "before finishing an experiment.",
     },
     .{
-        .name = "git_finish",
-        .subcommand = "git-finish",
-        .description = "Merge the current " ++
-            "experiment branch into main. " ++
-            "Call after a successful experiment " ++
-            "is committed.",
-    },
-    .{
-        .name = "git_abandon",
-        .subcommand = "git-abandon",
-        .description = "Discard uncommitted " ++
-            "changes and switch back to main. " ++
-            "Call after a failed experiment.",
+        .name = "experiment_finish",
+        .subcommand = "experiment-finish",
+        .description = "Conclude the current " ++
+            "experiment. Pass decision " ++
+            "(keep or abandon) and a summary " ++
+            "of what was tried. If keep: " ++
+            "commits and merges to main. " ++
+            "If abandon: discards changes " ++
+            "and returns to main.",
+        .properties = &.{
+            .{
+                .name = "decision",
+                .description = "keep or abandon",
+            },
+            .{
+                .name = "summary",
+                .description = "Concise summary: " ++
+                    "what was tried, the result, " ++
+                    "and why it succeeded or failed.",
+            },
+        },
+        .shape_override = .json_payload,
     },
     // ---- Build / test / bench ----
     .{
@@ -106,20 +115,12 @@ const bonsai_tools = [_]core.ToolDef{
             "decode_p99_us.",
     },
     .{
-        .name = "bench_compare",
-        .subcommand = "bench-compare",
-        .description = "Compare all benchmark " ++
-            "results side by side.",
-    },
-    .{
         .name = "history",
         .subcommand = "history",
-        .description = "Return the last N full " ++
-            "experiment benchmark records as a " ++
-            "JSON array. Use this for detailed " ++
-            "per-epoch data, config, etc. The " ++
-            "initial summary only shows key " ++
-            "metrics.",
+        .description = "Return the last N " ++
+            "experiment records as a JSON array. " ++
+            "Each record includes decision, " ++
+            "summary, and benchmark metrics.",
         .properties = &.{.{
             .name = "count",
             .description = "Number of recent " ++
@@ -254,41 +255,6 @@ const bonsai_tools = [_]core.ToolDef{
         }},
         .shape_override = .json_payload,
     },
-    // ---- Git / bookkeeping ----
-    .{
-        .name = "commit",
-        .subcommand = "commit",
-        .description = "Git commit all current " ++
-            "changes. Call after a successful KEEP " ++
-            "decision to preserve the optimization." ++
-            " The message should summarize what " ++
-            "was optimized and the throughput " ++
-            "improvement.",
-        .properties = &.{.{
-            .name = "message",
-            .description = "Commit message " ++
-                "summarizing the optimization",
-        }},
-        .shape_override = .json_payload,
-    },
-    .{
-        .name = "add_summary",
-        .subcommand = "add-summary",
-        .description = "Record a concise summary " ++
-            "of what was tried and why it " ++
-            "succeeded or failed. Call after " ++
-            "every experiment. Summaries " ++
-            "are injected into every future " ++
-            "experiment.",
-        .properties = &.{.{
-            .name = "summary",
-            .description = "Concise summary: what " ++
-                "was tried, the throughput " ++
-                "result, and why it succeeded " ++
-                "or failed.",
-        }},
-        .shape_override = .json_payload,
-    },
 };
 
 // ============================================================
@@ -302,7 +268,6 @@ const config = core.AgentConfig{
     .system_prompt_path = "programs/bonsai_system.md",
     .tool_schemas = core.toolSchemas(&bonsai_tools),
     .tool_map = core.toolMappings(&bonsai_tools),
-    .persist_tools = &.{"bench"},
     .history_fields = &.{
         .{ .json_key = "decode_tok_per_sec", .label = "tok/s" },
         .{ .json_key = "prefill_tok_per_sec", .label = "prefill" },
@@ -339,8 +304,7 @@ pub fn main() void {
 // Assembles the first user message from:
 //   1. Orientation (working directory, git state).
 //   2. Engineering rules from CLAUDE.md.
-//   3. Compact benchmark history.
-//   4. Agent-written summaries from prior runs.
+//   3. Experiment history (compact).
 // ============================================================
 
 fn buildBonsaiContext(
@@ -352,10 +316,6 @@ fn buildBonsaiContext(
     const history = core.buildHistorySummary(
         arena,
         cfg,
-    );
-    const summaries = core.buildSummariesSection(
-        arena,
-        cfg.history_dir,
     );
     const has_history = history.len > 0;
 
@@ -369,30 +329,32 @@ fn buildBonsaiContext(
         "you write.\n\n";
 
     const hist_section = if (has_history)
-        "## Benchmark history (compact)\n\n" ++
+        "## Experiment history\n\n" ++
+            "Each record includes decision, " ++
+            "summary, and benchmark metrics. " ++
             "Use the history tool for full " ++
-            "experiment details.\n\n"
+            "details.\n\n"
     else
-        "No previous benchmark history. " ++
+        "No previous experiment history. " ++
             "This is the first run.\n\n";
 
     const suffix =
         "\n\n## Begin\n\n" ++
         "Optimise engine throughput. " ++
-        "Start by calling git_start to create an " ++
-        "experiment branch, then read the source " ++
-        "code to understand the baseline.";
+        "Start by calling experiment_start " ++
+        "to create an experiment branch, then " ++
+        "read the source code to understand " ++
+        "the baseline.";
 
     return std.fmt.allocPrint(
         arena,
-        "{s}\n{s}{s}\n\n{s}{s}{s}{s}",
+        "{s}\n{s}{s}\n\n{s}{s}{s}",
         .{
             orientation,
             rules_section,
             rules,
             hist_section,
             if (has_history) history else "",
-            summaries,
             suffix,
         },
     ) catch "Begin optimising.";
