@@ -387,7 +387,11 @@ fn buildHotPathOutline(arena: Allocator) []const u8 {
         "\n## Hot-path map\n\n" ++
             "Function names and line numbers for " ++
             "the engine hot path. Use run_command " ++
-            "with sed to read specific functions.\n",
+            "with sed to read specific functions.\n" ++
+            "NOTE: run_command cwd is labrat/, so " ++
+            "prefix paths with ../ — e.g. " ++
+            "sed -n '100,150p' " ++
+            "../nnmetal/src/transformer.zig\n",
     ) catch return "";
 
     for (CODE_CONTEXT_FILES) |rel_path| {
