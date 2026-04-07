@@ -231,6 +231,21 @@ const BenchResults = struct {
     decode_p99_us: u64,
     measured_tokens: u32,
     timestamp_ns: i128,
+    power_source: PowerSource,
+};
+
+const PowerSource = enum {
+    ac,
+    battery,
+    unknown,
+
+    fn label(self: PowerSource) []const u8 {
+        return switch (self) {
+            .ac => "ac",
+            .battery => "battery",
+            .unknown => "unknown",
+        };
+    }
 };
 
 /// Compute aggregate statistics from raw per-token
@@ -300,6 +315,7 @@ fn computeResults(
         .decode_p99_us = p99_us,
         .measured_tokens = measure_count,
         .timestamp_ns = std.time.nanoTimestamp(),
+        .power_source = detectPowerSource(),
     };
 }
 
@@ -320,7 +336,8 @@ fn printSummary(
             "load:    {d:.1} ms\n" ++
             "prefill: {d} tokens  ({d:.1} tok/s)\n" ++
             "decode:  {d} tokens  ({d:.1} tok/s)\n" ++
-            "latency: p50={d} us  p99={d} us\n\n",
+            "latency: p50={d} us  p99={d} us\n" ++
+            "power:   {s}\n\n",
         .{
             r.load_ms,
             prompt_len,
@@ -329,6 +346,7 @@ fn printSummary(
             r.decode_tok_per_sec,
             r.decode_p50_us,
             r.decode_p99_us,
+            r.power_source.label(),
         },
     );
 }
@@ -387,7 +405,8 @@ fn writeJsonResults(
             "  \"prefill_tok_per_sec\": {d:.1},\n" ++
             "  \"decode_tok_per_sec\": {d:.1},\n" ++
             "  \"decode_p50_us\": {d},\n" ++
-            "  \"decode_p99_us\": {d}\n" ++
+            "  \"decode_p99_us\": {d},\n" ++
+            "  \"power_source\": \"{s}\"\n" ++
             "}}\n",
         .{
             ts_str,
@@ -399,6 +418,7 @@ fn writeJsonResults(
             r.decode_tok_per_sec,
             r.decode_p50_us,
             r.decode_p99_us,
+            r.power_source.label(),
         },
     ) catch unreachable;
 
@@ -434,6 +454,43 @@ fn writeJsonResults(
         "Results written to {s}\n",
         .{fname},
     );
+}
+
+// ============================================================
+// Power source detection
+// ============================================================
+
+/// Detect whether the machine is on AC or battery power
+/// by running `pmset -g batt` and parsing the first line.
+/// Returns .unknown if detection fails (e.g. on a desktop
+/// Mac with no battery, or if pmset is unavailable).
+fn detectPowerSource() PowerSource {
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &.{ "/usr/bin/pmset", "-g", "batt" },
+        .max_output_bytes = 4096,
+    }) catch return .unknown;
+
+    const ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return .unknown;
+
+    // First line: "Now drawing from 'AC Power'" or
+    //             "Now drawing from 'Battery Power'".
+    const stdout = result.stdout;
+    if (std.mem.indexOf(u8, stdout, "'AC Power'")) |_| {
+        return .ac;
+    }
+    if (std.mem.indexOf(
+        u8,
+        stdout,
+        "'Battery Power'",
+    )) |_| {
+        return .battery;
+    }
+    return .unknown;
 }
 
 // ============================================================
