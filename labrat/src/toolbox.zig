@@ -98,6 +98,8 @@ const MAX_FUNCTION_NAME: u32 = 256;
 const MAX_PATH_LEN: u32 = 512;
 const MAX_HISTORY_SIZE: usize = 2 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT: usize = 1 * 1024 * 1024;
+const MAX_SHOW_LINES: u32 = 200;
+const MAX_OUTLINE_FUNCTIONS: u32 = 512;
 
 // ============================================================
 // Internal result types
@@ -106,6 +108,13 @@ const MAX_COMMAND_OUTPUT: usize = 1 * 1024 * 1024;
 const FunctionBounds = struct {
     start_line: u32,
     end_line: u32,
+};
+
+/// A function name and its starting line number,
+/// used by show-outline and show-function suggestions.
+const FunctionEntry = struct {
+    name: []const u8,
+    line: u32,
 };
 
 // ============================================================
@@ -594,20 +603,62 @@ fn toolShow(
         return;
     };
     const lines = countLines(content);
-    const escaped = try tools.jsonEscape(
+
+    // Small files: return full content.
+    if (lines <= MAX_SHOW_LINES) {
+        const escaped = try tools.jsonEscape(
+            arena,
+            content,
+        );
+        const json = try std.fmt.allocPrint(
+            arena,
+            "{{\"status\": \"ok\", " ++
+                "\"file\": \"{s}\", " ++
+                "\"lines\": {d}, " ++
+                "\"content\": \"{s}\"}}\n",
+            .{ path, lines, escaped },
+        );
+        std.debug.assert(json.len > 0);
+        try tools.writeStdout(json);
+        return;
+    }
+
+    // Large files: return function outline instead.
+    const entries = collectFunctionNames(
         arena,
         content,
     );
+    var outline: std.ArrayList(u8) = .empty;
+    for (entries) |entry| {
+        const line_str = std.fmt.allocPrint(
+            arena,
+            "L{d} {s}\\n",
+            .{ entry.line, entry.name },
+        ) catch continue;
+        outline.appendSlice(
+            arena,
+            line_str,
+        ) catch break;
+    }
 
     const json = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"ok\", " ++
             "\"file\": \"{s}\", " ++
             "\"lines\": {d}, " ++
-            "\"content\": \"{s}\"}}\n",
-        .{ path, lines, escaped },
+            "\"truncated\": true, " ++
+            "\"outline\": \"{s}\", " ++
+            "\"hint\": \"Large file ({d} lines)." ++
+            " Outline shows function locations." ++
+            " Use run_command with sed -n " ++
+            "'START,ENDp' to read sections.\"}}\n",
+        .{
+            path,
+            lines,
+            outline.items,
+            lines,
+        },
     );
-    std.debug.assert(json.len > 0);
     try tools.writeStdout(json);
 }
 
@@ -676,6 +727,7 @@ fn toolShowFunction(
             arena,
             path,
             function_name,
+            content,
         );
         return;
     }
@@ -695,20 +747,53 @@ fn toolShowFunction(
     );
 }
 
-/// Emit a "function not found" JSON error.
+/// Emit a "function not found" JSON error with a list
+/// of available function names to help the agent
+/// recover without extra tool calls.
 fn writeFunctionNotFound(
     arena: Allocator,
     file: []const u8,
     function_name: []const u8,
+    content: []const u8,
 ) !void {
     std.debug.assert(file.len > 0);
     std.debug.assert(function_name.len > 0);
+
+    const entries = collectFunctionNames(
+        arena,
+        content,
+    );
+
+    // Build a JSON array of available names.
+    var names: std.ArrayList(u8) = .empty;
+    names.appendSlice(arena, "[") catch {};
+    for (entries, 0..) |entry, i| {
+        if (i > 0) {
+            names.appendSlice(
+                arena,
+                ",",
+            ) catch break;
+        }
+        const quoted = std.fmt.allocPrint(
+            arena,
+            "\"{s}\"",
+            .{entry.name},
+        ) catch continue;
+        names.appendSlice(arena, quoted) catch break;
+    }
+    names.appendSlice(arena, "]") catch {};
+
     const json = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"error\", " ++
             "\"error\": \"function '{s}' not " ++
-            "found in {s}\"}}\n",
-        .{ function_name, file },
+            "found in {s}\", " ++
+            "\"available\": {s}}}\n",
+        .{
+            function_name,
+            file,
+            names.items,
+        },
     );
     try tools.writeStdout(json);
 }
@@ -890,6 +975,83 @@ fn countBracesOnLine(
 
     std.debug.assert(current_depth >= -1);
     return current_depth;
+}
+
+/// Collect all function names and their line numbers
+/// from file content.  Detects Zig-style `fn name(`
+/// and Metal-style `kernel void name(` patterns.
+/// Returns at most MAX_OUTLINE_FUNCTIONS entries.
+fn collectFunctionNames(
+    arena: Allocator,
+    content: []const u8,
+) []const FunctionEntry {
+    std.debug.assert(content.len <= tools.MAX_FILE_SIZE);
+
+    var entries: std.ArrayList(FunctionEntry) = .empty;
+    var line_number: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+
+    while (iter.next()) |line| {
+        line_number += 1;
+        if (entries.items.len >= MAX_OUTLINE_FUNCTIONS) {
+            break;
+        }
+
+        const name = extractFunctionName(line) orelse
+            continue;
+        entries.append(arena, .{
+            .name = name,
+            .line = line_number,
+        }) catch break;
+    }
+
+    return entries.items;
+}
+
+/// Extract the function name from a line, if it
+/// contains a function signature.  Returns null if
+/// the line is not a function declaration.
+fn extractFunctionName(line: []const u8) ?[]const u8 {
+    if (line.len < 4) return null;
+
+    // Zig: look for "fn " followed by "(".
+    if (std.mem.indexOf(u8, line, "fn ")) |fn_pos| {
+        const name_start = fn_pos + 3;
+        if (name_start >= line.len) return null;
+        const rest = line[name_start..];
+        const paren = std.mem.indexOfScalar(
+            u8,
+            rest,
+            '(',
+        ) orelse return null;
+        if (paren == 0) return null;
+        return rest[0..paren];
+    }
+
+    // Metal: "kernel void name(" or "kernel half name(".
+    if (std.mem.startsWith(u8, line, "kernel ")) {
+        const after = line[7..];
+        const space = std.mem.indexOfScalar(
+            u8,
+            after,
+            ' ',
+        ) orelse return null;
+        if (space + 1 >= after.len) return null;
+        const name_part = after[space + 1 ..];
+        const paren = std.mem.indexOfScalar(
+            u8,
+            name_part,
+            '(',
+        ) orelse return null;
+        if (paren == 0) return null;
+        return name_part[0..paren];
+    }
+
+    return null;
 }
 
 /// Extract lines [start..end] (1-based, inclusive) from

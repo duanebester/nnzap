@@ -21,6 +21,31 @@ All 71 tests must keep passing.
    - abandon: regression or flat.
 5. STOP when done. Outer loop starts next experiment.
 
+## Turn budget
+
+Be economical with turns. Every turn costs time and
+tokens. Prefer action over exploration:
+
+- The initial context includes a hot-path map with
+  function names and line numbers. Use it.
+- Do NOT read entire large files with show. Use
+  run_command with grep/sed to read specific sections.
+- Make your edit as soon as you understand the target
+  area. Do not read every file first.
+- If check fails, fix it within 2 attempts or abandon.
+
+## Navigation
+
+Use run_command with CLI tools for code navigation:
+
+- Outline: grep -n 'fn ' <file>
+- Read range: sed -n '100,150p' <file>
+- Search: grep -rn 'pattern' nnmetal/src/
+- Find files: find nnmetal/src -name '*.zig'
+
+Use show only for files under ~200 lines.
+Use show_function when you know the exact name.
+
 ## Key files
 
 nnmetal/src/transformer.zig — dispatch, decode loop

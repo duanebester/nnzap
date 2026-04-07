@@ -518,6 +518,20 @@ fn runSingleExperiment(
 
     result.turns = turn + 1;
 
+    // Auto-abandon if the agent exhausted all turns
+    // without calling experiment_finish.  This prevents
+    // dirty experiment branches from piling up.
+    const hit_turn_limit =
+        turn >= config.max_turns_per_experiment;
+    if (hit_turn_limit) {
+        api.log(
+            "  Turn limit reached — " ++
+                "auto-abandoning experiment.\n",
+            .{},
+        );
+        autoAbandonExperiment(config, arena);
+    }
+
     // Save this experiment's conversation log.
     const fs_dir = resolveToFs(
         arena,
@@ -764,11 +778,39 @@ fn injectTurnStatus(
     idx: u32,
     turn: u32,
 ) void {
+    const max = config.max_turns_per_experiment;
+    const current = turn + 1;
+    std.debug.assert(current <= max);
+    const remaining = max - current;
+
+    const label = if (remaining <= 2)
+        std.fmt.allocPrint(
+            arena,
+            "[FINAL: Turn {d}/{d} — call " ++
+                "experiment_finish NOW or changes " ++
+                "will be auto-abandoned]",
+            .{ current, max },
+        ) catch return
+    else if (remaining <= 5)
+        std.fmt.allocPrint(
+            arena,
+            "[Turn {d}/{d} — {d} turns left, " ++
+                "wrap up: test, bench, " ++
+                "experiment_finish]",
+            .{ current, max, remaining },
+        ) catch return
+    else
+        std.fmt.allocPrint(
+            arena,
+            "[Turn {d}/{d}]",
+            .{ current, max },
+        ) catch return;
+
     const status = std.fmt.allocPrint(
         arena,
         ",{{\"type\":\"text\",\"text\":" ++
-            "\"[Turn {d}/{d}]\"}}]}}",
-        .{ turn + 1, config.max_turns_per_experiment },
+            "\"{s}\"}}]}}",
+        .{label},
     ) catch return;
 
     const prev = messages[idx];
@@ -856,6 +898,96 @@ fn printRunSummary(
 // ============================================================
 
 /// Route a tool call via the ToolMapping table.
+/// Auto-abandon an experiment that hit the turn limit.
+/// Calls the toolbox's experiment-finish with abandon
+/// so the history is recorded and the branch is cleaned
+/// up.  If the toolbox call fails (e.g. already on
+/// main), falls back to a direct git reset.
+fn autoAbandonExperiment(
+    config: *const AgentConfig,
+    arena: Allocator,
+) void {
+    const json =
+        "{\"decision\":\"abandon\"," ++
+        "\"summary\":\"Turn limit reached " ++
+        "— auto-abandoned.\"}";
+
+    // Write JSON payload to temp file.
+    const file = std.fs.cwd().createFile(
+        TOOL_INPUT_PATH,
+        .{},
+    ) catch {
+        fallbackGitReset(arena);
+        return;
+    };
+    file.writeAll(json) catch {
+        file.close();
+        fallbackGitReset(arena);
+        return;
+    };
+    file.close();
+
+    const result = callToolbox(
+        config,
+        arena,
+        &.{ "experiment-finish", "-f", TOOL_INPUT_PATH },
+    );
+
+    std.fs.cwd().deleteFile(TOOL_INPUT_PATH) catch {};
+
+    if (result.success) {
+        api.log(
+            "  Auto-abandon succeeded.\n",
+            .{},
+        );
+    } else {
+        api.log(
+            "  Auto-abandon via toolbox failed, " ++
+                "falling back to git reset.\n",
+            .{},
+        );
+        fallbackGitReset(arena);
+    }
+}
+
+/// Direct git reset as a last resort when the toolbox
+/// experiment-finish fails.  Does not record history.
+fn fallbackGitReset(arena: Allocator) void {
+    const result = std.process.Child.run(.{
+        .allocator = arena,
+        .argv = &.{
+            "/bin/sh",
+            "-c",
+            "git reset --hard HEAD && " ++
+                "git checkout main",
+        },
+        .max_output_bytes = 4096,
+    }) catch {
+        api.log(
+            "  WARNING: fallback git reset " ++
+                "also failed.\n",
+            .{},
+        );
+        return;
+    };
+    const ok = switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    if (ok) {
+        api.log(
+            "  Fallback git reset succeeded.\n",
+            .{},
+        );
+    } else {
+        api.log(
+            "  WARNING: fallback git reset " ++
+                "exited with error.\n",
+            .{},
+        );
+    }
+}
+
 pub fn dispatchTool(
     config: *const AgentConfig,
     arena: Allocator,

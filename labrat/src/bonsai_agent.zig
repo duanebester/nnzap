@@ -318,6 +318,8 @@ fn buildBonsaiContext(
         cfg,
     );
     const has_history = history.len > 0;
+    const outline = buildHotPathOutline(arena);
+    const last_bench = loadLastBench(arena);
 
     const rules_section =
         "## Engineering rules (CLAUDE.md)\n\n" ++
@@ -342,22 +344,269 @@ fn buildBonsaiContext(
         "\n\n## Begin\n\n" ++
         "Optimise engine throughput. " ++
         "Start by calling experiment_start " ++
-        "to create an experiment branch, then " ++
-        "read the source code to understand " ++
-        "the baseline.";
+        "to create an experiment branch. The " ++
+        "hot-path map above shows function " ++
+        "names and line numbers — use " ++
+        "run_command with sed/grep to read " ++
+        "specific sections.";
 
     return std.fmt.allocPrint(
         arena,
-        "{s}\n{s}{s}\n\n{s}{s}{s}",
+        "{s}\n{s}{s}\n\n{s}{s}{s}{s}{s}",
         .{
             orientation,
             rules_section,
             rules,
             hist_section,
             if (has_history) history else "",
+            outline,
+            last_bench,
             suffix,
         },
     ) catch "Begin optimising.";
+}
+
+// ============================================================
+// Hot-path outline builder
+// ============================================================
+
+/// Build a compact function outline of the hot-path
+/// source files.  Scans for `fn ` (Zig) and `kernel `
+/// (Metal) patterns.  Returns a formatted string like:
+///
+///   ## Hot-path map
+///
+///   ### transformer.zig (5982 lines)
+///   L54   pub fn TransformerConfig
+///   L398  pub fn init
+///   ...
+fn buildHotPathOutline(arena: Allocator) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(
+        arena,
+        "\n## Hot-path map\n\n" ++
+            "Function names and line numbers for " ++
+            "the engine hot path. Use run_command " ++
+            "with sed to read specific functions.\n",
+    ) catch return "";
+
+    for (CODE_CONTEXT_FILES) |rel_path| {
+        appendFileOutline(
+            arena,
+            &buf,
+            rel_path,
+        );
+    }
+
+    return buf.items;
+}
+
+/// Append a single file's function outline to buf.
+fn appendFileOutline(
+    arena: Allocator,
+    buf: *std.ArrayList(u8),
+    rel_path: []const u8,
+) void {
+    const fs_path = core.resolveToFs(
+        arena,
+        rel_path,
+    ) orelse return;
+    const content = std.fs.cwd().readFileAlloc(
+        arena,
+        fs_path,
+        MAX_FILE_SIZE,
+    ) catch return;
+    if (content.len == 0) return;
+
+    // Count lines.
+    var line_count: u32 = 0;
+    for (content) |c| {
+        if (c == '\n') line_count += 1;
+    }
+    if (content.len > 0 and
+        content[content.len - 1] != '\n')
+    {
+        line_count += 1;
+    }
+
+    // Extract short filename for the header.
+    const short_name = shortName(rel_path);
+    buf.appendSlice(arena, "\n### ") catch return;
+    buf.appendSlice(arena, short_name) catch return;
+    const header_suffix = std.fmt.allocPrint(
+        arena,
+        " ({d} lines)\n",
+        .{line_count},
+    ) catch return;
+    buf.appendSlice(arena, header_suffix) catch return;
+
+    // Scan for function signatures.
+    var line_number: u32 = 0;
+    var iter = std.mem.splitScalar(
+        u8,
+        content,
+        '\n',
+    );
+    while (iter.next()) |line| {
+        line_number += 1;
+        appendFunctionLine(
+            arena,
+            buf,
+            line,
+            line_number,
+        );
+    }
+}
+
+/// If line contains a function signature, append a
+/// formatted outline entry to buf.
+fn appendFunctionLine(
+    arena: Allocator,
+    buf: *std.ArrayList(u8),
+    line: []const u8,
+    line_number: u32,
+) void {
+    // Skip blank or very short lines.
+    if (line.len < 4) return;
+
+    // Zig: look for "fn " in the line.
+    if (std.mem.indexOf(u8, line, "fn ")) |fn_pos| {
+        // Extract "pub fn name" or "fn name".
+        const is_pub = fn_pos >= 4 and
+            std.mem.eql(
+                u8,
+                line[fn_pos - 4 .. fn_pos],
+                "pub ",
+            );
+        const name_start = fn_pos + 3;
+        const rest = line[name_start..];
+        const name_end = std.mem.indexOfScalar(
+            u8,
+            rest,
+            '(',
+        ) orelse return;
+        if (name_end == 0) return;
+        const name = rest[0..name_end];
+
+        const entry = std.fmt.allocPrint(
+            arena,
+            "  L{d:<5} {s}fn {s}\n",
+            .{
+                line_number,
+                if (is_pub)
+                    @as([]const u8, "pub ")
+                else
+                    @as([]const u8, ""),
+                name,
+            },
+        ) catch return;
+        buf.appendSlice(arena, entry) catch {};
+        return;
+    }
+
+    // Metal: look for "kernel " at start of line.
+    if (std.mem.startsWith(u8, line, "kernel ")) {
+        // Pattern: "kernel void name(" or similar.
+        const after_kernel = line[7..];
+        // Skip return type (usually "void ").
+        const space_pos = std.mem.indexOfScalar(
+            u8,
+            after_kernel,
+            ' ',
+        ) orelse return;
+        const name_part =
+            after_kernel[space_pos + 1 ..];
+        const paren_pos = std.mem.indexOfScalar(
+            u8,
+            name_part,
+            '(',
+        ) orelse return;
+        if (paren_pos == 0) return;
+        const name = name_part[0..paren_pos];
+
+        const entry = std.fmt.allocPrint(
+            arena,
+            "  L{d:<5} kernel {s}\n",
+            .{ line_number, name },
+        ) catch return;
+        buf.appendSlice(arena, entry) catch {};
+    }
+}
+
+/// Extract the short filename from a path like
+/// "nnmetal/src/shaders/transformer.metal" →
+/// "shaders/transformer.metal" or "transformer.zig".
+fn shortName(path: []const u8) []const u8 {
+    // Try to find "src/" and return everything after.
+    if (std.mem.indexOf(u8, path, "src/")) |pos| {
+        return path[pos + 4 ..];
+    }
+    // Fallback: return the last path component.
+    if (std.mem.lastIndexOfScalar(
+        u8,
+        path,
+        '/',
+    )) |pos| {
+        return path[pos + 1 ..];
+    }
+    return path;
+}
+
+// ============================================================
+// Last benchmark loader
+// ============================================================
+
+/// Load the last benchmark result from the history
+/// directory, if available.  Returns a short summary
+/// string, or empty string if no bench found.
+fn loadLastBench(arena: Allocator) []const u8 {
+    const bench_path = core.resolveToFs(
+        arena,
+        HISTORY_DIR ++ "/_last_bench.json",
+    ) orelse return "";
+    const raw = std.fs.cwd().readFileAlloc(
+        arena,
+        bench_path,
+        64 * 1024,
+    ) catch return "";
+    if (raw.len == 0) return "";
+
+    // Parse and extract key metrics.
+    const parsed = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        raw,
+        .{},
+    ) catch return "";
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return "",
+    };
+
+    const decode = core.getNumStr(
+        arena,
+        obj,
+        "decode_tok_per_sec",
+    );
+    const prefill = core.getNumStr(
+        arena,
+        obj,
+        "prefill_tok_per_sec",
+    );
+    const p99 = core.getNumStr(
+        arena,
+        obj,
+        "decode_p99_us",
+    );
+
+    return std.fmt.allocPrint(
+        arena,
+        "\n## Last benchmark\n\n" ++
+            "decode: {s} tok/s | prefill: {s} tok/s" ++
+            " | p99: {s} us\n" ++
+            "Target: 224 tok/s\n",
+        .{ decode, prefill, p99 },
+    ) catch "";
 }
 
 // ============================================================
