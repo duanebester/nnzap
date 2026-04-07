@@ -1131,7 +1131,8 @@ fn dispatchQMVFusedPairSiLUf16io(
     // buffer(7): QMVDims.
     metal.setBytes(encoder, QMVDims, &dims, 7);
 
-    const rows_per_tg: u32 = 32;
+    // 1 row per simdgroup × 16 simdgroups = 16 rows/TG.
+    const rows_per_tg: u32 = 16;
     const threadgroups = (dims.M + rows_per_tg - 1) /
         rows_per_tg;
     const grid = metal.MTLSize{
