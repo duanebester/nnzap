@@ -135,6 +135,31 @@ pub fn build(b: *std.Build) void {
         run_bonsai_bench_cmd.addArgs(args);
     }
 
+    // ── Bonsai 1.7B golden output test ────────────────────────────────
+    const bonsai_golden = b.addExecutable(.{
+        .name = "bonsai_golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/bonsai_golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nn", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(bonsai_golden);
+
+    const run_bonsai_golden_step = b.step(
+        "run-bonsai-golden",
+        "Run the Bonsai 1.7B golden output test",
+    );
+    const run_bonsai_golden_cmd = b.addRunArtifact(bonsai_golden);
+    run_bonsai_golden_step.dependOn(&run_bonsai_golden_cmd.step);
+    run_bonsai_golden_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_bonsai_golden_cmd.addArgs(args);
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────
     const mod_tests = b.addTest(.{
         .root_module = mod,

@@ -101,8 +101,13 @@ const bonsai_tools = [_]core.ToolDef{
     .{
         .name = "test",
         .subcommand = "test",
-        .description = "Run full test suite for " ++
-            "numerical correctness. STOP if this " ++
+        .description = "Run golden output test: " ++
+            "loads the real Bonsai 1.7B model, " ++
+            "generates from a known prompt with " ++
+            "greedy decoding, and checks that " ++
+            "output tokens match a hardcoded " ++
+            "expected sequence. Tests the ENTIRE " ++
+            "pipeline end-to-end. STOP if this " ++
             "fails.",
     },
     .{

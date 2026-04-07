@@ -37,7 +37,12 @@ const config = toolbox.ToolboxConfig{
         "nnmetal/build.zig.zon",
     },
     .check_command = &.{ "zig", "build" },
-    .test_command = &.{ "zig", "build", "test" },
+    .test_command = &.{
+        "zig",
+        "build",
+        "run-bonsai-golden",
+        "-Doptimize=ReleaseFast",
+    },
     .bench_command = &.{
         "zig",
         "build",
