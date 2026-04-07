@@ -130,5 +130,22 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── Tests ─────────────────────────────────────────────────────────
-    // (No library tests — these are standalone CLI tools)
+    const toolbox_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/toolbox.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "tools.zig", .module = tools_module },
+            },
+        }),
+    });
+    const run_toolbox_tests = b.addRunArtifact(
+        toolbox_tests,
+    );
+    const test_step = b.step(
+        "test",
+        "Run toolbox unit tests",
+    );
+    test_step.dependOn(&run_toolbox_tests.step);
 }

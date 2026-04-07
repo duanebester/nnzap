@@ -102,8 +102,6 @@ kernel void qmv_spec_f16io(
     device const uint32_t* bits32_r1 =
         (device const uint32_t*)(packed_bits + base1);
 
-    // Prevent full unrolling to preserve GPU occupancy.
-    #pragma clang loop unroll(disable)
     for (uint w = 0; w < words_per_lane; w++) {
         const uint32_t w0 =
             row0_valid ? bits32_r0[w] : 0;
@@ -148,7 +146,6 @@ kernel void qmv_spec_f16io(
 
     // Tail loop for when bytes_per_lane % 4 != 0.
     // Dead code when constexpr tail_bytes == 0 (e.g. K=2048).
-    #pragma clang loop unroll(disable)
     for (uint b = words_per_lane * 4;
          b < bytes_per_lane; b++) {
         const uint ci = col_start + b * 8;
@@ -266,8 +263,6 @@ kernel void qmv_spec_f16io_resadd(
     device const uint32_t* bits32_r1 =
         (device const uint32_t*)(packed_bits + base1);
 
-    // Prevent full unrolling to preserve GPU occupancy.
-    #pragma clang loop unroll(disable)
     for (uint w = 0; w < words_per_lane; w++) {
         const uint32_t w0 =
             row0_valid ? bits32_r0[w] : 0;
@@ -311,7 +306,6 @@ kernel void qmv_spec_f16io_resadd(
     }
 
     // Tail loop — dead code when constexpr tail_bytes == 0.
-    #pragma clang loop unroll(disable)
     for (uint b = words_per_lane * 4;
          b < bytes_per_lane; b++) {
         const uint ci = col_start + b * 8;
@@ -441,8 +435,6 @@ kernel void qmv_spec_fused_pair_f16io(
     device const uint32_t* w32_b1 =
         (device const uint32_t*)(packed_b + base_b1);
 
-    // Prevent full unrolling to preserve GPU occupancy.
-    #pragma clang loop unroll(disable)
     for (uint w = 0; w < words_per_lane; w++) {
         const uint32_t wa0 =
             row0_valid ? w32_a0[w] : 0;
@@ -506,7 +498,6 @@ kernel void qmv_spec_fused_pair_f16io(
     }
 
     // Tail bytes — dead code when constexpr tail_bytes == 0.
-    #pragma clang loop unroll(disable)
     for (uint b = words_per_lane * 4;
          b < bytes_per_lane; b++) {
         const uint ci = col_start + b * 8;
@@ -652,8 +643,6 @@ kernel void qmv_spec_f16in(
     device const uint32_t* bits32_r1 =
         (device const uint32_t*)(packed_bits + base1);
 
-    // Prevent full unrolling to preserve GPU occupancy.
-    #pragma clang loop unroll(disable)
     for (uint w = 0; w < words_per_lane; w++) {
         const uint32_t w0 =
             row0_valid ? bits32_r0[w] : 0;
@@ -697,7 +686,6 @@ kernel void qmv_spec_f16in(
     }
 
     // Tail loop — dead code when constexpr tail_bytes == 0.
-    #pragma clang loop unroll(disable)
     for (uint b = words_per_lane * 4;
          b < bytes_per_lane; b++) {
         const uint ci = col_start + b * 8;
@@ -961,7 +949,6 @@ kernel void qmv_spec_fused_pair_silu_f16io(
     device const uint32_t* w32_b1 =
         (device const uint32_t*)(packed_b + base_b1);
 
-    #pragma clang loop unroll(disable)
     for (uint w = 0; w < words_per_lane; w++) {
         const uint32_t wa0 = row0_valid ? w32_a0[w] : 0;
         const uint32_t wb0 = row0_valid ? w32_b0[w] : 0;
@@ -1019,7 +1006,6 @@ kernel void qmv_spec_fused_pair_silu_f16io(
     }
 
     // Tail bytes — dead code when bytes_per_lane % 4 == 0.
-    #pragma clang loop unroll(disable)
     for (uint b = words_per_lane * 4; b < bytes_per_lane; b++) {
         const uint ci = col_start + b * 8;
         const float x0 = float(input[ci]);

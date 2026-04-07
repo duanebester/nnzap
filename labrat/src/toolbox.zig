@@ -2098,3 +2098,586 @@ fn isAllowedWritePath(
     }
     return false;
 }
+
+// ============================================================
+// Tests
+//
+// These tests verify the function-finding and brace-
+// counting logic used by show-function, and document
+// known gaps that cause the agent to waste turns.
+// ============================================================
+
+// ------------------------------------------------------------
+// countBracesOnLine — basic correctness
+// ------------------------------------------------------------
+
+test "countBracesOnLine: opening brace increments" {
+    const depth = countBracesOnLine(
+        "fn foo() void {",
+        0,
+    );
+    try std.testing.expectEqual(@as(i32, 1), depth);
+}
+
+test "countBracesOnLine: closing brace decrements" {
+    const depth = countBracesOnLine("}", 1);
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}
+
+test "countBracesOnLine: balanced braces on one line" {
+    // `if (x) { y; }` has one open and one close.
+    const depth = countBracesOnLine(
+        "    if (x) { y; }",
+        1,
+    );
+    try std.testing.expectEqual(@as(i32, 1), depth);
+}
+
+test "countBracesOnLine: braces inside strings ignored" {
+    const depth = countBracesOnLine(
+        "    const s = \"}\";",
+        1,
+    );
+    try std.testing.expectEqual(@as(i32, 1), depth);
+}
+
+test "countBracesOnLine: escaped quote in string" {
+    // String: "hello \"world\" {" — brace is inside.
+    const depth = countBracesOnLine(
+        \\    const s = "hello \"world\" {";
+    ,
+        0,
+    );
+    // The brace is inside the string, so depth stays 0.
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}
+
+// ------------------------------------------------------------
+// countBracesOnLine — known bug: comments not handled
+//
+// Braces in single-line comments are counted as real
+// braces.  This causes scanForFunction to misidentify
+// function boundaries when comments contain braces.
+// ------------------------------------------------------------
+
+test "countBracesOnLine: BUG — brace in comment counted" {
+    // A closing brace in a comment should not decrement
+    // depth, but the current implementation counts it.
+    const depth = countBracesOnLine(
+        "    // closing brace }",
+        1,
+    );
+    // BUG: should be 1 (brace is in a comment), but
+    // the parser returns 0 because it doesn't skip
+    // comments.
+    try std.testing.expectEqual(@as(i32, 0), depth);
+}
+
+test "countBracesOnLine: BUG — open brace in comment counted" {
+    const depth = countBracesOnLine(
+        "    // see note about {",
+        1,
+    );
+    // BUG: should be 1, but reports 2.
+    try std.testing.expectEqual(@as(i32, 2), depth);
+}
+
+test "countBracesOnLine: BUG — Metal block comment braces" {
+    // Metal shaders use /* */ comments.
+    const depth = countBracesOnLine(
+        "    /* threadgroup buffer { shared } */",
+        1,
+    );
+    // BUG: should be 1 (braces are in a comment).
+    // The { and } cancel out, so depth happens to stay
+    // 1 by accident.  But unbalanced braces in block
+    // comments would fail.
+    try std.testing.expectEqual(@as(i32, 1), depth);
+}
+
+test "countBracesOnLine: BUG — unbalanced brace in block comment" {
+    const depth = countBracesOnLine(
+        "    /* see { for details */",
+        1,
+    );
+    // BUG: should be 1, but reports 2.
+    try std.testing.expectEqual(@as(i32, 2), depth);
+}
+
+test "countBracesOnLine: BUG — char literal brace counted" {
+    // Zig char literal: '{' should not count.
+    const depth = countBracesOnLine(
+        "    const c = '{';",
+        0,
+    );
+    // BUG: should be 0 (brace is a char literal), but
+    // the parser doesn't handle single-quote literals.
+    // The ' doesn't toggle any state, so { is counted.
+    try std.testing.expectEqual(@as(i32, 1), depth);
+}
+
+// ------------------------------------------------------------
+// scanForFunction — basic correctness
+// ------------------------------------------------------------
+
+test "scanForFunction: single-line Zig function" {
+    const content =
+        \\const x = 1;
+        \\
+        \\fn hello() void {
+        \\    return;
+        \\}
+    ;
+    const bounds = scanForFunction(content, "fn hello(");
+    try std.testing.expect(bounds != null);
+    try std.testing.expectEqual(
+        @as(u32, 3),
+        bounds.?.start_line,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 5),
+        bounds.?.end_line,
+    );
+}
+
+test "scanForFunction: multi-line signature" {
+    const content =
+        \\fn configure(
+        \\    width: u32,
+        \\    height: u32,
+        \\) void {
+        \\    _ = width;
+        \\    _ = height;
+        \\}
+    ;
+    const bounds = scanForFunction(
+        content,
+        "fn configure(",
+    );
+    try std.testing.expect(bounds != null);
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        bounds.?.start_line,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 7),
+        bounds.?.end_line,
+    );
+}
+
+test "scanForFunction: nested braces in body" {
+    const content =
+        \\fn process(items: []const u8) u32 {
+        \\    var count: u32 = 0;
+        \\    for (items) |item| {
+        \\        if (item > 0) {
+        \\            count += 1;
+        \\        }
+        \\    }
+        \\    return count;
+        \\}
+    ;
+    const bounds = scanForFunction(
+        content,
+        "fn process(",
+    );
+    try std.testing.expect(bounds != null);
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        bounds.?.start_line,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 9),
+        bounds.?.end_line,
+    );
+}
+
+test "scanForFunction: second function in file" {
+    const content =
+        \\fn first() void {
+        \\    return;
+        \\}
+        \\
+        \\fn second() u32 {
+        \\    return 42;
+        \\}
+    ;
+    const bounds = scanForFunction(
+        content,
+        "fn second(",
+    );
+    try std.testing.expect(bounds != null);
+    try std.testing.expectEqual(
+        @as(u32, 5),
+        bounds.?.start_line,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 7),
+        bounds.?.end_line,
+    );
+}
+
+test "scanForFunction: pattern not found" {
+    const content =
+        \\fn hello() void {
+        \\    return;
+        \\}
+    ;
+    const bounds = scanForFunction(
+        content,
+        "fn goodbye(",
+    );
+    try std.testing.expect(bounds == null);
+}
+
+// ------------------------------------------------------------
+// scanForFunction — known bug: comment braces break bounds
+//
+// Because countBracesOnLine doesn't skip comments, a
+// closing brace in a comment prematurely terminates
+// the function.  This is the root cause of incorrect
+// show-function output for functions with brace-
+// containing comments.
+// ------------------------------------------------------------
+
+test "scanForFunction: BUG — comment with closing brace truncates function" {
+    // A function whose body contains a comment with }.
+    // The parser sees the } in the comment and thinks
+    // the function ended early.
+    const content =
+        \\fn render(self: *Self) void {
+        \\    // Note: see closing brace }
+        \\    self.draw();
+        \\    self.present();
+        \\}
+    ;
+    const bounds = scanForFunction(
+        content,
+        "fn render(",
+    );
+    try std.testing.expect(bounds != null);
+    // BUG: should be end_line=5 (the real closing brace)
+    // but the comment } on line 2 brings depth to 0,
+    // so the parser reports end_line=2.
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        bounds.?.end_line,
+    );
+}
+
+test "scanForFunction: BUG — comment with open brace extends function" {
+    // A comment with { pushes depth up.  The real
+    // closing brace only brings depth to 1 instead of
+    // 0, so the function appears to extend past its
+    // actual end into the next function.
+    const content =
+        \\fn alpha() void {
+        \\    // TODO: refactor { this block
+        \\    doStuff();
+        \\}
+        \\
+        \\fn beta() void {
+        \\    return;
+        \\}
+    ;
+    const bounds = scanForFunction(
+        content,
+        "fn alpha(",
+    );
+    try std.testing.expect(bounds != null);
+    // BUG: should be end_line=4.  The comment { on
+    // line 2 increments depth to 2, so the real } on
+    // line 4 only drops to 1.  The parser continues
+    // into beta() and terminates when beta's } brings
+    // depth to 0 — reporting end_line=8.
+    try std.testing.expectEqual(
+        @as(u32, 8),
+        bounds.?.end_line,
+    );
+}
+
+// ------------------------------------------------------------
+// findFunctionBounds — Zig and Metal dispatch
+// ------------------------------------------------------------
+
+test "findFunctionBounds: pub fn found" {
+    const content =
+        \\pub fn forwardDecode(self: *Self) void {
+        \\    self.embed();
+        \\    self.blocks();
+        \\}
+    ;
+    const bounds = findFunctionBounds(
+        content,
+        "forwardDecode",
+    );
+    try std.testing.expect(bounds != null);
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        bounds.?.start_line,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 4),
+        bounds.?.end_line,
+    );
+}
+
+test "findFunctionBounds: private fn found" {
+    const content =
+        \\fn helper(x: u32) u32 {
+        \\    return x + 1;
+        \\}
+    ;
+    const bounds = findFunctionBounds(content, "helper");
+    try std.testing.expect(bounds != null);
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        bounds.?.start_line,
+    );
+}
+
+test "findFunctionBounds: Metal kernel found via C fallback" {
+    const content =
+        \\#include <metal_stdlib>
+        \\
+        \\kernel void myKernel(
+        \\    device float* out [[buffer(0)]],
+        \\    uint tid [[thread_position_in_grid]]
+        \\) {
+        \\    out[tid] = 1.0;
+        \\}
+    ;
+    const bounds = findFunctionBounds(
+        content,
+        "myKernel",
+    );
+    try std.testing.expect(bounds != null);
+    try std.testing.expectEqual(
+        @as(u32, 3),
+        bounds.?.start_line,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 8),
+        bounds.?.end_line,
+    );
+}
+
+test "findFunctionBounds: empty name returns null" {
+    const content =
+        \\fn hello() void {
+        \\    return;
+        \\}
+    ;
+    const bounds = findFunctionBounds(content, "");
+    try std.testing.expect(bounds == null);
+}
+
+test "findFunctionBounds: nonexistent name returns null" {
+    const content =
+        \\fn hello() void {
+        \\    return;
+        \\}
+    ;
+    const bounds = findFunctionBounds(
+        content,
+        "goodbye",
+    );
+    try std.testing.expect(bounds == null);
+}
+
+// ------------------------------------------------------------
+// findFunctionBounds — known gap: no fuzzy/substring match
+//
+// The agent tried show_function with "decodeOneToken"
+// and "generate" when the actual functions were
+// "forwardDecode" and "forwardBlock".  All three calls
+// returned null with no suggestions — the agent then
+// spent 5+ turns doing manual sed/grep to find the
+// right names.
+// ------------------------------------------------------------
+
+test "findFunctionBounds: GAP — substring does not match" {
+    const content =
+        \\pub fn forwardDecode(self: *Self) void {
+        \\    self.embed();
+        \\}
+        \\
+        \\pub fn forwardBlock(self: *Self, i: u32) void {
+        \\    _ = i;
+        \\    self.attn();
+        \\}
+    ;
+
+    // Exact name works.
+    const exact = findFunctionBounds(
+        content,
+        "forwardDecode",
+    );
+    try std.testing.expect(exact != null);
+
+    // Substring "decode" does not match "forwardDecode".
+    const sub = findFunctionBounds(content, "decode");
+    try std.testing.expect(sub == null);
+
+    // Substring "forward" does not match either.
+    const prefix = findFunctionBounds(
+        content,
+        "forward",
+    );
+    try std.testing.expect(prefix == null);
+}
+
+test "findFunctionBounds: GAP — wrong name no suggestions" {
+    // The agent guessed "decodeOneToken" — a plausible
+    // name that doesn't exist.  The tool returned null
+    // with no indication of what names DO exist.
+    const content =
+        \\pub fn forwardDecode(self: *Self) void {
+        \\    self.embed();
+        \\}
+    ;
+    const wrong = findFunctionBounds(
+        content,
+        "decodeOneToken",
+    );
+    try std.testing.expect(wrong == null);
+
+    const also_wrong = findFunctionBounds(
+        content,
+        "generate",
+    );
+    try std.testing.expect(also_wrong == null);
+}
+
+// ------------------------------------------------------------
+// countLines
+// ------------------------------------------------------------
+
+test "countLines: empty content" {
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        countLines(""),
+    );
+}
+
+test "countLines: single line no trailing newline" {
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        countLines("hello"),
+    );
+}
+
+test "countLines: single line with trailing newline" {
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        countLines("hello\n"),
+    );
+}
+
+test "countLines: multiple lines" {
+    try std.testing.expectEqual(
+        @as(u32, 3),
+        countLines("a\nb\nc\n"),
+    );
+}
+
+test "countLines: no trailing newline counts last line" {
+    try std.testing.expectEqual(
+        @as(u32, 3),
+        countLines("a\nb\nc"),
+    );
+}
+
+// ------------------------------------------------------------
+// extractLineRange
+// ------------------------------------------------------------
+
+test "extractLineRange: single line" {
+    var arena_state = std.heap.ArenaAllocator.init(
+        std.testing.allocator,
+    );
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const content = "line1\nline2\nline3\nline4\n";
+    const result = extractLineRange(
+        arena,
+        content,
+        2,
+        2,
+    );
+    try std.testing.expectEqualStrings(
+        "line2",
+        result,
+    );
+}
+
+test "extractLineRange: multi-line range" {
+    var arena_state = std.heap.ArenaAllocator.init(
+        std.testing.allocator,
+    );
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const content = "aaa\nbbb\nccc\nddd\neee\n";
+    const result = extractLineRange(
+        arena,
+        content,
+        2,
+        4,
+    );
+    try std.testing.expectEqualStrings(
+        "bbb\nccc\nddd",
+        result,
+    );
+}
+
+test "extractLineRange: first line" {
+    var arena_state = std.heap.ArenaAllocator.init(
+        std.testing.allocator,
+    );
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const content = "first\nsecond\nthird\n";
+    const result = extractLineRange(
+        arena,
+        content,
+        1,
+        1,
+    );
+    try std.testing.expectEqualStrings(
+        "first",
+        result,
+    );
+}
+
+// ------------------------------------------------------------
+// toolShow — known gap: no size guard
+//
+// toolShow returns the entire file content regardless
+// of size.  For transformer.zig (5982 lines, ~185 KB),
+// the agent received a 185 KB JSON blob with no line
+// numbers and no outline — then spent 10+ turns doing
+// manual sed to navigate.  These tests document that
+// countLines imposes no cap and there is no truncation
+// threshold.
+// ------------------------------------------------------------
+
+test "countLines: large file has no cap" {
+    // Simulate a 6000-line file.  countLines reports the
+    // count faithfully — there is no threshold where
+    // toolShow would switch to an outline.
+    const line = "const x = 42;\n";
+    const count: u32 = 6000;
+    var buf: [6000 * 14]u8 = undefined;
+    var offset: usize = 0;
+    for (0..count) |_| {
+        @memcpy(buf[offset..][0..line.len], line);
+        offset += line.len;
+    }
+    const result = countLines(buf[0..offset]);
+    try std.testing.expectEqual(count, result);
+    // No truncation, no outline mode — the full
+    // content would be JSON-escaped and returned.
+}
