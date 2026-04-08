@@ -1030,3 +1030,201 @@ kernel void qmv_spec_fused_pair_silu_f16io(
         }
     }
 }
+
+// ====================================================================
+// Kernel 7: qmv_spec_fused_norm_pair_silu_f16io
+// ====================================================================
+/// Fused FFN-RMSNorm + gate/up projection + SiLU activation.
+/// Reads the f32 residual and f16 norm_scale directly, computes
+/// RMSNorm cooperatively in threadgroup memory, then performs
+/// the gate+up QMV with SiLU.  Eliminates 1 dispatch + 1 barrier
+/// per block vs the separate RMSNorm → gate+up+SiLU path.
+///
+/// Uses padded threadgroup stride (cols_per_lane + 2) to avoid
+/// bank conflicts when 32 lanes read from TG memory.
+///
+/// Dispatch: threadgroups = ceil(M / 16), threads = 512.
+kernel void qmv_spec_fused_norm_pair_silu_f16io(
+    device const uint8_t* packed_a   [[buffer(0)]],
+    device const half*    scales_a   [[buffer(1)]],
+    device const float*   residual   [[buffer(2)]],
+    device half*          output     [[buffer(3)]],
+    device const uint8_t* packed_b   [[buffer(4)]],
+    device const half*    scales_b   [[buffer(5)]],
+    device const half*    norm_scale [[buffer(6)]],
+    constant QMVDims&     dims       [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint K = SPEC_HIDDEN_K;
+    constexpr uint group_size = SPEC_GS;
+    static_assert(K % 32 == 0, "K must be SIMD-aligned.");
+    static_assert(K % group_size == 0, "K must be group-aligned.");
+    static_assert(K / 32 <= group_size, "Single-group requirement.");
+    static_assert(K <= 4096, "K must fit in threadgroup memory.");
+    const uint M = dims.M;
+
+    constexpr uint cols_per_lane = K / 32;
+    // Pad stride by 2 so adjacent lanes hit different TG memory
+    // banks: bank = ((lane * stride) / 2) % 32 = lane when
+    // stride is odd after dividing by 2 (66/2 = 33, gcd(33,32)=1).
+    constexpr uint padded_stride = cols_per_lane + 2;
+    constexpr uint groups_per_row = K / group_size;
+    constexpr uint bytes_per_lane = cols_per_lane / 8;
+    constexpr uint bytes_per_row = K / 8;
+    constexpr uint words_per_lane = bytes_per_lane / 4;
+    constexpr uint elems_per_thread = K / 512;
+
+    static_assert(K % 512 == 0,
+        "K must be divisible by 512 for cooperative load.");
+
+    // TG memory: padded normalized input + reduction scratch.
+    threadgroup half tg_input[32 * padded_stride];
+    threadgroup float tg_reduce[16];
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+
+    // ── Phase 1: Cooperative RMSNorm ────────────────────────
+    // Each thread sums squares of its share of the residual.
+    float partial_sos = 0.0f;
+    for (uint j = 0; j < elems_per_thread; j++) {
+        const float v = residual[tid * elems_per_thread + j];
+        partial_sos += v * v;
+    }
+    // Reduce within simdgroup, then across simdgroups.
+    partial_sos = simd_sum(partial_sos);
+    if (lane == 0) {
+        tg_reduce[simdgroup_idx] = partial_sos;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // First simdgroup reduces the 16 partial sums.
+    if (simdgroup_idx == 0) {
+        const float v = (lane < 16)
+            ? tg_reduce[lane] : 0.0f;
+        const float total = simd_sum(v);
+        if (lane == 0) {
+            tg_reduce[0] = rsqrt(
+                total / float(K) + 1e-6f
+            );
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv = tg_reduce[0];
+
+    // ── Phase 2: Normalize and store f16 to TG memory ───────
+    // Each thread normalizes its elements and writes them to
+    // the padded TG layout for bank-conflict-free QMV reads.
+    for (uint j = 0; j < elems_per_thread; j++) {
+        const uint elem = tid * elems_per_thread + j;
+        const float val = residual[elem] * rms_inv
+            * float(norm_scale[elem]);
+        const uint qmv_lane = elem / cols_per_lane;
+        const uint lane_off = elem % cols_per_lane;
+        tg_input[qmv_lane * padded_stride + lane_off] =
+            half(val);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 3: Gate+Up QMV with SiLU from TG memory ──────
+    const uint row = tgid * 16 + simdgroup_idx;
+    const uint col_byte_off = lane * bytes_per_lane;
+    const uint grp = (lane * cols_per_lane) / group_size;
+    const uint tg_base = lane * padded_stride;
+
+    float sig_gate = 0.0f;
+    float sig_up = 0.0f;
+    const bool row_valid = row < M;
+    const uint base_a = row * bytes_per_row + col_byte_off;
+    const uint base_b = row * bytes_per_row + col_byte_off;
+
+    device const uint32_t* w32_a =
+        (device const uint32_t*)(packed_a + base_a);
+    device const uint32_t* w32_b =
+        (device const uint32_t*)(packed_b + base_b);
+
+    for (uint w = 0; w < words_per_lane; w++) {
+        const uint32_t wa = row_valid ? w32_a[w] : 0;
+        const uint32_t wb = row_valid ? w32_b[w] : 0;
+
+        for (uint bi = 0; bi < 4; bi++) {
+            const uint lo = w * 32 + bi * 8;
+            const float x0 = float(tg_input[tg_base + lo]);
+            const float x1 = float(tg_input[tg_base+lo+1]);
+            const float x2 = float(tg_input[tg_base+lo+2]);
+            const float x3 = float(tg_input[tg_base+lo+3]);
+            const float x4 = float(tg_input[tg_base+lo+4]);
+            const float x5 = float(tg_input[tg_base+lo+5]);
+            const float x6 = float(tg_input[tg_base+lo+6]);
+            const float x7 = float(tg_input[tg_base+lo+7]);
+            const uint sh = bi * 8;
+            const uint ba = (wa >> sh) & 0xFFu;
+            const uint bb = (wb >> sh) & 0xFFu;
+            sig_gate += select(-x0, x0, bool(ba & 1));
+            sig_gate += select(-x1, x1, bool(ba & 2));
+            sig_gate += select(-x2, x2, bool(ba & 4));
+            sig_gate += select(-x3, x3, bool(ba & 8));
+            sig_gate += select(-x4, x4, bool(ba & 16));
+            sig_gate += select(-x5, x5, bool(ba & 32));
+            sig_gate += select(-x6, x6, bool(ba & 64));
+            sig_gate += select(-x7, x7, bool(ba & 128));
+            sig_up += select(-x0, x0, bool(bb & 1));
+            sig_up += select(-x1, x1, bool(bb & 2));
+            sig_up += select(-x2, x2, bool(bb & 4));
+            sig_up += select(-x3, x3, bool(bb & 8));
+            sig_up += select(-x4, x4, bool(bb & 16));
+            sig_up += select(-x5, x5, bool(bb & 32));
+            sig_up += select(-x6, x6, bool(bb & 64));
+            sig_up += select(-x7, x7, bool(bb & 128));
+        }
+    }
+
+    // Tail bytes — dead code when bytes_per_lane % 4 == 0.
+    for (uint b = words_per_lane * 4;
+         b < bytes_per_lane; b++)
+    {
+        const uint lo = b * 8;
+        const float x0 = float(tg_input[tg_base + lo]);
+        const float x1 = float(tg_input[tg_base+lo+1]);
+        const float x2 = float(tg_input[tg_base+lo+2]);
+        const float x3 = float(tg_input[tg_base+lo+3]);
+        const float x4 = float(tg_input[tg_base+lo+4]);
+        const float x5 = float(tg_input[tg_base+lo+5]);
+        const float x6 = float(tg_input[tg_base+lo+6]);
+        const float x7 = float(tg_input[tg_base+lo+7]);
+        if (row_valid) {
+            const uint bva = packed_a[base_a + b];
+            sig_gate += select(-x0, x0, bool(bva & 1));
+            sig_gate += select(-x1, x1, bool(bva & 2));
+            sig_gate += select(-x2, x2, bool(bva & 4));
+            sig_gate += select(-x3, x3, bool(bva & 8));
+            sig_gate += select(-x4, x4, bool(bva & 16));
+            sig_gate += select(-x5, x5, bool(bva & 32));
+            sig_gate += select(-x6, x6, bool(bva & 64));
+            sig_gate += select(-x7, x7, bool(bva & 128));
+            const uint bvb = packed_b[base_b + b];
+            sig_up += select(-x0, x0, bool(bvb & 1));
+            sig_up += select(-x1, x1, bool(bvb & 2));
+            sig_up += select(-x2, x2, bool(bvb & 4));
+            sig_up += select(-x3, x3, bool(bvb & 8));
+            sig_up += select(-x4, x4, bool(bvb & 16));
+            sig_up += select(-x5, x5, bool(bvb & 32));
+            sig_up += select(-x6, x6, bool(bvb & 64));
+            sig_up += select(-x7, x7, bool(bvb & 128));
+        }
+    }
+
+    // Fused SiLU(gate) * up output.
+    if (row_valid) {
+        const uint sc_off = row * groups_per_row + grp;
+        float g = float(scales_a[sc_off]) * sig_gate;
+        float u = float(scales_b[sc_off]) * sig_up;
+        g = simd_sum(g);
+        u = simd_sum(u);
+        if (lane == 0) {
+            const float silu = g / (1.0f + exp(-g));
+            output[row] = half(silu * u);
+        }
+    }
+}

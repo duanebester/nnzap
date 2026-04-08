@@ -793,6 +793,7 @@ pub const Device = struct {
     spec_qmv_f16in: ?ComputePipeline = null,
     spec_qmv_mg_f16io_resadd: ?ComputePipeline = null,
     spec_qmv_fused_pair_silu_f16io: ?ComputePipeline = null,
+    spec_qmv_fused_norm_pair_silu_f16io: ?ComputePipeline = null,
 
     // K values the specialized pipelines target.
     // Used by dispatch functions to verify dims.K matches

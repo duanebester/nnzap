@@ -109,6 +109,13 @@ pub fn initOnDevice(
             "qmv_spec_fused_pair_silu_f16io",
         );
 
+    device.spec_qmv_fused_norm_pair_silu_f16io =
+        try metal.ComputePipeline.init(
+            device_obj,
+            lib,
+            "qmv_spec_fused_norm_pair_silu_f16io",
+        );
+
     // Record which K values these pipelines target so
     // dispatch functions can verify dims.K matches.
     device.spec_hidden_K = hidden_K;

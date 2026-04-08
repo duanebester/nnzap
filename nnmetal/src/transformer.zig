@@ -1132,6 +1132,71 @@ fn dispatchQMVFusedPairSiLUf16io(
     );
 }
 
+/// Dispatch fused FFN-RMSNorm + gate/up + SiLU kernel.
+/// Reads f32 residual and f16 norm_scale directly, computes
+/// RMSNorm cooperatively in TG memory, then performs the
+/// gate+up QMV with SiLU.  Eliminates 1 RMSNorm dispatch
+/// and 1 barrier per block vs the separate path.
+///
+/// buffer(0,1): gate bits+scales, buffer(2): f32 residual,
+/// buffer(3): f16 output, buffer(4,5): up bits+scales,
+/// buffer(6): f16 norm_scale, buffer(7): QMVDims.
+///
+/// Dispatch: threadgroups = ceil(M / 16), threads = 512.
+fn dispatchFusedNormPairSiLUf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.PackedBuffer,
+    packed_b: metal.PackedBuffer,
+    residual: objc.Object,
+    output: objc.Object,
+    norm_scale: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(dims.K % dims.group_size == 0);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+    std.debug.assert(residual.value != null);
+    std.debug.assert(norm_scale.value != null);
+
+    // buffer(0,1): packed A / gate (bits + scales).
+    metal.setPackedBuffer(encoder, packed_a, 0);
+    // buffer(2): f32 residual [K].
+    setRawBuffer(encoder, residual, 0, 2);
+    // buffer(3): fused output [M] f16.
+    setRawBuffer(encoder, output, 0, 3);
+    // buffer(4,5): packed B / up (bits + scales).
+    metal.setPackedBuffer(encoder, packed_b, 4);
+    // buffer(6): f16 norm scale [K].
+    setRawBuffer(encoder, norm_scale, 0, 6);
+    // buffer(7): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 7);
+
+    const rows_per_tg: u32 = 16;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 512,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(
+        encoder,
+        device.spec_qmv_fused_norm_pair_silu_f16io.?,
+        grid,
+        group,
+    );
+}
+
 /// Dispatch 1-bit matrix-vector multiply (qmv): output = W_1bit × input.
 /// W is [M × K] in Q1_0_g128 packed format.  Input is [K] f32,
 /// output is [M] f32.  Uses the qmv pipeline from compute.metal
@@ -2150,37 +2215,58 @@ fn encodeMLPHalf(
         .K = Config.hidden_size,
         .group_size = Config.group_size,
     };
-    dispatchRMSNorm(
-        device,
-        encoder,
-        pipelines.rms_norm_f16out,
-        a.residual,
-        a.ffn_norm_scale,
-        a.norm_out,
-        .{
-            .hidden_size = Config.hidden_size,
-            .num_tokens = 1,
-            .eps = 1e-6,
-        },
-    );
-    bufferBarrier(encoder);
     // Gate and up projections share the same input and dims.
-    // Prefer the fused gate+up+SiLU kernel when the
-    // specialized pipeline is available — saves 2 dispatches
-    // and 2 barriers per block by computing
-    // silu(gate) * up in the QMV output stage.
+    // Best path: fuse FFN-RMSNorm + gate+up+SiLU into a
+    // single kernel — saves 2 dispatches + 2 barriers per
+    // block by reading the f32 residual directly.
     const can_fuse = comptime (Config.hidden_size % Config.group_size == 0) and
         (Config.hidden_size <= 6144) and
         (Config.hidden_size >= 256) and
         (Config.hidden_size / 32 <= Config.group_size);
-    const use_fused_silu = can_fuse and
+    // Fused norm needs K <= 4096 for threadgroup memory.
+    const can_fuse_norm = can_fuse and
+        comptime (Config.hidden_size <= 4096);
+    const use_fused_norm_silu = can_fuse_norm and
+        device.spec_qmv_fused_norm_pair_silu_f16io != null and
+        device.spec_qmv_fused_norm_pair_silu_f16io.?
+            .max_threads_per_group >= 512 and
+        mlp_qmv.K == device.spec_hidden_K;
+    const use_fused_silu = !use_fused_norm_silu and can_fuse and
         device.spec_qmv_fused_pair_silu_f16io != null and
         device.spec_qmv_fused_pair_silu_f16io.?
             .max_threads_per_group >= 512 and
         mlp_qmv.K == device.spec_hidden_K;
-    if (use_fused_silu) {
-        // Fused gate+up+SiLU: output goes directly to
-        // mlp_out, skipping gate/up buffers entirely.
+    if (use_fused_norm_silu) {
+        // Fused norm+gate+up+SiLU: reads f32 residual
+        // directly, computes RMSNorm in TG memory, then
+        // gate+up QMV with SiLU.  Skips norm_out, gate,
+        // and up buffers entirely.
+        dispatchFusedNormPairSiLUf16io(
+            device,
+            encoder,
+            a.gate_proj,
+            a.up_proj,
+            a.residual,
+            a.mlp_out,
+            a.ffn_norm_scale,
+            mlp_qmv,
+        );
+    } else if (use_fused_silu) {
+        // Fused gate+up+SiLU: needs separate RMSNorm first.
+        dispatchRMSNorm(
+            device,
+            encoder,
+            pipelines.rms_norm_f16out,
+            a.residual,
+            a.ffn_norm_scale,
+            a.norm_out,
+            .{
+                .hidden_size = Config.hidden_size,
+                .num_tokens = 1,
+                .eps = 1e-6,
+            },
+        );
+        bufferBarrier(encoder);
         dispatchQMVFusedPairSiLUf16io(
             device,
             encoder,
@@ -2190,54 +2276,71 @@ fn encodeMLPHalf(
             a.mlp_out,
             mlp_qmv,
         );
-    } else if (can_fuse) {
-        dispatchQMVFusedPairf16io(
-            device,
-            encoder,
-            a.gate_proj,
-            a.up_proj,
-            a.norm_out,
-            a.gate,
-            a.up,
-            mlp_qmv,
-        );
-        bufferBarrier(encoder);
-        dispatchSiLUElementwiseMul(
-            device,
-            encoder,
-            pipelines.silu_elementwise_mul_f16,
-            a.gate,
-            a.up,
-            a.mlp_out,
-            Config.intermediate_size,
-        );
     } else {
-        dispatchQMVf16io(
+        // Non-fused-norm paths need separate RMSNorm.
+        dispatchRMSNorm(
             device,
             encoder,
-            a.gate_proj,
+            pipelines.rms_norm_f16out,
+            a.residual,
+            a.ffn_norm_scale,
             a.norm_out,
-            a.gate,
-            mlp_qmv,
-        );
-        dispatchQMVf16io(
-            device,
-            encoder,
-            a.up_proj,
-            a.norm_out,
-            a.up,
-            mlp_qmv,
+            .{
+                .hidden_size = Config.hidden_size,
+                .num_tokens = 1,
+                .eps = 1e-6,
+            },
         );
         bufferBarrier(encoder);
-        dispatchSiLUElementwiseMul(
-            device,
-            encoder,
-            pipelines.silu_elementwise_mul_f16,
-            a.gate,
-            a.up,
-            a.mlp_out,
-            Config.intermediate_size,
-        );
+        if (can_fuse) {
+            dispatchQMVFusedPairf16io(
+                device,
+                encoder,
+                a.gate_proj,
+                a.up_proj,
+                a.norm_out,
+                a.gate,
+                a.up,
+                mlp_qmv,
+            );
+            bufferBarrier(encoder);
+            dispatchSiLUElementwiseMul(
+                device,
+                encoder,
+                pipelines.silu_elementwise_mul_f16,
+                a.gate,
+                a.up,
+                a.mlp_out,
+                Config.intermediate_size,
+            );
+        } else {
+            dispatchQMVf16io(
+                device,
+                encoder,
+                a.gate_proj,
+                a.norm_out,
+                a.gate,
+                mlp_qmv,
+            );
+            dispatchQMVf16io(
+                device,
+                encoder,
+                a.up_proj,
+                a.norm_out,
+                a.up,
+                mlp_qmv,
+            );
+            bufferBarrier(encoder);
+            dispatchSiLUElementwiseMul(
+                device,
+                encoder,
+                pipelines.silu_elementwise_mul_f16,
+                a.gate,
+                a.up,
+                a.mlp_out,
+                Config.intermediate_size,
+            );
+        }
     }
     bufferBarrier(encoder);
     // Fused QMV + residual accumulate: the down-projection
