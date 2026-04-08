@@ -325,6 +325,20 @@ pub const GQADims = extern struct {
     heads_per_kv_group: u32,
 };
 
+/// Extended GQA dims for fused Q/K norm + RoPE + KV cache.
+/// Must match Metal's GQAFusedDims in transformer.metal.
+pub const GQAFusedDims = extern struct {
+    num_query_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    seq_len: u32,
+    max_context_length: u32,
+    heads_per_kv_group: u32,
+    position: u32,
+    eps: f32,
+    rope_theta: f32,
+};
+
 /// 1-bit embedding lookup dimensions.
 pub const EmbedDims = extern struct {
     vocab_size: u32,
@@ -367,6 +381,7 @@ pub const TransformerPipelines = struct {
     fused_k_norm_rope_kv_cache_f16: metal.ComputePipeline,
     gqa_attention_f16io: metal.ComputePipeline,
     gqa_attention_f16io_tg: metal.ComputePipeline,
+    gqa_attention_fused_f16io_tg: metal.ComputePipeline,
     silu_elementwise_mul_f16: metal.ComputePipeline,
     residual_add_f16: metal.ComputePipeline,
     set_completion_flag: metal.ComputePipeline,
@@ -470,6 +485,11 @@ pub const TransformerPipelines = struct {
                 device_obj,
                 lib,
                 "gqa_attention_f16io_tg",
+            ),
+            .gqa_attention_fused_f16io_tg = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "gqa_attention_fused_f16io_tg",
             ),
             .silu_elementwise_mul_f16 = try metal.ComputePipeline.init(
                 device_obj,
@@ -786,6 +806,60 @@ fn dispatchGQAAttentionTG(
     setRawBuffer(encoder, output_buffer, 0, 3);
     // Skip buffer(4) — no scratch needed.
     metal.setBytes(encoder, GQADims, &dims, 5);
+
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, dims.num_query_heads),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 256,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Fused GQA attention: applies Q-norm + RoPE, K-norm +
+/// RoPE + KV cache update, then full attention — all in
+/// one dispatch.  Eliminates 2 dispatches + 1 barrier per
+/// block vs the separate norm+RoPE path.
+fn dispatchGQAAttentionFusedTG(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    pipeline: metal.ComputePipeline,
+    q_buffer: objc.Object,
+    k_cache_buffer: objc.Object,
+    v_cache_buffer: objc.Object,
+    output_buffer: objc.Object,
+    k_raw_buffer: objc.Object,
+    v_raw_buffer: objc.Object,
+    q_norm_scale: objc.Object,
+    k_norm_scale: objc.Object,
+    dims: GQAFusedDims,
+) void {
+    std.debug.assert(dims.num_query_heads > 0);
+    std.debug.assert(dims.seq_len > 0);
+    std.debug.assert(
+        dims.seq_len <= dims.max_context_length,
+    );
+    std.debug.assert(
+        dims.heads_per_kv_group ==
+            dims.num_query_heads / dims.num_kv_heads,
+    );
+    std.debug.assert(dims.seq_len <= 1024);
+
+    setRawBuffer(encoder, q_buffer, 0, 0);
+    setRawBuffer(encoder, k_cache_buffer, 0, 1);
+    setRawBuffer(encoder, v_cache_buffer, 0, 2);
+    setRawBuffer(encoder, output_buffer, 0, 3);
+    setRawBuffer(encoder, k_raw_buffer, 0, 4);
+    setRawBuffer(encoder, v_raw_buffer, 0, 5);
+    setRawBuffer(encoder, q_norm_scale, 0, 6);
+    setRawBuffer(encoder, k_norm_scale, 0, 7);
+    metal.setBytes(
+        encoder, GQAFusedDims, &dims, 8,
+    );
 
     const grid = metal.MTLSize{
         .width = @as(c_ulong, dims.num_query_heads),
@@ -2160,45 +2234,10 @@ fn encodeAttentionProjections(
             Config, device, encoder, pipelines, a, q_qmv, kv_qmv,
         );
     }
-    // Fused Q norm + RoPE Q: per-head RMSNorm then RoPE
-    // in a single dispatch.  Saves 1 dispatch vs separate.
-    dispatchFusedNormRoPE(
-        device,
-        encoder,
-        pipelines.fused_norm_rope_f16,
-        a.q,
-        a.q_norm_scale,
-        .{
-            .num_heads = Config.num_query_heads,
-            .head_dim = Config.head_dim,
-            .position = a.position,
-            .eps = 1e-6,
-            .rope_theta = Config.rope_theta,
-        },
-    );
-    // Fused K norm + RoPE K + KV cache: per-head RMSNorm,
-    // then RoPE, then write to k_cache + copy V to v_cache.
-    // Saves 2 dispatches + 2 barriers vs separate path.
-    dispatchFusedKNormRoPEKVCache(
-        device,
-        encoder,
-        pipelines.fused_k_norm_rope_kv_cache_f16,
-        a.k,
-        a.v,
-        a.k_cache,
-        a.v_cache,
-        a.k_norm_scale,
-        .{
-            .num_kv_heads = Config.num_kv_heads,
-            .head_dim = Config.head_dim,
-            .position = a.position,
-            .max_context_length = Config.max_context_length,
-            .eps = 1e-6,
-            .rope_theta = Config.rope_theta,
-        },
-    );
-    // Single barrier: wait for both fused dispatches before
-    // GQA attention reads Q and k/v caches.
+    // Q/K norm + RoPE + KV cache update are now fused into
+    // the GQA attention kernel (encodeAttentionGather).
+    // Single barrier: wait for Q/K/V projection writes
+    // before the fused GQA kernel reads them.
     bufferBarrier(encoder);
 }
 
@@ -2346,46 +2385,78 @@ fn encodeAttentionGather(
     pipelines: *const TransformerPipelines,
     a: ForwardBlockArgs,
 ) void {
-    const dims = GQADims{
-        .num_query_heads = Config.num_query_heads,
-        .num_kv_heads = Config.num_kv_heads,
-        .head_dim = Config.head_dim,
-        .seq_len = a.seq_len,
-        .max_context_length = Config.max_context_length,
-        .heads_per_kv_group = Config.heads_per_kv_group,
-    };
-
-    // Use threadgroup-scores kernel when seq_len fits in
-    // threadgroup memory (avoids the scratch buffer
-    // round-trip).  Fall back to the scratch-based kernel
-    // for longer sequences.
-    // Use threadgroup-scores kernel when seq_len fits in
-    // threadgroup memory (avoids the scratch buffer
-    // round-trip).  Fall back to the scratch-based kernel
-    // for longer sequences.
+    // Use the fused kernel that applies Q/K norm + RoPE +
+    // KV cache update inside GQA when seq_len fits in TG
+    // memory.  Falls back to separate dispatches otherwise.
     const TG_SEQ_LIMIT: u32 = 1024;
     if (a.seq_len <= TG_SEQ_LIMIT) {
-        dispatchGQAAttentionTG(
+        dispatchGQAAttentionFusedTG(
             device,
             encoder,
-            pipelines.gqa_attention_f16io_tg,
+            pipelines.gqa_attention_fused_f16io_tg,
             a.q,
             a.k_cache,
             a.v_cache,
             a.attn_out,
-            dims,
+            a.k,
+            a.v,
+            a.q_norm_scale,
+            a.k_norm_scale,
+            .{
+                .num_query_heads = Config.num_query_heads,
+                .num_kv_heads = Config.num_kv_heads,
+                .head_dim = Config.head_dim,
+                .seq_len = a.seq_len,
+                .max_context_length = Config.max_context_length,
+                .heads_per_kv_group = Config.heads_per_kv_group,
+                .position = a.position,
+                .eps = 1e-6,
+                .rope_theta = Config.rope_theta,
+            },
         );
     } else {
+        // Long-sequence fallback: separate norm+RoPE+cache,
+        // then the scratch-based GQA kernel.
+        dispatchFusedNormRoPE(
+            device, encoder,
+            pipelines.fused_norm_rope_f16,
+            a.q, a.q_norm_scale,
+            .{
+                .num_heads = Config.num_query_heads,
+                .head_dim = Config.head_dim,
+                .position = a.position,
+                .eps = 1e-6,
+                .rope_theta = Config.rope_theta,
+            },
+        );
+        dispatchFusedKNormRoPEKVCache(
+            device, encoder,
+            pipelines.fused_k_norm_rope_kv_cache_f16,
+            a.k, a.v, a.k_cache, a.v_cache,
+            a.k_norm_scale,
+            .{
+                .num_kv_heads = Config.num_kv_heads,
+                .head_dim = Config.head_dim,
+                .position = a.position,
+                .max_context_length = Config.max_context_length,
+                .eps = 1e-6,
+                .rope_theta = Config.rope_theta,
+            },
+        );
+        bufferBarrier(encoder);
         dispatchGQAAttention(
-            device,
-            encoder,
+            device, encoder,
             pipelines.gqa_attention_f16io,
-            a.q,
-            a.k_cache,
-            a.v_cache,
-            a.attn_out,
-            a.attn_scratch,
-            dims,
+            a.q, a.k_cache, a.v_cache,
+            a.attn_out, a.attn_scratch,
+            .{
+                .num_query_heads = Config.num_query_heads,
+                .num_kv_heads = Config.num_kv_heads,
+                .head_dim = Config.head_dim,
+                .seq_len = a.seq_len,
+                .max_context_length = Config.max_context_length,
+                .heads_per_kv_group = Config.heads_per_kv_group,
+            },
         );
     }
     bufferBarrier(encoder);

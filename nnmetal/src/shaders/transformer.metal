@@ -1274,6 +1274,241 @@ kernel void gqa_attention_f16io_tg(
 }
 
 // ============================================================================
+// Fused GQA Attention + Q-Norm + RoPE + K-Norm + RoPE + KV Cache (f16 TG)
+// ============================================================================
+
+/// Extended dims for GQA with fused Q/K norm, RoPE, and KV cache.
+struct GQAFusedDims {
+    uint  num_query_heads;
+    uint  num_kv_heads;
+    uint  head_dim;
+    uint  seq_len;
+    uint  max_context_length;
+    uint  heads_per_kv_group;
+    uint  position;
+    float eps;
+    float rope_theta;
+};
+
+/// Fused GQA attention that also applies:
+///   - Per-head RMSNorm + RoPE to Q (from raw projection)
+///   - Per-head RMSNorm + RoPE to K, then write to k_cache
+///   - Copy V to v_cache
+///
+/// Each TG handles one query head.  The KV cache update is
+/// redundantly computed by all query heads sharing a KV head
+/// (heads_per_kv_group TGs write identical values).  This
+/// eliminates 2 dispatches + 1 barrier per block vs separate
+/// norm+RoPE kernels.
+///
+/// Dispatch: threadgroups = num_query_heads, threads = 256.
+kernel void gqa_attention_fused_f16io_tg(
+    device const half*    Q          [[buffer(0)]],
+    device half*          k_cache    [[buffer(1)]],
+    device half*          v_cache    [[buffer(2)]],
+    device half*          output     [[buffer(3)]],
+    device const half*    K_raw      [[buffer(4)]],
+    device const half*    V_raw      [[buffer(5)]],
+    device const half*    q_norm_sc  [[buffer(6)]],
+    device const half*    k_norm_sc  [[buffer(7)]],
+    constant GQAFusedDims& dims      [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    const uint THREADS = 256;
+    const uint SIMD_SIZE = 32;
+    const uint NUM_SIMD_GROUPS = THREADS / SIMD_SIZE;
+    const uint TG_SEQ_MAX = 1024;
+    const uint head = tgid;
+
+    if (head >= dims.num_query_heads) return;
+
+    const uint kv_head = head / dims.heads_per_kv_group;
+    const uint head_dim = dims.head_dim;
+    const uint seq_len = dims.seq_len;
+    const uint max_ctx = dims.max_context_length;
+    const uint position = dims.position;
+
+    if (seq_len > TG_SEQ_MAX) return;
+
+    const uint simd_group = tid / SIMD_SIZE;
+    const uint simd_lane = tid % SIMD_SIZE;
+
+    const uint kv_stride = max_ctx * head_dim;
+    device half* kc = k_cache + kv_head * kv_stride;
+    device half* vc = v_cache + kv_head * kv_stride;
+
+    const float inv_sqrt_d = rsqrt(float(head_dim));
+
+    threadgroup float shared_buf[256];
+    threadgroup float tg_scores[TG_SEQ_MAX];
+
+    // ── Phase 1: Q — load, per-head RMSNorm, RoPE ──────────
+    float q_val = (tid < head_dim)
+        ? float(Q[head * head_dim + tid]) : 0.0f;
+
+    // Sum of squares reduction for Q RMSNorm.
+    float q_sq = q_val * q_val;
+    float q_warp_sq = simd_sum(q_sq);
+    if (simd_lane == 0) {
+        shared_buf[simd_group] = q_warp_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint active_warps = (head_dim + 31) / 32;
+    float q_total = 0.0f;
+    for (uint i = 0; i < active_warps; i++) {
+        q_total += shared_buf[i];
+    }
+    const float q_rms =
+        rsqrt(q_total / float(head_dim) + dims.eps);
+
+    // Normalize and scale Q.
+    if (tid < head_dim) {
+        q_val = q_val * q_rms * float(q_norm_sc[tid]);
+    }
+    shared_buf[tid] = q_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // RoPE on Q: consecutive-pair rotation.
+    if (tid < head_dim && (tid % 2 == 0)) {
+        const uint pair = tid / 2;
+        const float exp2_arg =
+            -float(2 * pair) / float(head_dim)
+            * log2(dims.rope_theta);
+        const float theta_i = exp2(exp2_arg);
+        const float angle = float(position) * theta_i;
+        const float cv = cos(angle);
+        const float sv = sin(angle);
+        const float a = shared_buf[tid];
+        const float b = shared_buf[tid + 1];
+        shared_buf[tid]     = a * cv - b * sv;
+        shared_buf[tid + 1] = a * sv + b * cv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // shared_buf[0..head_dim-1] = Q after norm + RoPE.
+
+    // ── Phase 2: K — norm + RoPE → k_cache; V → v_cache ────
+    device const half* kr = K_raw + kv_head * head_dim;
+    device const half* vr = V_raw + kv_head * head_dim;
+
+    float k_val = (tid < head_dim)
+        ? float(kr[tid]) : 0.0f;
+
+    // K RMSNorm reduction — use tg_scores[0..7] as scratch.
+    float k_sq = k_val * k_val;
+    float k_warp_sq = simd_sum(k_sq);
+    if (simd_lane == 0) {
+        tg_scores[simd_group] = k_warp_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float k_total = 0.0f;
+    for (uint i = 0; i < active_warps; i++) {
+        k_total += tg_scores[i];
+    }
+    const float k_rms =
+        rsqrt(k_total / float(head_dim) + dims.eps);
+
+    // Normalize, scale K, store for RoPE pair access.
+    float k_normed = 0.0f;
+    if (tid < head_dim) {
+        k_normed = k_val * k_rms * float(k_norm_sc[tid]);
+    }
+    tg_scores[tid] = k_normed;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // RoPE on K, write to k_cache at current position.
+    if (tid < head_dim && (tid % 2 == 0)) {
+        const uint pair = tid / 2;
+        const float exp2_arg =
+            -float(2 * pair) / float(head_dim)
+            * log2(dims.rope_theta);
+        const float theta_i = exp2(exp2_arg);
+        const float angle = float(position) * theta_i;
+        const float cv = cos(angle);
+        const float sv = sin(angle);
+        const float a = tg_scores[tid];
+        const float b = tg_scores[tid + 1];
+        kc[position * head_dim + tid] =
+            half(a * cv - b * sv);
+        kc[position * head_dim + tid + 1] =
+            half(a * sv + b * cv);
+    }
+
+    // Copy V to v_cache at current position.
+    if (tid < head_dim) {
+        vc[position * head_dim + tid] = vr[tid];
+    }
+
+    // Ensure k_cache/v_cache writes are visible within TG.
+    threadgroup_barrier(
+        mem_flags::mem_device
+        | mem_flags::mem_threadgroup
+    );
+
+    // ── Phase 3: Attention scores Q·K ───────────────────────
+    for (uint t = tid; t < seq_len; t += THREADS) {
+        float dot = 0.0f;
+        for (uint d = 0; d < head_dim; d++) {
+            dot += shared_buf[d]
+                * float(kc[t * head_dim + d]);
+        }
+        tg_scores[t] = dot * inv_sqrt_d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 4: Softmax — max, exp, sum, normalize ─────────
+    float local_max = -INFINITY;
+    for (uint t = tid; t < seq_len; t += THREADS) {
+        local_max = max(local_max, tg_scores[t]);
+    }
+    const float warp_max = simd_max(local_max);
+    if (simd_lane == 0) {
+        shared_buf[simd_group] = warp_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float max_score = shared_buf[0];
+    for (uint i = 1; i < NUM_SIMD_GROUPS; i++) {
+        max_score = max(max_score, shared_buf[i]);
+    }
+
+    float local_sum = 0.0f;
+    for (uint t = tid; t < seq_len; t += THREADS) {
+        const float e = exp(tg_scores[t] - max_score);
+        tg_scores[t] = e;
+        local_sum += e;
+    }
+    const float warp_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        shared_buf[simd_group] = warp_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sum_exp = shared_buf[0];
+    for (uint i = 1; i < NUM_SIMD_GROUPS; i++) {
+        sum_exp += shared_buf[i];
+    }
+
+    for (uint t = tid; t < seq_len; t += THREADS) {
+        tg_scores[t] /= sum_exp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 5: Weighted sum of V, write f16 output ────────
+    for (uint d = tid; d < head_dim; d += THREADS) {
+        float accum = 0.0f;
+        for (uint t = 0; t < seq_len; t++) {
+            accum +=
+                tg_scores[t]
+                * float(vc[t * head_dim + d]);
+        }
+        output[head * head_dim + d] = half(accum);
+    }
+}
+
+// ============================================================================
 // Fused SiLU + Elementwise Mul f16
 // ============================================================================
 
