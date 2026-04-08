@@ -1447,14 +1447,25 @@ kernel void gqa_attention_fused_f16io_tg(
         | mem_flags::mem_threadgroup
     );
 
-    // ── Phase 3: Attention scores Q·K ───────────────────────
-    for (uint t = tid; t < seq_len; t += THREADS) {
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
-            dot += shared_buf[d]
+    // ── Phase 3: Attention scores Q·K (SIMD-cooperative) ───
+    // Each SIMD group computes one dot product cooperatively:
+    // 32 lanes split head_dim (64 / 32 = 2 elements each),
+    // then simd_sum reduces.  8 SIMD groups process 8 tokens
+    // per iteration — all 256 threads active.
+    for (uint t = simd_group; t < seq_len;
+         t += NUM_SIMD_GROUPS)
+    {
+        float partial = 0.0f;
+        for (uint d = simd_lane; d < head_dim;
+             d += SIMD_SIZE)
+        {
+            partial += shared_buf[d]
                 * float(kc[t * head_dim + d]);
         }
-        tg_scores[t] = dot * inv_sqrt_d;
+        const float dot = simd_sum(partial);
+        if (simd_lane == 0) {
+            tg_scores[t] = dot * inv_sqrt_d;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1496,15 +1507,26 @@ kernel void gqa_attention_fused_f16io_tg(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 5: Weighted sum of V, write f16 output ────────
-    for (uint d = tid; d < head_dim; d += THREADS) {
-        float accum = 0.0f;
-        for (uint t = 0; t < seq_len; t++) {
-            accum +=
-                tg_scores[t]
+    // ── Phase 5: Weighted V sum (SIMD-cooperative) ──────────
+    // Each SIMD group handles one output dimension: 32 lanes
+    // split seq_len, then simd_sum reduces.  8 SIMD groups
+    // process 8 dimensions per iteration (64 / 8 = 8 iters).
+    // All 256 threads active vs only 64 in the per-thread
+    // version.
+    for (uint d = simd_group; d < head_dim;
+         d += NUM_SIMD_GROUPS)
+    {
+        float partial = 0.0f;
+        for (uint t = simd_lane; t < seq_len;
+             t += SIMD_SIZE)
+        {
+            partial += tg_scores[t]
                 * float(vc[t * head_dim + d]);
         }
-        output[head * head_dim + d] = half(accum);
+        const float accum = simd_sum(partial);
+        if (simd_lane == 0) {
+            output[head * head_dim + d] = half(accum);
+        }
     }
 }
 
