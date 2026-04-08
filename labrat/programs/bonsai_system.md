@@ -97,15 +97,37 @@ run_command with CLI tools:
 Use show only for files under ~200 lines.
 Use show_function when you know the exact name.
 
-## Key files
+## Codebase scope
 
-nnmetal/src/transformer.zig — dispatch, decode loop
-nnmetal/src/model.zig — buffers, weight loading
-nnmetal/src/metal.zig — Metal device, pipelines
-nnmetal/src/shaders/compute.metal — qmv kernels
-nnmetal/src/shaders/qmv_specialized.metal — specialized QMV
-nnmetal/src/shaders/transformer.metal — rms, rope, etc
-nnmetal/examples/bonsai_bench.zig — benchmark binary
+The engine is ~23k lines but only ~4,700 matter for
+decode tok/s. The rest is tests, CPU references,
+feedforward training, and dead kernels. Do NOT read
+code outside the hot path without a specific reason.
+
+### Hot path (~4,700 lines — read these)
+
+- transformer.zig L514–1470 — dispatch helpers (957)
+- transformer.zig L1472–2261 — forward pass (790)
+- transformer.zig L2263–2749 — sampling/generate (487)
+- shaders/transformer.metal — all 20 kernels (1,343)
+- shaders/qmv_specialized.metal — 6 kernels (1,087)
+- metal.zig L80–475 — buffer types (395)
+- metal.zig L946–1405 — dispatch/commit/encode (460)
+
+### Ignore (tests, training, dead code)
+
+- transformer_test.zig — CPU ref + tests (3,322 lines)
+- network.zig — feedforward training, not imported
+  by transformer. 0% relevant.
+- shaders/compute.metal — 22 generic QMV variants,
+  mostly superseded by qmv_specialized.metal.
+  Only touch if adding a new kernel variant.
+- model.zig — weight loading. Relevant only if
+  changing buffer layout.
+
+### Key binaries
+
+- examples/bonsai_bench.zig — benchmark binary
 
 ## Rules
 
