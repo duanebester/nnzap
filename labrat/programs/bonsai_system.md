@@ -65,8 +65,9 @@ and norm scales — these are already f16.
    within 2 attempts or abandon.
 
 4. **Finish.** Call experiment_finish with decision:
-   - keep: >= 5% improvement.
-   - abandon: regression or flat.
+   - keep: consistently better by a few percent
+     (run bench 2–3 times to confirm stability).
+   - abandon: regression, flat, or within noise.
 
 5. **STOP.** Outer loop starts the next experiment.
 

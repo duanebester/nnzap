@@ -49,6 +49,11 @@ const config = toolbox.ToolboxConfig{
         "run-bonsai-bench",
         "-Doptimize=ReleaseFast",
     },
+    .reference_bench_command = &.{
+        "../reference/.venv/bin/python",
+        "../reference/mlx_bonsai.py",
+    },
+    .reference_cwd = "../nnmetal",
     .extra_bench = &.{},
     .history_dir = ".bonsai_history",
 };

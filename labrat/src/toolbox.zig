@@ -68,6 +68,17 @@ pub const ToolboxConfig = struct {
     /// Primary benchmark command.
     bench_command: []const []const u8,
 
+    /// Reference benchmark command (e.g. MLX).
+    /// When set, the bench tool runs both the primary
+    /// and reference benchmarks back-to-back under
+    /// identical conditions, extracts decode_tok_per_sec
+    /// from each, and reports parity_pct in the output.
+    reference_bench_command: []const []const u8 = &.{},
+
+    /// Working directory for the reference benchmark.
+    /// Defaults to project_root if empty.
+    reference_cwd: []const u8 = "",
+
     /// Additional benchmark commands keyed by
     /// subcommand name.
     extra_bench: []const ExtraBench = &.{},
@@ -412,21 +423,69 @@ fn toolBench(
         .{config.name},
     );
 
+    const primary = runBenchCommand(
+        arena,
+        config.bench_command,
+        config.project_root,
+    ) orelse return;
+
+    // If no reference benchmark configured, output
+    // the primary result as-is.
+    if (config.reference_bench_command.len == 0) {
+        cacheBenchResult(config, arena, primary);
+        try tools.writeStdout(primary);
+        return;
+    }
+
+    // Run the reference benchmark under identical
+    // conditions (back-to-back, same thermal state).
+    const ref_cwd = if (config.reference_cwd.len > 0)
+        config.reference_cwd
+    else
+        config.project_root;
+
+    std.debug.print(
+        "{s}: running reference bench...\n",
+        .{config.name},
+    );
+
+    const reference = runBenchCommand(
+        arena,
+        config.reference_bench_command,
+        ref_cwd,
+    );
+
+    const combined = buildCombinedBench(
+        arena,
+        primary,
+        reference,
+    );
+    cacheBenchResult(config, arena, combined);
+    try tools.writeStdout(combined);
+}
+
+/// Run a benchmark command and return its stdout,
+/// or null if it failed (error already written).
+fn runBenchCommand(
+    arena: Allocator,
+    argv: []const []const u8,
+    cwd: []const u8,
+) ?[]const u8 {
     const result = std.process.Child.run(.{
         .allocator = arena,
-        .argv = config.bench_command,
-        .cwd = config.project_root,
+        .argv = argv,
+        .cwd = cwd,
         .max_output_bytes = tools.MAX_OUTPUT_BYTES,
     }) catch |err| {
-        const json = try std.fmt.allocPrint(
+        const json = std.fmt.allocPrint(
             arena,
             "{{\"status\": \"error\", " ++
                 "\"error\": \"spawn_failed: " ++
                 "{s}\"}}\n",
             .{@errorName(err)},
-        );
-        try tools.writeStdout(json);
-        return;
+        ) catch return null;
+        tools.writeStdout(json) catch {};
+        return null;
     };
 
     if (result.stderr.len > 0) {
@@ -441,25 +500,188 @@ fn toolBench(
     };
 
     if (!success) {
-        try tools.writeBuildError(
+        tools.writeBuildError(
             arena,
             result.stderr,
             2000,
-        );
-        return;
+        ) catch {};
+        return null;
     }
 
-    // Capture stdout from the benchmark command.
-    if (result.stdout.len > 0) {
-        cacheBenchResult(config, arena, result.stdout);
-        try tools.writeStdout(result.stdout);
-    } else {
-        try tools.writeStdout(
+    if (result.stdout.len == 0) {
+        tools.writeStdout(
             "{\"status\": \"error\", " ++
                 "\"error\": \"no benchmark " ++
                 "output\"}\n",
-        );
+        ) catch {};
+        return null;
     }
+
+    return result.stdout;
+}
+
+/// Extract a float field from a JSON string by key.
+/// Simple substring scan — no allocation, no JSON parse.
+fn extractJsonFloat(
+    json: []const u8,
+    key: []const u8,
+) ?f64 {
+    // Scan for "key": pattern without allocating.
+    // Walk json looking for '"', then match key, then
+    // '":' followed by the number.
+    var i: usize = 0;
+    while (i + key.len + 3 < json.len) : (i += 1) {
+        if (json[i] != '"') continue;
+        const k_start = i + 1;
+        const k_end = k_start + key.len;
+        if (k_end >= json.len) break;
+        if (!std.mem.eql(u8, json[k_start..k_end], key))
+            continue;
+        if (json[k_end] != '"') continue;
+        // Expect ':' after the closing quote.
+        var c: usize = k_end + 1;
+        while (c < json.len and json[c] == ' ') c += 1;
+        if (c >= json.len or json[c] != ':') continue;
+        c += 1;
+
+        // Skip whitespace after colon.
+        while (c < json.len and
+            (json[c] == ' ' or json[c] == '\t'))
+        {
+            c += 1;
+        }
+        if (c >= json.len) return null;
+
+        // Parse the number.
+        const num_start = c;
+        while (c < json.len) : (c += 1) {
+            const ch = json[c];
+            if ((ch >= '0' and ch <= '9') or
+                ch == '.' or ch == '-' or
+                ch == 'e' or ch == 'E' or ch == '+')
+            {
+                continue;
+            }
+            break;
+        }
+        if (c == num_start) return null;
+
+        return std.fmt.parseFloat(
+            f64,
+            json[num_start..c],
+        ) catch null;
+    }
+    return null;
+}
+
+/// Combine primary and reference bench outputs into
+/// a single JSON result with parity_pct.
+fn buildCombinedBench(
+    arena: Allocator,
+    primary: []const u8,
+    reference: ?[]const u8,
+) []const u8 {
+    // Strip trailing whitespace from primary JSON
+    // to inject new fields before the closing brace.
+    var trimmed = std.mem.trimRight(
+        u8,
+        primary,
+        &[_]u8{ ' ', '\n', '\r', '\t' },
+    );
+
+    // Find the last '}' in the primary output.
+    const last_brace = std.mem.lastIndexOfScalar(
+        u8,
+        trimmed,
+        '}',
+    ) orelse return primary;
+    const before_brace = trimmed[0..last_brace];
+
+    // Extract primary decode tok/s.
+    const primary_tok = extractJsonFloat(
+        primary,
+        "decode_tok_per_sec",
+    );
+
+    // Build the extra fields.
+    var extra: std.ArrayList(u8) = .empty;
+
+    if (reference) |ref| {
+        const ref_tok = extractJsonFloat(
+            ref,
+            "decode_tok_per_sec",
+        );
+        const ref_prefill = extractJsonFloat(
+            ref,
+            "prefill_tok_per_sec",
+        );
+        const ref_p50 = extractJsonFloat(
+            ref,
+            "decode_p50_us",
+        );
+        const ref_p99 = extractJsonFloat(
+            ref,
+            "decode_p99_us",
+        );
+
+        if (ref_tok) |rt| {
+            const s = std.fmt.allocPrint(
+                arena,
+                ",\n  \"reference_decode_tok_per_sec\"" ++
+                    ": {d:.1}",
+                .{rt},
+            ) catch "";
+            extra.appendSlice(arena, s) catch {};
+        }
+        if (ref_prefill) |rp| {
+            const s = std.fmt.allocPrint(
+                arena,
+                ",\n  \"reference_prefill_tok_per_sec\"" ++
+                    ": {d:.1}",
+                .{rp},
+            ) catch "";
+            extra.appendSlice(arena, s) catch {};
+        }
+        if (ref_p50) |v| {
+            const s = std.fmt.allocPrint(
+                arena,
+                ",\n  \"reference_decode_p50_us\"" ++
+                    ": {d:.0}",
+                .{v},
+            ) catch "";
+            extra.appendSlice(arena, s) catch {};
+        }
+        if (ref_p99) |v| {
+            const s = std.fmt.allocPrint(
+                arena,
+                ",\n  \"reference_decode_p99_us\"" ++
+                    ": {d:.0}",
+                .{v},
+            ) catch "";
+            extra.appendSlice(arena, s) catch {};
+        }
+        if (primary_tok != null and ref_tok != null) {
+            const parity = primary_tok.? /
+                ref_tok.? * 100.0;
+            const s = std.fmt.allocPrint(
+                arena,
+                ",\n  \"parity_pct\": {d:.1}",
+                .{parity},
+            ) catch "";
+            extra.appendSlice(arena, s) catch {};
+        }
+    } else {
+        extra.appendSlice(
+            arena,
+            ",\n  \"reference_status\": \"error\"",
+        ) catch {};
+    }
+
+    return std.fmt.allocPrint(
+        arena,
+        "{s}{s}\n}}\n",
+        .{ before_brace, extra.items },
+    ) catch primary;
 }
 
 /// Cache the latest benchmark JSON to a temp file
