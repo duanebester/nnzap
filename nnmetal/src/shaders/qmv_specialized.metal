@@ -813,60 +813,94 @@ kernel void qmv_spec_mg_f16io_resadd(
     uint byte_in_group =
         (col_start % group_size) / 8;
 
+    // Use uint32 reads instead of byte-by-byte.
+    // base_bytes is always 4-byte aligned when extra_lanes==0
+    // (e.g. K=6144 → base_bytes=24 → 6 words).
+    constexpr uint mg_words = base_bytes / 4;
+    static_assert(base_bytes % 4 == 0,
+        "base_bytes must be 4-byte aligned for uint32.");
+    static_assert(extra_lanes == 0,
+        "uint32 path requires uniform lane byte counts.");
+
+    device const uint32_t* bits32_r0 =
+        (device const uint32_t*)(
+            packed_bits + row_byte_base0);
+    device const uint32_t* bits32_r1 =
+        (device const uint32_t*)(
+            packed_bits + row_byte_base1);
+
     // Prevent full unrolling to preserve GPU occupancy.
     #pragma clang loop unroll(disable)
-    for (uint b = 0; b < my_bytes; b++) {
-        const uint base_col = col_start + b * 8;
+    for (uint w = 0; w < mg_words; w++) {
+        const uint32_t w0 =
+            row0_valid ? bits32_r0[w] : 0;
+        const uint32_t w1 =
+            row1_valid ? bits32_r1[w] : 0;
 
-        // Widen f16 to f32 before accumulation.
-        const float x0 = float(input[base_col + 0]);
-        const float x1 = float(input[base_col + 1]);
-        const float x2 = float(input[base_col + 2]);
-        const float x3 = float(input[base_col + 3]);
-        const float x4 = float(input[base_col + 4]);
-        const float x5 = float(input[base_col + 5]);
-        const float x6 = float(input[base_col + 6]);
-        const float x7 = float(input[base_col + 7]);
+        for (uint bi = 0; bi < 4; bi++) {
+            const uint base_col =
+                col_start + (w * 4 + bi) * 8;
 
-        if (row0_valid) {
-            const uint bv0 =
-                packed_bits[row_byte_base0 + b];
+            // Widen f16 to f32 before accumulation.
+            const float x0 =
+                float(input[base_col + 0]);
+            const float x1 =
+                float(input[base_col + 1]);
+            const float x2 =
+                float(input[base_col + 2]);
+            const float x3 =
+                float(input[base_col + 3]);
+            const float x4 =
+                float(input[base_col + 4]);
+            const float x5 =
+                float(input[base_col + 5]);
+            const float x6 =
+                float(input[base_col + 6]);
+            const float x7 =
+                float(input[base_col + 7]);
+
+            const uint sh = bi * 8;
+            const uint bv0 = (w0 >> sh) & 0xFFu;
+            const uint bv1 = (w1 >> sh) & 0xFFu;
             signed0 += select(-x0, x0, bool(bv0 & 1));
             signed0 += select(-x1, x1, bool(bv0 & 2));
             signed0 += select(-x2, x2, bool(bv0 & 4));
             signed0 += select(-x3, x3, bool(bv0 & 8));
-            signed0 += select(-x4, x4, bool(bv0 & 16));
-            signed0 += select(-x5, x5, bool(bv0 & 32));
-            signed0 += select(-x6, x6, bool(bv0 & 64));
-            signed0 += select(-x7, x7, bool(bv0 & 128));
-        }
-
-        if (row1_valid) {
-            const uint bv1 =
-                packed_bits[row_byte_base1 + b];
+            signed0 +=
+                select(-x4, x4, bool(bv0 & 16));
+            signed0 +=
+                select(-x5, x5, bool(bv0 & 32));
+            signed0 +=
+                select(-x6, x6, bool(bv0 & 64));
+            signed0 +=
+                select(-x7, x7, bool(bv0 & 128));
             signed1 += select(-x0, x0, bool(bv1 & 1));
             signed1 += select(-x1, x1, bool(bv1 & 2));
             signed1 += select(-x2, x2, bool(bv1 & 4));
             signed1 += select(-x3, x3, bool(bv1 & 8));
-            signed1 += select(-x4, x4, bool(bv1 & 16));
-            signed1 += select(-x5, x5, bool(bv1 & 32));
-            signed1 += select(-x6, x6, bool(bv1 & 64));
-            signed1 += select(-x7, x7, bool(bv1 & 128));
-        }
+            signed1 +=
+                select(-x4, x4, bool(bv1 & 16));
+            signed1 +=
+                select(-x5, x5, bool(bv1 & 32));
+            signed1 +=
+                select(-x6, x6, bool(bv1 & 64));
+            signed1 +=
+                select(-x7, x7, bool(bv1 & 128));
 
-        // Flush at group boundary.
-        byte_in_group++;
-        if (byte_in_group == bytes_per_group) {
-            const float s = float(
-                scales[row_scale_off0 + cur_group]);
-            accum0 += s * signed0;
-            signed0 = 0.0f;
-            const float t = float(
-                scales[row_scale_off1 + cur_group]);
-            accum1 += t * signed1;
-            signed1 = 0.0f;
-            cur_group++;
-            byte_in_group = 0;
+            // Flush at group boundary.
+            byte_in_group++;
+            if (byte_in_group == bytes_per_group) {
+                const float s = float(
+                    scales[row_scale_off0 + cur_group]);
+                accum0 += s * signed0;
+                signed0 = 0.0f;
+                const float t = float(
+                    scales[row_scale_off1 + cur_group]);
+                accum1 += t * signed1;
+                signed1 = 0.0f;
+                cur_group++;
+                byte_in_group = 0;
+            }
         }
     }
 
