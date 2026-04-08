@@ -760,7 +760,7 @@ kernel void qmv_spec_f16in(
 kernel void qmv_spec_mg_f16io_resadd(
     device const uint8_t* packed_bits [[buffer(0)]],
     device const half*    scales      [[buffer(1)]],
-    constant half*        input       [[buffer(2)]],
+    device const half*    input       [[buffer(2)]],
     device float*         residual    [[buffer(3)]],
     constant QMVDims&     dims        [[buffer(4)]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -774,7 +774,22 @@ kernel void qmv_spec_mg_f16io_resadd(
         "Group size must be byte-aligned.");
     static_assert(K % group_size == 0,
         "K must be a multiple of group_size.");
+    static_assert(K <= 12288,
+        "K must fit in 24 KB threadgroup memory.");
     const uint M = dims.M;
+
+    // Cache input vector in threadgroup memory to avoid
+    // constant-cache pressure (K=6144 → 12 KB exceeds
+    // per-CU constant cache on some Apple Silicon).
+    threadgroup half tg_input[K];
+    constexpr uint elems_per_thread = K / 512;
+    static_assert(K % 512 == 0,
+        "K must be divisible by 512 for cooperative load.");
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_input[tid * elems_per_thread + j] =
+            input[tid * elems_per_thread + j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
@@ -843,21 +858,21 @@ kernel void qmv_spec_mg_f16io_resadd(
 
             // Widen f16 to f32 before accumulation.
             const float x0 =
-                float(input[base_col + 0]);
+                float(tg_input[base_col + 0]);
             const float x1 =
-                float(input[base_col + 1]);
+                float(tg_input[base_col + 1]);
             const float x2 =
-                float(input[base_col + 2]);
+                float(tg_input[base_col + 2]);
             const float x3 =
-                float(input[base_col + 3]);
+                float(tg_input[base_col + 3]);
             const float x4 =
-                float(input[base_col + 4]);
+                float(tg_input[base_col + 4]);
             const float x5 =
-                float(input[base_col + 5]);
+                float(tg_input[base_col + 5]);
             const float x6 =
-                float(input[base_col + 6]);
+                float(tg_input[base_col + 6]);
             const float x7 =
-                float(input[base_col + 7]);
+                float(tg_input[base_col + 7]);
 
             const uint sh = bi * 8;
             const uint bv0 = (w0 >> sh) & 0xFFu;
