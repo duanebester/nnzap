@@ -1228,3 +1228,345 @@ kernel void qmv_spec_fused_norm_pair_silu_f16io(
         }
     }
 }
+
+// ====================================================================
+// Kernel 8: qmv_spec_fused_norm_f16io — fused RMSNorm + single QMV
+// ====================================================================
+/// Reads the f32 residual and f16 norm_scale directly, computes
+/// RMSNorm cooperatively in threadgroup memory, then performs a
+/// single QMV from the TG-cached normalized input.  Used for the
+/// Q attention projection to avoid a separate RMSNorm dispatch.
+///
+/// Dispatch: threadgroups = ceil(M / 16), threads = 512.
+kernel void qmv_spec_fused_norm_f16io(
+    device const uint8_t* packed_bits [[buffer(0)]],
+    device const half*    scales      [[buffer(1)]],
+    device const float*   residual    [[buffer(2)]],
+    device half*          output      [[buffer(3)]],
+    device const half*    norm_scale  [[buffer(4)]],
+    constant QMVDims&     dims        [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint K = SPEC_HIDDEN_K;
+    constexpr uint group_size = SPEC_GS;
+    static_assert(K % 32 == 0, "K must be SIMD-aligned.");
+    static_assert(K % group_size == 0, "K must be group-aligned.");
+    static_assert(K / 32 <= group_size, "Single-group requirement.");
+    static_assert(K <= 4096, "K must fit in threadgroup memory.");
+    const uint M = dims.M;
+
+    constexpr uint cols_per_lane = K / 32;
+    constexpr uint padded_stride = cols_per_lane + 2;
+    constexpr uint groups_per_row = K / group_size;
+    constexpr uint bytes_per_lane = cols_per_lane / 8;
+    constexpr uint bytes_per_row = K / 8;
+    constexpr uint words_per_lane = bytes_per_lane / 4;
+    constexpr uint elems_per_thread = K / 512;
+
+    static_assert(K % 512 == 0,
+        "K must be divisible by 512 for cooperative load.");
+
+    threadgroup half tg_input[32 * padded_stride];
+    threadgroup float tg_reduce[16];
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+
+    // ── Phase 1: Cooperative RMSNorm ────────────────────────
+    float partial_sos = 0.0f;
+    for (uint j = 0; j < elems_per_thread; j++) {
+        const float v = residual[tid * elems_per_thread + j];
+        partial_sos += v * v;
+    }
+    partial_sos = simd_sum(partial_sos);
+    if (lane == 0) {
+        tg_reduce[simdgroup_idx] = partial_sos;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_idx == 0) {
+        const float v = (lane < 16)
+            ? tg_reduce[lane] : 0.0f;
+        const float total = simd_sum(v);
+        if (lane == 0) {
+            tg_reduce[0] = rsqrt(
+                total / float(K) + 1e-6f
+            );
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv = tg_reduce[0];
+
+    // ── Phase 2: Normalize and store f16 to TG memory ───────
+    for (uint j = 0; j < elems_per_thread; j++) {
+        const uint elem = tid * elems_per_thread + j;
+        const float val = residual[elem] * rms_inv
+            * float(norm_scale[elem]);
+        const uint qmv_lane = elem / cols_per_lane;
+        const uint lane_off = elem % cols_per_lane;
+        tg_input[qmv_lane * padded_stride + lane_off] =
+            half(val);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 3: Single QMV from TG memory ──────────────────
+    const uint row = tgid * 16 + simdgroup_idx;
+    const uint col_byte_off = lane * bytes_per_lane;
+    const uint grp = (lane * cols_per_lane) / group_size;
+    const uint tg_base = lane * padded_stride;
+
+    float sig = 0.0f;
+    const bool row_valid = row < M;
+    const uint base = row * bytes_per_row + col_byte_off;
+
+    device const uint32_t* w32 =
+        (device const uint32_t*)(packed_bits + base);
+
+    for (uint w = 0; w < words_per_lane; w++) {
+        const uint32_t wv = row_valid ? w32[w] : 0;
+
+        for (uint bi = 0; bi < 4; bi++) {
+            const uint lo = w * 32 + bi * 8;
+            const float x0 = float(tg_input[tg_base + lo]);
+            const float x1 = float(tg_input[tg_base+lo+1]);
+            const float x2 = float(tg_input[tg_base+lo+2]);
+            const float x3 = float(tg_input[tg_base+lo+3]);
+            const float x4 = float(tg_input[tg_base+lo+4]);
+            const float x5 = float(tg_input[tg_base+lo+5]);
+            const float x6 = float(tg_input[tg_base+lo+6]);
+            const float x7 = float(tg_input[tg_base+lo+7]);
+            const uint sh = bi * 8;
+            const uint bv = (wv >> sh) & 0xFFu;
+            sig += select(-x0, x0, bool(bv & 1));
+            sig += select(-x1, x1, bool(bv & 2));
+            sig += select(-x2, x2, bool(bv & 4));
+            sig += select(-x3, x3, bool(bv & 8));
+            sig += select(-x4, x4, bool(bv & 16));
+            sig += select(-x5, x5, bool(bv & 32));
+            sig += select(-x6, x6, bool(bv & 64));
+            sig += select(-x7, x7, bool(bv & 128));
+        }
+    }
+
+    // Tail bytes — dead code when bytes_per_lane % 4 == 0.
+    for (uint b = words_per_lane * 4;
+         b < bytes_per_lane; b++)
+    {
+        const uint lo = b * 8;
+        const float x0 = float(tg_input[tg_base + lo]);
+        const float x1 = float(tg_input[tg_base+lo+1]);
+        const float x2 = float(tg_input[tg_base+lo+2]);
+        const float x3 = float(tg_input[tg_base+lo+3]);
+        const float x4 = float(tg_input[tg_base+lo+4]);
+        const float x5 = float(tg_input[tg_base+lo+5]);
+        const float x6 = float(tg_input[tg_base+lo+6]);
+        const float x7 = float(tg_input[tg_base+lo+7]);
+        if (row_valid) {
+            const uint bval = packed_bits[base + b];
+            sig += select(-x0, x0, bool(bval & 1));
+            sig += select(-x1, x1, bool(bval & 2));
+            sig += select(-x2, x2, bool(bval & 4));
+            sig += select(-x3, x3, bool(bval & 8));
+            sig += select(-x4, x4, bool(bval & 16));
+            sig += select(-x5, x5, bool(bval & 32));
+            sig += select(-x6, x6, bool(bval & 64));
+            sig += select(-x7, x7, bool(bval & 128));
+        }
+    }
+
+    if (row_valid) {
+        const uint sc_off = row * groups_per_row + grp;
+        float acc = float(scales[sc_off]) * sig;
+        acc = simd_sum(acc);
+        if (lane == 0) {
+            output[row] = half(acc);
+        }
+    }
+}
+
+// ====================================================================
+// Kernel 9: qmv_spec_fused_norm_pair_f16io — fused RMSNorm + pair QMV
+// ====================================================================
+/// Reads the f32 residual and f16 norm_scale directly, computes
+/// RMSNorm cooperatively in threadgroup memory, then performs a
+/// paired QMV (two weight matrices, two outputs) from the
+/// TG-cached normalized input.  Used for fused K+V attention
+/// projections to avoid a separate RMSNorm dispatch.
+///
+/// Dispatch: threadgroups = ceil(M / 16), threads = 512.
+kernel void qmv_spec_fused_norm_pair_f16io(
+    device const uint8_t* packed_a   [[buffer(0)]],
+    device const half*    scales_a   [[buffer(1)]],
+    device const float*   residual   [[buffer(2)]],
+    device half*          output_a   [[buffer(3)]],
+    device const uint8_t* packed_b   [[buffer(4)]],
+    device const half*    scales_b   [[buffer(5)]],
+    device half*          output_b   [[buffer(6)]],
+    device const half*    norm_scale [[buffer(7)]],
+    constant QMVDims&     dims       [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint K = SPEC_HIDDEN_K;
+    constexpr uint group_size = SPEC_GS;
+    static_assert(K % 32 == 0, "K must be SIMD-aligned.");
+    static_assert(K % group_size == 0, "K must be group-aligned.");
+    static_assert(K / 32 <= group_size, "Single-group requirement.");
+    static_assert(K <= 4096, "K must fit in threadgroup memory.");
+    const uint M = dims.M;
+
+    constexpr uint cols_per_lane = K / 32;
+    constexpr uint padded_stride = cols_per_lane + 2;
+    constexpr uint groups_per_row = K / group_size;
+    constexpr uint bytes_per_lane = cols_per_lane / 8;
+    constexpr uint bytes_per_row = K / 8;
+    constexpr uint words_per_lane = bytes_per_lane / 4;
+    constexpr uint elems_per_thread = K / 512;
+
+    static_assert(K % 512 == 0,
+        "K must be divisible by 512 for cooperative load.");
+
+    threadgroup half tg_input[32 * padded_stride];
+    threadgroup float tg_reduce[16];
+
+    const uint simdgroup_idx = tid / 32;
+    const uint lane = tid % 32;
+
+    // ── Phase 1: Cooperative RMSNorm ────────────────────────
+    float partial_sos = 0.0f;
+    for (uint j = 0; j < elems_per_thread; j++) {
+        const float v = residual[tid * elems_per_thread + j];
+        partial_sos += v * v;
+    }
+    partial_sos = simd_sum(partial_sos);
+    if (lane == 0) {
+        tg_reduce[simdgroup_idx] = partial_sos;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup_idx == 0) {
+        const float v = (lane < 16)
+            ? tg_reduce[lane] : 0.0f;
+        const float total = simd_sum(v);
+        if (lane == 0) {
+            tg_reduce[0] = rsqrt(
+                total / float(K) + 1e-6f
+            );
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float rms_inv = tg_reduce[0];
+
+    // ── Phase 2: Normalize and store f16 to TG memory ───────
+    for (uint j = 0; j < elems_per_thread; j++) {
+        const uint elem = tid * elems_per_thread + j;
+        const float val = residual[elem] * rms_inv
+            * float(norm_scale[elem]);
+        const uint qmv_lane = elem / cols_per_lane;
+        const uint lane_off = elem % cols_per_lane;
+        tg_input[qmv_lane * padded_stride + lane_off] =
+            half(val);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 3: Paired QMV from TG memory ──────────────────
+    const uint row = tgid * 16 + simdgroup_idx;
+    const uint col_byte_off = lane * bytes_per_lane;
+    const uint grp = (lane * cols_per_lane) / group_size;
+    const uint tg_base = lane * padded_stride;
+
+    float sig_a = 0.0f;
+    float sig_b = 0.0f;
+    const bool row_valid = row < M;
+    const uint base_a = row * bytes_per_row + col_byte_off;
+    const uint base_b = row * bytes_per_row + col_byte_off;
+
+    device const uint32_t* w32_a =
+        (device const uint32_t*)(packed_a + base_a);
+    device const uint32_t* w32_b =
+        (device const uint32_t*)(packed_b + base_b);
+
+    for (uint w = 0; w < words_per_lane; w++) {
+        const uint32_t wa = row_valid ? w32_a[w] : 0;
+        const uint32_t wb = row_valid ? w32_b[w] : 0;
+
+        for (uint bi = 0; bi < 4; bi++) {
+            const uint lo = w * 32 + bi * 8;
+            const float x0 = float(tg_input[tg_base + lo]);
+            const float x1 = float(tg_input[tg_base+lo+1]);
+            const float x2 = float(tg_input[tg_base+lo+2]);
+            const float x3 = float(tg_input[tg_base+lo+3]);
+            const float x4 = float(tg_input[tg_base+lo+4]);
+            const float x5 = float(tg_input[tg_base+lo+5]);
+            const float x6 = float(tg_input[tg_base+lo+6]);
+            const float x7 = float(tg_input[tg_base+lo+7]);
+            const uint sh = bi * 8;
+            const uint ba = (wa >> sh) & 0xFFu;
+            const uint bb = (wb >> sh) & 0xFFu;
+            sig_a += select(-x0, x0, bool(ba & 1));
+            sig_a += select(-x1, x1, bool(ba & 2));
+            sig_a += select(-x2, x2, bool(ba & 4));
+            sig_a += select(-x3, x3, bool(ba & 8));
+            sig_a += select(-x4, x4, bool(ba & 16));
+            sig_a += select(-x5, x5, bool(ba & 32));
+            sig_a += select(-x6, x6, bool(ba & 64));
+            sig_a += select(-x7, x7, bool(ba & 128));
+            sig_b += select(-x0, x0, bool(bb & 1));
+            sig_b += select(-x1, x1, bool(bb & 2));
+            sig_b += select(-x2, x2, bool(bb & 4));
+            sig_b += select(-x3, x3, bool(bb & 8));
+            sig_b += select(-x4, x4, bool(bb & 16));
+            sig_b += select(-x5, x5, bool(bb & 32));
+            sig_b += select(-x6, x6, bool(bb & 64));
+            sig_b += select(-x7, x7, bool(bb & 128));
+        }
+    }
+
+    // Tail bytes — dead code when bytes_per_lane % 4 == 0.
+    for (uint b = words_per_lane * 4;
+         b < bytes_per_lane; b++)
+    {
+        const uint lo = b * 8;
+        const float x0 = float(tg_input[tg_base + lo]);
+        const float x1 = float(tg_input[tg_base+lo+1]);
+        const float x2 = float(tg_input[tg_base+lo+2]);
+        const float x3 = float(tg_input[tg_base+lo+3]);
+        const float x4 = float(tg_input[tg_base+lo+4]);
+        const float x5 = float(tg_input[tg_base+lo+5]);
+        const float x6 = float(tg_input[tg_base+lo+6]);
+        const float x7 = float(tg_input[tg_base+lo+7]);
+        if (row_valid) {
+            const uint bva = packed_a[base_a + b];
+            sig_a += select(-x0, x0, bool(bva & 1));
+            sig_a += select(-x1, x1, bool(bva & 2));
+            sig_a += select(-x2, x2, bool(bva & 4));
+            sig_a += select(-x3, x3, bool(bva & 8));
+            sig_a += select(-x4, x4, bool(bva & 16));
+            sig_a += select(-x5, x5, bool(bva & 32));
+            sig_a += select(-x6, x6, bool(bva & 64));
+            sig_a += select(-x7, x7, bool(bva & 128));
+            const uint bvb = packed_b[base_b + b];
+            sig_b += select(-x0, x0, bool(bvb & 1));
+            sig_b += select(-x1, x1, bool(bvb & 2));
+            sig_b += select(-x2, x2, bool(bvb & 4));
+            sig_b += select(-x3, x3, bool(bvb & 8));
+            sig_b += select(-x4, x4, bool(bvb & 16));
+            sig_b += select(-x5, x5, bool(bvb & 32));
+            sig_b += select(-x6, x6, bool(bvb & 64));
+            sig_b += select(-x7, x7, bool(bvb & 128));
+        }
+    }
+
+    if (row_valid) {
+        const uint sc_off = row * groups_per_row + grp;
+        float acc_a = float(scales_a[sc_off]) * sig_a;
+        float acc_b = float(scales_b[sc_off]) * sig_b;
+        acc_a = simd_sum(acc_a);
+        acc_b = simd_sum(acc_b);
+        if (lane == 0) {
+            output_a[row] = half(acc_a);
+            output_b[row] = half(acc_b);
+        }
+    }
+}

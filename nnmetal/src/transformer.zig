@@ -1197,6 +1197,137 @@ fn dispatchFusedNormPairSiLUf16io(
     );
 }
 
+/// Dispatch fused attention-RMSNorm + single QMV kernel.
+/// Reads f32 residual and f16 norm_scale directly, computes
+/// RMSNorm cooperatively in TG memory, then performs a single
+/// QMV with f16 output.  Eliminates 1 RMSNorm dispatch and
+/// 1 barrier per block vs the separate path.
+///
+/// buffer(0,1): packed bits+scales, buffer(2): f32 residual,
+/// buffer(3): f16 output, buffer(4): f16 norm_scale,
+/// buffer(5): QMVDims.
+///
+/// Dispatch: threadgroups = ceil(M / 16), threads = 512.
+fn dispatchFusedNormQMVf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_w: metal.PackedBuffer,
+    residual: objc.Object,
+    output: objc.Object,
+    norm_scale: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(dims.K % dims.group_size == 0);
+    std.debug.assert(packed_w.packed_count > 0);
+    std.debug.assert(residual.value != null);
+    std.debug.assert(norm_scale.value != null);
+
+    // buffer(0,1): packed bits + scales.
+    metal.setPackedBuffer(encoder, packed_w, 0);
+    // buffer(2): f32 residual [K].
+    setRawBuffer(encoder, residual, 0, 2);
+    // buffer(3): f16 output [M].
+    setRawBuffer(encoder, output, 0, 3);
+    // buffer(4): f16 norm scale [K].
+    setRawBuffer(encoder, norm_scale, 0, 4);
+    // buffer(5): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 5);
+
+    const rows_per_tg: u32 = 16;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 512,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(
+        encoder,
+        device.spec_qmv_fused_norm_f16io.?,
+        grid,
+        group,
+    );
+}
+
+/// Dispatch fused attention-RMSNorm + paired QMV kernel.
+/// Reads f32 residual and f16 norm_scale directly, computes
+/// RMSNorm cooperatively in TG memory, then performs a paired
+/// QMV (two weight matrices, two outputs) with f16 output.
+/// Eliminates 1 RMSNorm dispatch and 1 barrier per block
+/// vs the separate path.
+///
+/// buffer(0,1): packed A bits+scales, buffer(2): f32 residual,
+/// buffer(3): f16 output A, buffer(4,5): packed B bits+scales,
+/// buffer(6): f16 output B, buffer(7): f16 norm_scale,
+/// buffer(8): QMVDims.
+///
+/// Dispatch: threadgroups = ceil(M / 16), threads = 512.
+fn dispatchFusedNormPairQMVf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.PackedBuffer,
+    packed_b: metal.PackedBuffer,
+    residual: objc.Object,
+    output_a: objc.Object,
+    output_b: objc.Object,
+    norm_scale: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(dims.K % dims.group_size == 0);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+    std.debug.assert(residual.value != null);
+    std.debug.assert(norm_scale.value != null);
+
+    // buffer(0,1): packed A (K proj) bits + scales.
+    metal.setPackedBuffer(encoder, packed_a, 0);
+    // buffer(2): f32 residual [K].
+    setRawBuffer(encoder, residual, 0, 2);
+    // buffer(3): f16 output A [M].
+    setRawBuffer(encoder, output_a, 0, 3);
+    // buffer(4,5): packed B (V proj) bits + scales.
+    metal.setPackedBuffer(encoder, packed_b, 4);
+    // buffer(6): f16 output B [M].
+    setRawBuffer(encoder, output_b, 0, 6);
+    // buffer(7): f16 norm scale [K].
+    setRawBuffer(encoder, norm_scale, 0, 7);
+    // buffer(8): QMVDims.
+    metal.setBytes(encoder, QMVDims, &dims, 8);
+
+    const rows_per_tg: u32 = 16;
+    const threadgroups = (dims.M + rows_per_tg - 1) /
+        rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = 512,
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(
+        encoder,
+        device.spec_qmv_fused_norm_pair_f16io.?,
+        grid,
+        group,
+    );
+}
+
 /// Dispatch 1-bit matrix-vector multiply (qmv): output = W_1bit × input.
 /// W is [M × K] in Q1_0_g128 packed format.  Input is [K] f32,
 /// output is [M] f32.  Uses the qmv pipeline from compute.metal
@@ -2001,48 +2132,34 @@ fn encodeAttentionProjections(
         .K = Config.hidden_size,
         .group_size = Config.group_size,
     };
-    dispatchRMSNorm(
-        device,
-        encoder,
-        pipelines.rms_norm_f16out,
-        a.residual,
-        a.attn_norm_scale,
-        a.norm_out,
-        .{
-            .hidden_size = Config.hidden_size,
-            .num_tokens = 1,
-            .eps = 1e-6,
-        },
-    );
-    bufferBarrier(encoder);
-    dispatchQMVf16io(device, encoder, a.q_proj, a.norm_out, a.q, .{
+    const q_qmv = QMVDims{
         .M = Config.query_dim,
         .K = Config.hidden_size,
         .group_size = Config.group_size,
-    });
-    // K and V projections share input (norm_out) and dims
-    // (kv_dim x hidden_size). Fuse into one dispatch to
-    // halve input vector loads and save dispatch overhead.
-    const can_fuse_kv = comptime (Config.hidden_size % Config.group_size == 0) and
-        (Config.hidden_size <= 6144) and
+    };
+    // Fused norm needs K <= 4096 for threadgroup memory
+    // and both single + pair pipelines available.
+    const can_fuse_norm = comptime (Config.hidden_size % Config.group_size == 0) and
+        (Config.hidden_size <= 4096) and
         (Config.hidden_size >= 256) and
         (Config.hidden_size / 32 <= Config.group_size);
-    if (can_fuse_kv) {
-        dispatchQMVFusedPairf16io(
-            device,
-            encoder,
-            a.k_proj,
-            a.v_proj,
-            a.norm_out,
-            a.k,
-            a.v,
-            kv_qmv,
+    const use_fused_norm = can_fuse_norm and
+        device.spec_qmv_fused_norm_f16io != null and
+        device.spec_qmv_fused_norm_f16io.?
+            .max_threads_per_group >= 512 and
+        device.spec_qmv_fused_norm_pair_f16io != null and
+        device.spec_qmv_fused_norm_pair_f16io.?
+            .max_threads_per_group >= 512 and
+        q_qmv.K == device.spec_hidden_K;
+    if (use_fused_norm) {
+        encodeAttnProjFusedNorm(
+            Config, device, encoder, a, q_qmv, kv_qmv,
         );
     } else {
-        dispatchQMVf16io(device, encoder, a.k_proj, a.norm_out, a.k, kv_qmv);
-        dispatchQMVf16io(device, encoder, a.v_proj, a.norm_out, a.v, kv_qmv);
+        encodeAttnProjSeparateNorm(
+            Config, device, encoder, pipelines, a, q_qmv, kv_qmv,
+        );
     }
-    bufferBarrier(encoder);
     // Fused Q norm + RoPE Q: per-head RMSNorm then RoPE
     // in a single dispatch.  Saves 1 dispatch vs separate.
     dispatchFusedNormRoPE(
@@ -2082,6 +2199,97 @@ fn encodeAttentionProjections(
     );
     // Single barrier: wait for both fused dispatches before
     // GQA attention reads Q and k/v caches.
+    bufferBarrier(encoder);
+}
+
+/// Fused-norm path: each QMV kernel reads the f32 residual
+/// and f16 norm_scale directly, computes RMSNorm in TG memory.
+/// Saves 1 RMSNorm dispatch + 1 barrier vs the separate path.
+fn encodeAttnProjFusedNorm(
+    comptime Config: type,
+    device: *const metal.Device,
+    encoder: objc.Object,
+    a: ForwardBlockArgs,
+    q_qmv: QMVDims,
+    kv_qmv: QMVDims,
+) void {
+    std.debug.assert(q_qmv.K == Config.hidden_size);
+    std.debug.assert(kv_qmv.K == Config.hidden_size);
+    // Q projection: fused norm + single QMV.
+    dispatchFusedNormQMVf16io(
+        device,
+        encoder,
+        a.q_proj,
+        a.residual,
+        a.q,
+        a.attn_norm_scale,
+        q_qmv,
+    );
+    // KV projection: fused norm + paired QMV (concurrent
+    // with Q — both read residual and norm_scale read-only).
+    dispatchFusedNormPairQMVf16io(
+        device,
+        encoder,
+        a.k_proj,
+        a.v_proj,
+        a.residual,
+        a.k,
+        a.v,
+        a.attn_norm_scale,
+        kv_qmv,
+    );
+    bufferBarrier(encoder);
+}
+
+/// Separate-norm path: RMSNorm → barrier → Q + fused KV.
+/// Fallback when fused norm kernels are not available.
+fn encodeAttnProjSeparateNorm(
+    comptime Config: type,
+    device: *const metal.Device,
+    encoder: objc.Object,
+    pipelines: *const TransformerPipelines,
+    a: ForwardBlockArgs,
+    q_qmv: QMVDims,
+    kv_qmv: QMVDims,
+) void {
+    std.debug.assert(q_qmv.K == Config.hidden_size);
+    std.debug.assert(kv_qmv.K == Config.hidden_size);
+    dispatchRMSNorm(
+        device,
+        encoder,
+        pipelines.rms_norm_f16out,
+        a.residual,
+        a.attn_norm_scale,
+        a.norm_out,
+        .{
+            .hidden_size = Config.hidden_size,
+            .num_tokens = 1,
+            .eps = 1e-6,
+        },
+    );
+    bufferBarrier(encoder);
+    dispatchQMVf16io(
+        device, encoder, a.q_proj, a.norm_out, a.q, q_qmv,
+    );
+    const can_fuse_kv = comptime
+        (Config.hidden_size % Config.group_size == 0) and
+        (Config.hidden_size <= 6144) and
+        (Config.hidden_size >= 256) and
+        (Config.hidden_size / 32 <= Config.group_size);
+    if (can_fuse_kv) {
+        dispatchQMVFusedPairf16io(
+            device, encoder,
+            a.k_proj, a.v_proj, a.norm_out,
+            a.k, a.v, kv_qmv,
+        );
+    } else {
+        dispatchQMVf16io(
+            device, encoder, a.k_proj, a.norm_out, a.k, kv_qmv,
+        );
+        dispatchQMVf16io(
+            device, encoder, a.v_proj, a.norm_out, a.v, kv_qmv,
+        );
+    }
     bufferBarrier(encoder);
 }
 
