@@ -186,7 +186,7 @@ kernel void q4mv_spec_f16io_resadd(
     device const uint8_t* packed_nibs [[buffer(0)]],
     device const ushort*  scales      [[buffer(1)]],
     device const ushort*  biases      [[buffer(2)]],
-    constant half*        input       [[buffer(3)]],
+    device const half*    input       [[buffer(3)]],
     device float*         residual    [[buffer(4)]],
     constant QMVDims&     dims        [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -202,7 +202,22 @@ kernel void q4mv_spec_f16io_resadd(
         "K must be >= 256 for Q4 uint32 path.");
     static_assert(group_size % 8 == 0,
         "Group size must be 8-aligned.");
+    static_assert(K % 512 == 0,
+        "K must be divisible by 512 "
+        "for cooperative TG load.");
+    static_assert(K <= 4096,
+        "K must fit in threadgroup memory.");
     const uint M = dims.M;
+
+    // Cache input in threadgroup memory — faster than
+    // constant cache for non-uniform (interleaved) access.
+    threadgroup half tg_input[K];
+    constexpr uint elems_per_thread = K / 512;
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_input[tid * elems_per_thread + j] =
+            input[tid * elems_per_thread + j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
@@ -239,7 +254,7 @@ kernel void q4mv_spec_f16io_resadd(
 
         float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const float x = float(input[col_base + ni]);
+            const float x = float(tg_input[col_base + ni]);
             nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
             nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
             gs += x;
@@ -367,7 +382,7 @@ kernel void q4mv_spec_f16in(
     device const uint8_t* packed_nibs [[buffer(0)]],
     device const ushort*  scales      [[buffer(1)]],
     device const ushort*  biases      [[buffer(2)]],
-    constant half*        input       [[buffer(3)]],
+    device const half*    input       [[buffer(3)]],
     device float*         output      [[buffer(4)]],
     constant QMVDims&     dims        [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -383,7 +398,22 @@ kernel void q4mv_spec_f16in(
         "K must be >= 256 for Q4 uint32 path.");
     static_assert(group_size % 8 == 0,
         "Group size must be 8-aligned.");
+    static_assert(K % 512 == 0,
+        "K must be divisible by 512 "
+        "for cooperative TG load.");
+    static_assert(K <= 4096,
+        "K must fit in threadgroup memory.");
     const uint M = dims.M;
+
+    // Cache input in threadgroup memory — faster than
+    // constant cache for non-uniform (interleaved) access.
+    threadgroup half tg_input[K];
+    constexpr uint elems_per_thread = K / 512;
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_input[tid * elems_per_thread + j] =
+            input[tid * elems_per_thread + j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
@@ -420,7 +450,7 @@ kernel void q4mv_spec_f16in(
 
         float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const float x = float(input[col_base + ni]);
+            const float x = float(tg_input[col_base + ni]);
             nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
             nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
             gs += x;
