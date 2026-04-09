@@ -1578,26 +1578,31 @@ pub fn setQ4Buffer(
     std.debug.assert(bits_index + 2 <= MAX_BUFFER_INDEX);
     std.debug.assert(q4_buffer.packed_count > 0);
 
-    // Bind packed nibbles at offset 0.
-    encoder.msgSend(void, "setBuffer:offset:atIndex:", .{
-        q4_buffer.obj.value,
-        @as(c_ulong, 0),
-        @as(c_ulong, bits_index),
-    });
-
-    // Bind scales at scaleOffset (same MTLBuffer).
-    encoder.msgSend(void, "setBuffer:offset:atIndex:", .{
-        q4_buffer.obj.value,
+    // Batch-bind all 3 slots (nibbles, scales, biases)
+    // in a single ObjC call.  Same MTLBuffer at three
+    // consecutive indices with different offsets.
+    const raw_ptr = q4_buffer.obj.value;
+    const ptrs = [3]?*anyopaque{
+        raw_ptr, raw_ptr, raw_ptr,
+    };
+    const offsets = [3]c_ulong{
+        0,
         @as(c_ulong, q4_buffer.scaleOffset()),
-        @as(c_ulong, bits_index + 1),
-    });
-
-    // Bind biases at biasOffset (same MTLBuffer).
-    encoder.msgSend(void, "setBuffer:offset:atIndex:", .{
-        q4_buffer.obj.value,
         @as(c_ulong, q4_buffer.biasOffset()),
-        @as(c_ulong, bits_index + 2),
-    });
+    };
+    const range = [2]c_ulong{
+        @as(c_ulong, bits_index),
+        3,
+    };
+    encoder.msgSend(
+        void,
+        "setBuffers:offsets:withRange:",
+        .{
+            @as(*const anyopaque, @ptrCast(&ptrs)),
+            @as(*const anyopaque, @ptrCast(&offsets)),
+            @as([2]c_ulong, range),
+        },
+    );
 }
 
 fn compileLibrary(device: objc.Object) !objc.Object {
