@@ -239,15 +239,21 @@ kernel void kv_cache_update(
     const uint d = gid % dims.head_dim;
     const uint pos = dims.position;
 
-    // Cache layout: [head][time][d].
+    // K cache layout: [head][time][d] — coalesced for Q·K
+    // dot products where lanes iterate over d.
+    // V cache layout: [head][d][time] — coalesced for
+    // weighted V sum where lanes iterate over t.
     const uint cache_stride =
         dims.max_context_length * dims.head_dim;
-    const uint cache_idx =
+    const uint k_idx =
         head * cache_stride + pos * dims.head_dim + d;
+    const uint v_idx =
+        head * cache_stride
+        + d * dims.max_context_length + pos;
 
     // f32 → f16 truncation happens here.
-    k_cache[cache_idx] = half(k_proj[gid]);
-    v_cache[cache_idx] = half(v_proj[gid]);
+    k_cache[k_idx] = half(k_proj[gid]);
+    v_cache[v_idx] = half(v_proj[gid]);
 }
 
 // ============================================================================
@@ -950,10 +956,11 @@ kernel void fused_k_norm_rope_kv_cache_f16(
     device const half* k_in = k_proj + head * head_dim;
     device const half* v_in = v_proj + head * head_dim;
 
-    // Cache layout: [head][time][d].
+    // K cache layout: [head][time][d].
+    // V cache layout: [head][d][time].
     const uint cache_stride =
         dims.max_context_length * head_dim;
-    const uint cache_base =
+    const uint k_cache_base =
         head * cache_stride
         + dims.position * head_dim;
 
@@ -1007,15 +1014,18 @@ kernel void fused_k_norm_rope_kv_cache_f16(
         const float x0 = shared[tid];
         const float x1 = shared[tid + 1];
 
-        k_cache[cache_base + tid] =
+        k_cache[k_cache_base + tid] =
             half(x0 * cos_val - x1 * sin_val);
-        k_cache[cache_base + tid + 1] =
+        k_cache[k_cache_base + tid + 1] =
             half(x0 * sin_val + x1 * cos_val);
     }
 
-    // ── Step 5: Copy V to cache (no norm/rotation) ───────────
+    // ── Step 5: Copy V to cache (transposed layout) ──────────
     if (tid < head_dim) {
-        v_cache[cache_base + tid] = v_in[tid];
+        const uint v_idx = head * cache_stride
+            + tid * dims.max_context_length
+            + dims.position;
+        v_cache[v_idx] = v_in[tid];
     }
 }
 
@@ -1079,22 +1089,27 @@ kernel void fused_rope_k_kv_cache_update_f16(
     const float x0 = float(k_proj[src_base]);
     const float x1 = float(k_proj[src_base + 1]);
 
-    // Cache layout: [head][time][d].
+    // K cache layout: [head][time][d].
+    // V cache layout: [head][d][time].
     const uint cache_stride =
         dims.max_context_length * dims.head_dim;
-    const uint cache_base =
+    const uint k_base =
         head * cache_stride + pos * dims.head_dim
         + pair * 2;
 
     // Write RoPE-rotated K directly to cache.
-    k_cache[cache_base]     =
+    k_cache[k_base] =
         half(x0 * cos_val - x1 * sin_val);
-    k_cache[cache_base + 1] =
+    k_cache[k_base + 1] =
         half(x0 * sin_val + x1 * cos_val);
 
-    // ── V copy (no rotation) ─────────────────────────────────
-    v_cache[cache_base]     = v_proj[src_base];
-    v_cache[cache_base + 1] = v_proj[src_base + 1];
+    // ── V copy (transposed layout) ──────────────────────────
+    const uint max_ctx = dims.max_context_length;
+    const uint v_head_base = head * cache_stride;
+    v_cache[v_head_base + (pair * 2) * max_ctx + pos] =
+        v_proj[src_base];
+    v_cache[v_head_base + (pair * 2 + 1) * max_ctx + pos] =
+        v_proj[src_base + 1];
 }
 
 // ============================================================================
@@ -1126,15 +1141,19 @@ kernel void kv_cache_update_f16in(
     const uint d = gid % dims.head_dim;
     const uint pos = dims.position;
 
-    // Cache layout: [head][time][d].
+    // K cache layout: [head][time][d].
+    // V cache layout: [head][d][time].
     const uint cache_stride =
         dims.max_context_length * dims.head_dim;
-    const uint cache_idx =
+    const uint k_idx =
         head * cache_stride + pos * dims.head_dim + d;
+    const uint v_idx =
+        head * cache_stride
+        + d * dims.max_context_length + pos;
 
     // Both source and cache are f16 — no cast needed.
-    k_cache[cache_idx] = k_proj[gid];
-    v_cache[cache_idx] = v_proj[gid];
+    k_cache[k_idx] = k_proj[gid];
+    v_cache[v_idx] = v_proj[gid];
 }
 
 // ============================================================================
@@ -1265,11 +1284,13 @@ kernel void gqa_attention_f16io(
     threadgroup_barrier(mem_flags::mem_device);
 
     // ── Step 5: Weighted sum of V, write f16 output ──────────
+    // V cache is transposed: [head][d][time] for coalesced
+    // reads when lanes iterate over t.
     for (uint d = tid; d < head_dim; d += THREADS) {
         float accum = 0.0f;
         for (uint t = 0; t < seq_len; t++) {
             accum +=
-                scores[t] * float(v[t * head_dim + d]);
+                scores[t] * float(v[d * max_ctx + t]);
         }
         output[head * head_dim + d] = half(accum);
     }
@@ -1402,11 +1423,13 @@ kernel void gqa_attention_f16io_tg(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ── Step 5: Weighted sum of V, write f16 output ──────────
+    // V cache is transposed: [head][d][time] for coalesced
+    // reads when lanes iterate over t.
     for (uint d = tid; d < head_dim; d += THREADS) {
         float accum = 0.0f;
         for (uint t = 0; t < seq_len; t++) {
             accum +=
-                tg_scores[t] * float(v[t * head_dim + d]);
+                tg_scores[t] * float(v[d * max_ctx + t]);
         }
         output[head * head_dim + d] = half(accum);
     }
@@ -1576,8 +1599,10 @@ kernel void gqa_attention_fused_f16io_tg(
     }
 
     // Copy V to v_cache at current position.
+    // V cache is transposed: [head][d][time] for coalesced
+    // reads in Phase 5 where lanes iterate over t.
     if (tid < head_dim) {
-        vc[position * head_dim + tid] = vr[tid];
+        vc[tid * max_ctx + position] = vr[tid];
     }
 
     // Ensure k_cache/v_cache writes are visible within TG.
@@ -1649,6 +1674,9 @@ kernel void gqa_attention_fused_f16io_tg(
     // Each SIMD group handles one output dimension: 32 lanes
     // split seq_len, then simd_sum reduces.  16 SIMD groups
     // process 16 dims per iteration (128 / 16 = 8 iters).
+    // V cache is transposed: [head][d][time] — adjacent lanes
+    // (adjacent t) read consecutive addresses for coalesced
+    // 64-byte memory transactions.
     for (uint d = simd_group; d < head_dim;
          d += NUM_SIMD_GROUPS)
     {
@@ -1657,7 +1685,7 @@ kernel void gqa_attention_fused_f16io_tg(
              t += SIMD_SIZE)
         {
             partial += tg_scores[t]
-                * float(vc[t * head_dim + d]);
+                * float(vc[d * max_ctx + t]);
         }
         const float accum = simd_sum(partial);
         if (simd_lane == 0) {

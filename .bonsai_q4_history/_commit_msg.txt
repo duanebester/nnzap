@@ -1,1 +1,9 @@
-Doubled GQA attention fused kernel threads from 256 to 512 (8→16 SIMD groups). This halves iterations in Phase 3 (Q·K dot products: 16 tokens/iter vs 8) and Phase 5 (weighted V sum: 128/16=8 iters vs 128/8=16 iters). Changed shared_buf from [256] to [512] floats. TG memory goes from 5KB to 6KB (well within 32KB limit). 16 TGs × 512 threads = 8K threads total — still fits on M2 Max's 38 cores. Only threads tid < head_dim=128 are active during norm/RoPE phases; all 512 active during attention/softmax/V-sum phases. Result: 224.4→234.4 tok/s (+4.5%), parity with MLX reference improved from 93.3% to 98.0%. P50 latency dropped 202μs (4453→4251μs).
+Transposed V cache layout from [head][time][dim] to [head][dim][time] across all 7 kernels that access V cache (3 GQA attention variants + 4 KV cache update variants). K cache layout unchanged.
+
+**Problem**: In GQA Phase 5 (weighted V sum), SIMD lanes iterate over time steps t, reading vc[t*head_dim+d]. Adjacent lanes access addresses head_dim×2=256 bytes apart — each lane hits a separate 128-byte cache line. 32 lanes load 32 cache lines (4096 bytes) for 64 bytes of useful data = 1.6% bandwidth utilization.
+
+**Fix**: With transposed layout vc[d*max_ctx+t], adjacent lanes read consecutive addresses (2 bytes apart). 32 values fit in one cache line. 128 bytes loaded for 64 bytes useful = 50% utilization (32× improvement).
+
+**Estimated savings**: ~63KB wasted bandwidth per head per block × 16 heads × 28 blocks = ~28MB per token. V cache writes become strided but happen once per KV head vs reads happening once per query head (4× fewer), and write volume is tiny (128 elements per head).
+
+**Correctness**: Golden output test passes — all 7 V cache access points updated consistently (5 write sites, 3 read sites).
