@@ -733,11 +733,14 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
     const uint lane = tid % 32;
 
     // ── Phase 1: Cooperative RMSNorm ────────────────
+    // Cache residual in registers to avoid a second
+    // device memory read in Phase 2.
+    float cached_res[elems_per_thread];
     float partial_sos = 0.0f;
     for (uint j = 0; j < elems_per_thread; j++) {
-        const float v =
+        cached_res[j] =
             residual[tid * elems_per_thread + j];
-        partial_sos += v * v;
+        partial_sos += cached_res[j] * cached_res[j];
     }
     partial_sos = simd_sum(partial_sos);
     if (lane == 0) {
@@ -762,7 +765,7 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
     for (uint j = 0; j < elems_per_thread; j++) {
         const uint elem =
             tid * elems_per_thread + j;
-        const float val = residual[elem] * rms_inv
+        const float val = cached_res[j] * rms_inv
             * float(norm_scale[elem]);
         tg_input[elem] = half(bf16_round(val));
     }
@@ -869,11 +872,14 @@ kernel void q4mv_spec_fused_norm_f16io(
     const uint lane = tid % 32;
 
     // ── Phase 1: Cooperative RMSNorm ────────────────
+    // Cache residual in registers to avoid a second
+    // device memory read in Phase 2.
+    float cached_res[elems_per_thread];
     float partial_sos = 0.0f;
     for (uint j = 0; j < elems_per_thread; j++) {
-        const float v =
+        cached_res[j] =
             residual[tid * elems_per_thread + j];
-        partial_sos += v * v;
+        partial_sos += cached_res[j] * cached_res[j];
     }
     partial_sos = simd_sum(partial_sos);
     if (lane == 0) {
@@ -898,7 +904,7 @@ kernel void q4mv_spec_fused_norm_f16io(
     for (uint j = 0; j < elems_per_thread; j++) {
         const uint elem =
             tid * elems_per_thread + j;
-        const float val = residual[elem] * rms_inv
+        const float val = cached_res[j] * rms_inv
             * float(norm_scale[elem]);
         tg_input[elem] = half(bf16_round(val));
     }
@@ -1019,11 +1025,14 @@ kernel void q4mv_spec_fused_norm_pair_f16io(
     const uint lane = tid % 32;
 
     // ── Phase 1: Cooperative RMSNorm ────────────────
+    // Cache residual in registers to avoid a second
+    // device memory read in Phase 2.
+    float cached_res[elems_per_thread];
     float partial_sos = 0.0f;
     for (uint j = 0; j < elems_per_thread; j++) {
-        const float v =
+        cached_res[j] =
             residual[tid * elems_per_thread + j];
-        partial_sos += v * v;
+        partial_sos += cached_res[j] * cached_res[j];
     }
     partial_sos = simd_sum(partial_sos);
     if (lane == 0) {
@@ -1048,7 +1057,7 @@ kernel void q4mv_spec_fused_norm_pair_f16io(
     for (uint j = 0; j < elems_per_thread; j++) {
         const uint elem =
             tid * elems_per_thread + j;
-        const float val = residual[elem] * rms_inv
+        const float val = cached_res[j] * rms_inv
             * float(norm_scale[elem]);
         tg_input[elem] = half(bf16_round(val));
     }
