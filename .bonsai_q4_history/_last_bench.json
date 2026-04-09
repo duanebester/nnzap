@@ -1,20 +1,20 @@
 {
-  "timestamp_utc": "2026-04-09T17:34:20Z",
+  "timestamp_utc": "2026-04-09T17:36:18Z",
   "model": "Qwen3-1.7B-Q4",
   "quant": "Q4_MLX_g64",
   "prompt_tokens": 19,
   "warmup_tokens": 8,
   "measured_tokens": 64,
-  "load_ms": 96.2,
-  "prefill_tok_per_sec": 96.9,
-  "decode_tok_per_sec": 215.0,
-  "decode_p50_us": 4682,
-  "decode_p99_us": 5079,
+  "load_ms": 93.4,
+  "prefill_tok_per_sec": 98.8,
+  "decode_tok_per_sec": 218.3,
+  "decode_p50_us": 4607,
+  "decode_p99_us": 4787,
   "power_source": "ac"
 ,
-  "reference_decode_tok_per_sec": 238.2,
-  "reference_prefill_tok_per_sec": 381.6,
-  "reference_decode_p50_us": 4159,
-  "reference_decode_p99_us": 4484,
-  "parity_pct": 90.3
+  "reference_decode_tok_per_sec": 237.0,
+  "reference_prefill_tok_per_sec": 383.6,
+  "reference_decode_p50_us": 4168,
+  "reference_decode_p99_us": 5860,
+  "parity_pct": 92.1
 }

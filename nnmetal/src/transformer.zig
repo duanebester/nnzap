@@ -2919,7 +2919,7 @@ fn encodeAttnProjFusedNorm(
             kv_qmv,
         );
     }
-    bufferBarrier(encoder);
+    // Barrier deferred to encodeAttentionProjections (caller).
 }
 
 /// Separate-norm path: RMSNorm → barrier → Q + fused KV.
@@ -3033,7 +3033,7 @@ fn encodeAttnProjSeparateNorm(
             );
         }
     }
-    bufferBarrier(encoder);
+    // Barrier deferred to encodeAttentionProjections (caller).
 }
 
 /// Encode RoPE on Q and K, then write K/V to the cache.
