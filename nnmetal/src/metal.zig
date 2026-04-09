@@ -335,6 +335,140 @@ pub const PackedBuffer = struct {
 };
 
 // ============================================================================
+// Q4Buffer — 4-bit quantized weights in MLX Q4 (affine) format
+// ============================================================================
+
+/// A Metal shared buffer storing 4-bit packed weights in Q4 MLX
+/// (affine) format. The buffer contains three regions in a single
+/// allocation:
+///
+///   [packed_nibbles (uint8_t)] [scales (raw BF16 u16)]
+///                              [biases (raw BF16 u16)]
+///
+/// Each weight element is a 4-bit unsigned integer (0–15). Two
+/// nibbles are packed per byte. MLX packs 8 nibbles per uint32 in
+/// sequential column order.
+///
+/// The encoder binds the same MTLBuffer three times with different
+/// offsets to present all three regions to the kernel without extra
+/// allocations.
+pub const Q4Buffer = struct {
+    obj: objc.Object,
+    packed_count: u32, // number of weight elements (nibbles)
+    group_size: u32, // weights per scale/bias group
+    byte_len: u32, // total allocation in bytes
+
+    /// Number of packed bytes: ceil(packed_count / 2).
+    /// Each byte holds two 4-bit nibbles.
+    pub fn nibbleBytes(self: Q4Buffer) u32 {
+        std.debug.assert(self.packed_count > 0);
+        std.debug.assert(self.group_size > 0);
+        return @as(u32, @intCast(
+            std.math.divCeil(u32, self.packed_count, 2) catch
+                unreachable,
+        ));
+    }
+
+    /// Number of scale/bias groups: ceil(packed_count / group_size).
+    pub fn numGroups(self: Q4Buffer) u32 {
+        std.debug.assert(self.packed_count > 0);
+        std.debug.assert(self.group_size > 0);
+        return @as(u32, @intCast(
+            std.math.divCeil(
+                u32,
+                self.packed_count,
+                self.group_size,
+            ) catch unreachable,
+        ));
+    }
+
+    /// Byte offset where the raw BF16 scale array begins
+    /// (= nibbleBytes, since scales follow packed nibbles).
+    pub fn scaleOffset(self: Q4Buffer) u32 {
+        const offset = self.nibbleBytes();
+        std.debug.assert(offset > 0);
+        std.debug.assert(offset < self.byte_len);
+        return offset;
+    }
+
+    /// Byte offset where the raw BF16 bias array begins
+    /// (= nibbleBytes + numGroups * 2, since each BF16 bias
+    /// is 2 bytes and biases follow scales).
+    pub fn biasOffset(self: Q4Buffer) u32 {
+        const offset =
+            self.nibbleBytes() + self.numGroups() * 2;
+        std.debug.assert(offset > 0);
+        std.debug.assert(offset < self.byte_len);
+        return offset;
+    }
+
+    /// Allocate a new Q4Buffer for `num_weights` 4-bit elements
+    /// with the given group size.
+    pub fn init(
+        device: objc.Object,
+        num_weights: u32,
+        group_size_val: u32,
+    ) !Q4Buffer {
+        std.debug.assert(num_weights > 0);
+        std.debug.assert(group_size_val > 0);
+
+        const nibble_bytes: u32 = @intCast(
+            std.math.divCeil(u32, num_weights, 2) catch
+                unreachable,
+        );
+        const num_groups: u32 = @intCast(
+            std.math.divCeil(
+                u32,
+                num_weights,
+                group_size_val,
+            ) catch unreachable,
+        );
+        const scale_bytes: u32 = num_groups * 2; // raw BF16 (u16)
+        const bias_bytes: u32 = num_groups * 2; // raw BF16 (u16)
+        const total_bytes: u32 =
+            nibble_bytes + scale_bytes + bias_bytes;
+        std.debug.assert(total_bytes > 0);
+
+        const raw = device.msgSend(
+            ?*anyopaque,
+            "newBufferWithLength:options:",
+            .{
+                @as(c_ulong, total_bytes),
+                MTLResourceOptions.storage_shared,
+            },
+        ) orelse return error.MetalBufferAllocFailed;
+
+        const result = Q4Buffer{
+            .obj = objc.Object.fromId(raw),
+            .packed_count = num_weights,
+            .group_size = group_size_val,
+            .byte_len = total_bytes,
+        };
+
+        // Zero-fill to prevent stale data leaks (Rule 21).
+        const ptr = result.obj.msgSend(
+            *anyopaque,
+            "contents",
+            .{},
+        );
+        const byte_ptr: [*]u8 = @ptrCast(ptr);
+        @memset(byte_ptr[0..total_bytes], 0);
+
+        return result;
+    }
+
+    /// Return the underlying Metal buffer object.
+    pub fn metalBuffer(self: Q4Buffer) objc.Object {
+        return self.obj;
+    }
+
+    pub fn deinit(self: *Q4Buffer) void {
+        self.obj.msgSend(void, "release", .{});
+        self.* = undefined;
+    }
+};
+
+// ============================================================================
 // MultiBuffered — generic N-buffered resource for overlapping CPU/GPU work
 // ============================================================================
 
@@ -784,7 +918,7 @@ pub const Device = struct {
     qmv_const_f16io_resadd: ComputePipeline,
     qmv_const_multigroup_f16io_resadd: ComputePipeline,
 
-    // Specialized QMV pipelines — compiled at init for the
+    // Specialized QMV pipelines (Q1) — compiled at init for the
     // specific model dimensions. Set by transformer init
     // via initSpecializedQMV(). Null when not initialized.
     spec_qmv_f16io: ?ComputePipeline = null,
@@ -797,11 +931,30 @@ pub const Device = struct {
     spec_qmv_fused_norm_f16io: ?ComputePipeline = null,
     spec_qmv_fused_norm_pair_f16io: ?ComputePipeline = null,
 
-    // K values the specialized pipelines target.
+    // K values the Q1 specialized pipelines target.
     // Used by dispatch functions to verify dims.K matches
     // before selecting a specialized pipeline.
     spec_hidden_K: u32 = 0,
     spec_inter_K: u32 = 0,
+
+    // Specialized Q4 QMV pipelines — compiled at init for
+    // 4-bit MLX quantized models.  Same structure as the Q1
+    // specialized pipelines but using Q4 dequant kernels
+    // (nibble extraction + affine scale/bias).  Null when
+    // the model uses Q1 quantization.
+    spec_q4mv_f16io: ?ComputePipeline = null,
+    spec_q4mv_f16io_resadd: ?ComputePipeline = null,
+    spec_q4mv_fused_pair_f16io: ?ComputePipeline = null,
+    spec_q4mv_f16in: ?ComputePipeline = null,
+    spec_q4mv_mg_f16io_resadd: ?ComputePipeline = null,
+    spec_q4mv_fused_pair_silu_f16io: ?ComputePipeline = null,
+    spec_q4mv_fused_norm_pair_silu_f16io: ?ComputePipeline = null,
+    spec_q4mv_fused_norm_f16io: ?ComputePipeline = null,
+    spec_q4mv_fused_norm_pair_f16io: ?ComputePipeline = null,
+
+    // K values the Q4 specialized pipelines target.
+    spec_q4_hidden_K: u32 = 0,
+    spec_q4_inter_K: u32 = 0,
 
     pub fn init(self: *Device) !void {
         const device = objc.Object.fromId(
@@ -1404,6 +1557,46 @@ pub fn setPackedBuffer(
         packed_buffer.obj.value,
         scale_byte_offset,
         @as(c_ulong, bits_index + 1),
+    });
+}
+
+/// Bind a Q4Buffer's three regions (packed nibbles, raw BF16
+/// scales, and raw BF16 biases) to a compute encoder at
+/// consecutive indices.  All three bindings reference the same
+/// underlying MTLBuffer — scales and biases use byte offsets
+/// into the single allocation.
+///
+/// After this call:
+///   buffer(bits_index)   → packed uint8_t nibbles, offset 0
+///   buffer(bits_index+1) → raw BF16 scales (ushort), offset = scaleOffset()
+///   buffer(bits_index+2) → raw BF16 biases (ushort), offset = biasOffset()
+pub fn setQ4Buffer(
+    encoder: objc.Object,
+    q4_buffer: Q4Buffer,
+    bits_index: u32,
+) void {
+    std.debug.assert(bits_index + 2 <= MAX_BUFFER_INDEX);
+    std.debug.assert(q4_buffer.packed_count > 0);
+
+    // Bind packed nibbles at offset 0.
+    encoder.msgSend(void, "setBuffer:offset:atIndex:", .{
+        q4_buffer.obj.value,
+        @as(c_ulong, 0),
+        @as(c_ulong, bits_index),
+    });
+
+    // Bind scales at scaleOffset (same MTLBuffer).
+    encoder.msgSend(void, "setBuffer:offset:atIndex:", .{
+        q4_buffer.obj.value,
+        @as(c_ulong, q4_buffer.scaleOffset()),
+        @as(c_ulong, bits_index + 1),
+    });
+
+    // Bind biases at biasOffset (same MTLBuffer).
+    encoder.msgSend(void, "setBuffer:offset:atIndex:", .{
+        q4_buffer.obj.value,
+        @as(c_ulong, q4_buffer.biasOffset()),
+        @as(c_ulong, bits_index + 2),
     });
 }
 

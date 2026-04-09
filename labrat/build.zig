@@ -85,6 +85,29 @@ pub fn build(b: *std.Build) void {
         br_cmd.addArgs(args);
     }
 
+    // ── Bonsai Q4 researcher CLI ──────────────────────────────────────
+    const bonsai_q4_researcher = b.addExecutable(.{
+        .name = "bonsai_q4_researcher",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bonsai_q4_researcher.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "tools.zig", .module = tools_module },
+                .{ .name = "toolbox.zig", .module = toolbox_module },
+            },
+        }),
+    });
+    b.installArtifact(bonsai_q4_researcher);
+
+    const bq4r_step = b.step("bonsai-q4-researcher", "Bonsai Q4 inference research and benchmarking");
+    const bq4r_cmd = b.addRunArtifact(bonsai_q4_researcher);
+    bq4r_step.dependOn(&bq4r_cmd.step);
+    bq4r_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        bq4r_cmd.addArgs(args);
+    }
+
     // ── MNIST agent (LLM experiment runner) ───────────────────────────
     const mnist_agent = b.addExecutable(.{
         .name = "mnist_agent",
@@ -127,6 +150,28 @@ pub fn build(b: *std.Build) void {
     ba_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         ba_cmd.addArgs(args);
+    }
+
+    // ── Bonsai Q4 agent (LLM engine optimiser) ────────────────────────
+    const bonsai_q4_agent = b.addExecutable(.{
+        .name = "bonsai_q4_agent",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bonsai_q4_agent.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "agent_core.zig", .module = agent_core_module },
+            },
+        }),
+    });
+    b.installArtifact(bonsai_q4_agent);
+
+    const bq4a_step = b.step("bonsai-q4-agent", "Autonomous Q4 engine optimisation runner");
+    const bq4a_cmd = b.addRunArtifact(bonsai_q4_agent);
+    bq4a_step.dependOn(&bq4a_cmd.step);
+    bq4a_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        bq4a_cmd.addArgs(args);
     }
 
     // ── Tests ─────────────────────────────────────────────────────────

@@ -18,17 +18,47 @@ const objc = @import("objc");
 const metal = @import("metal.zig");
 const layout = @import("layout.zig");
 const specialized_qmv = @import("specialized_qmv.zig");
+const specialized_q4mv = @import("specialized_q4mv.zig");
 
 const log = std.log.scoped(.transformer);
 const divCeil = layout.divCeil;
 
 // ============================================================================
+// QuantFormat — selects the weight quantization scheme
+// ============================================================================
+
+/// Quantization format for weight matrices.  Determines buffer
+/// layout, dequantization kernels, and model loading strategy.
+/// The format is a comptime parameter on TransformerConfig so
+/// the entire pipeline specializes at compile time — no runtime
+/// branching on the hot path.
+pub const QuantFormat = enum {
+    /// 1-bit symmetric: each weight is a single bit, dequantized
+    /// as `bit ? +scale : -scale`.  Buffer layout:
+    ///   [packed_bits (uint8_t)] [scales (f16)]
+    /// MLX stores affine (scale, bias); we convert to symmetric
+    /// at load time by halving the scale and discarding the bias.
+    q1_0,
+
+    /// 4-bit MLX affine: each weight is a 4-bit unsigned nibble
+    /// (0–15), dequantized as `scale * float(nibble) + bias`.
+    /// Buffer layout:
+    ///   [packed_nibbles (uint8_t)] [scales (raw BF16 u16)]
+    ///                              [biases (raw BF16 u16)]
+    /// MLX packs 8 nibbles per uint32 in sequential column order.
+    /// Scales and biases are stored as raw BF16 uint16 bit
+    /// patterns — no host-side conversion.  GPU kernels convert
+    /// inline via zero-extension to f32.
+    q4_mlx,
+};
+
+// ============================================================================
 // TransformerDesc — input configuration for TransformerConfig
 // ============================================================================
 
-/// Describes a Qwen3-style transformer architecture.  All fields are
-/// required; no defaults.  Pass this to `TransformerConfig` to get a
-/// comptime type with all derived sizes and offsets.
+/// Describes a Qwen3-style transformer architecture.  Most fields
+/// are required; `quant_format` and `group_size` have defaults for
+/// backward compatibility with existing Q1 configs.
 pub const TransformerDesc = struct {
     vocab_size: u32,
     hidden_size: u32,
@@ -41,6 +71,13 @@ pub const TransformerDesc = struct {
     max_prefill_length: u32,
     rope_theta: f32,
     tie_word_embeddings: bool,
+    /// Weight quantization format.  Defaults to 1-bit symmetric
+    /// for backward compatibility with existing Bonsai configs.
+    quant_format: QuantFormat = .q1_0,
+    /// Number of weight elements per scale group.  Defaults to
+    /// 128 (Q1 convention).  Q4 MLX models typically use 64 or
+    /// 128 depending on the quantization tool settings.
+    group_size: u32 = 128,
 };
 
 // ============================================================================
@@ -70,7 +107,17 @@ pub fn TransformerConfig(comptime cfg: TransformerDesc) type {
         pub const rope_theta: f32 = cfg.rope_theta;
         pub const tie_word_embeddings: bool =
             cfg.tie_word_embeddings;
-        pub const group_size: u32 = 128;
+        pub const quant_format: QuantFormat =
+            cfg.quant_format;
+        pub const group_size: u32 = cfg.group_size;
+
+        /// Comptime weight buffer type — `PackedBuffer` for Q1,
+        /// `Q4Buffer` for Q4 MLX.  Used to parameterize
+        /// `ForwardBlockArgs` and `Model` field types.
+        pub const WeightBuffer = switch (cfg.quant_format) {
+            .q1_0 => metal.PackedBuffer,
+            .q4_mlx => metal.Q4Buffer,
+        };
 
         // -- Derived constants --
 
@@ -108,19 +155,34 @@ pub fn TransformerConfig(comptime cfg: TransformerDesc) type {
             // handles the size change.
         }
 
-        // -- 1-bit packed sizes (bytes) --
+        // -- Packed weight sizes (bytes) --
 
-        /// Total packed bytes (bits + f16 scales) for a weight
-        /// matrix with `rows × cols` elements.
+        /// Total packed bytes for a weight matrix with
+        /// `rows × cols` elements.  Layout depends on
+        /// quant_format:
+        ///   Q1: [bits] [scales]
+        ///   Q4: [nibbles] [scales] [biases]
         fn packedBytes(
             comptime rows: u32,
             comptime cols: u32,
         ) u32 {
             const total = rows * cols;
-            const bit_bytes = divCeil(total, 8);
             const num_groups = divCeil(total, group_size);
-            const scale_bytes = num_groups * 2; // f16
-            return bit_bytes + scale_bytes;
+            return switch (quant_format) {
+                .q1_0 => blk: {
+                    const bit_bytes = divCeil(total, 8);
+                    const scale_bytes = num_groups * 2;
+                    break :blk bit_bytes + scale_bytes;
+                },
+                .q4_mlx => blk: {
+                    const nibble_bytes =
+                        divCeil(total, 2);
+                    const scale_bytes = num_groups * 2;
+                    const bias_bytes = num_groups * 2;
+                    break :blk nibble_bytes +
+                        scale_bytes + bias_bytes;
+                },
+            };
         }
 
         // Per-layer packed weight sizes (bytes).
@@ -154,11 +216,10 @@ pub fn TransformerConfig(comptime cfg: TransformerDesc) type {
         pub const lm_head_bytes: u32 =
             if (tie_word_embeddings) 0 else packedBytes(hidden_size, vocab_size);
 
-        // RMSNorm scales: f16, two per layer (attn + ffn) + final.
-        // QK norms: f16, two per layer (q_norm + k_norm), each
-        // head_dim elements.  Stored as f16 at inference time
-        // (converted from f32 at load time — negligible loss for
-        // values near 1.0).
+        // RMSNorm scales: f32, two per layer (attn + ffn) + final.
+        // QK norms: f32, two per layer (q_norm + k_norm), each
+        // head_dim elements.  Stored as f32 at inference time
+        // (lossless conversion from source BF16/F16/F32).
         pub const norm_scales_per_layer: u32 =
             hidden_size * 2 + head_dim * 2;
         pub const total_norm_scale_count: u32 =
@@ -167,7 +228,7 @@ pub fn TransformerConfig(comptime cfg: TransformerDesc) type {
         // Total model weight bytes.  u64 for future-proofing —
         // the 8B model exceeds 1 GB.
         pub const total_weight_bytes: u64 =
-            @as(u64, embedding_bytes) + total_layer_weight_bytes + lm_head_bytes + total_norm_scale_count * 2; // f16
+            @as(u64, embedding_bytes) + total_layer_weight_bytes + lm_head_bytes + total_norm_scale_count * 4; // f32
 
         // -- KV cache sizes (f16 elements) --
         // u64 because large contexts can exceed u32 range.
@@ -218,6 +279,10 @@ pub fn TransformerConfig(comptime cfg: TransformerDesc) type {
 // Model configs — validate comptime logic across all sizes
 // ============================================================================
 
+// ============================================================================
+// Model configs — Q1 (1-bit symmetric)
+// ============================================================================
+
 pub const Bonsai1_7B = TransformerConfig(.{
     .vocab_size = 151669,
     .hidden_size = 2048,
@@ -258,6 +323,62 @@ pub const Bonsai8B = TransformerConfig(.{
     .max_prefill_length = 512,
     .rope_theta = 1000000.0,
     .tie_word_embeddings = false,
+});
+
+// ============================================================================
+// Model configs — Q4 MLX (4-bit affine)
+// ============================================================================
+
+/// Standard Qwen3 1.7B with MLX 4-bit quantization.
+/// vocab_size = 151936 (standard Qwen3 tokenizer, not the
+/// trimmed 151669 used by PrismML's 1-bit Bonsai models).
+/// group_size = 64 (MLX default for 4-bit quantization).
+pub const Bonsai1_7B_Q4 = TransformerConfig(.{
+    .vocab_size = 151936,
+    .hidden_size = 2048,
+    .intermediate_size = 6144,
+    .num_layers = 28,
+    .num_query_heads = 16,
+    .num_kv_heads = 8,
+    .head_dim = 128,
+    .max_context_length = 32768,
+    .max_prefill_length = 512,
+    .rope_theta = 1000000.0,
+    .tie_word_embeddings = true,
+    .quant_format = .q4_mlx,
+    .group_size = 64,
+});
+
+pub const Bonsai4B_Q4 = TransformerConfig(.{
+    .vocab_size = 151936,
+    .hidden_size = 2560,
+    .intermediate_size = 9728,
+    .num_layers = 36,
+    .num_query_heads = 32,
+    .num_kv_heads = 8,
+    .head_dim = 128,
+    .max_context_length = 32768,
+    .max_prefill_length = 512,
+    .rope_theta = 5000000.0,
+    .tie_word_embeddings = true,
+    .quant_format = .q4_mlx,
+    .group_size = 64,
+});
+
+pub const Bonsai8B_Q4 = TransformerConfig(.{
+    .vocab_size = 151936,
+    .hidden_size = 4096,
+    .intermediate_size = 12288,
+    .num_layers = 36,
+    .num_query_heads = 32,
+    .num_kv_heads = 8,
+    .head_dim = 128,
+    .max_context_length = 65536,
+    .max_prefill_length = 512,
+    .rope_theta = 1000000.0,
+    .tie_word_embeddings = false,
+    .quant_format = .q4_mlx,
+    .group_size = 64,
 });
 
 // ============================================================================
@@ -339,7 +460,7 @@ pub const GQAFusedDims = extern struct {
     rope_theta: f32,
 };
 
-/// 1-bit embedding lookup dimensions.
+/// Embedding lookup dimensions (shared by Q1 and Q4 kernels).
 pub const EmbedDims = extern struct {
     vocab_size: u32,
     hidden_size: u32,
@@ -347,9 +468,10 @@ pub const EmbedDims = extern struct {
     group_size: u32,
 };
 
-/// 1-bit matrix-vector multiply dimensions.  Must match Metal's
-/// QMVDims in compute.metal.  M = output rows (weight matrix
-/// rows), K = input dimension (weight matrix columns).
+/// Quantized matrix-vector multiply dimensions.  Must match
+/// Metal's QMVDims in compute.metal and q4mv_specialized.metal.
+/// M = output rows (weight matrix rows), K = input dimension
+/// (weight matrix columns).  Shared by Q1 and Q4 kernels.
 pub const QMVDims = extern struct {
     M: u32,
     K: u32,
@@ -362,7 +484,8 @@ pub const QMVDims = extern struct {
 
 /// Holds pre-compiled Metal compute pipelines for all transformer
 /// kernels.  Compiles `transformer.metal` as a separate library
-/// from the training kernels in `compute.metal`.
+/// from the training kernels in `compute.metal`.  Includes both
+/// Q1 and Q4 embedding lookup pipelines.
 pub const TransformerPipelines = struct {
     rms_norm: metal.ComputePipeline,
     rms_norm_f16out: metal.ComputePipeline,
@@ -372,7 +495,9 @@ pub const TransformerPipelines = struct {
     kv_cache_update: metal.ComputePipeline,
     gqa_attention: metal.ComputePipeline,
     embedding_lookup: metal.ComputePipeline,
+    embedding_lookup_q4: metal.ComputePipeline,
     residual_add: metal.ComputePipeline,
+    rms_norm_bf16_f16out: metal.ComputePipeline,
     rms_norm_f16: metal.ComputePipeline,
     rope_f16: metal.ComputePipeline,
     kv_cache_update_f16in: metal.ComputePipeline,
@@ -441,10 +566,20 @@ pub const TransformerPipelines = struct {
                 lib,
                 "embedding_lookup",
             ),
+            .embedding_lookup_q4 = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "embedding_lookup_q4",
+            ),
             .residual_add = try metal.ComputePipeline.init(
                 device_obj,
                 lib,
                 "residual_add",
+            ),
+            .rms_norm_bf16_f16out = try metal.ComputePipeline.init(
+                device_obj,
+                lib,
+                "rms_norm_bf16_f16out",
             ),
             .rms_norm_f16 = try metal.ComputePipeline.init(
                 device_obj,
@@ -858,7 +993,10 @@ fn dispatchGQAAttentionFusedTG(
     setRawBuffer(encoder, q_norm_scale, 0, 6);
     setRawBuffer(encoder, k_norm_scale, 0, 7);
     metal.setBytes(
-        encoder, GQAFusedDims, &dims, 8,
+        encoder,
+        GQAFusedDims,
+        &dims,
+        8,
     );
 
     const grid = metal.MTLSize{
@@ -1740,47 +1878,456 @@ fn dispatchQMVf16ioResadd(
 }
 
 // ============================================================================
+// Q4 dispatch helpers (4-bit affine, MLX format)
+// ============================================================================
+
+/// Dispatch Q4 matrix-vector multiply: f16 input, f16 output.
+/// Q4 buffers bind nibbles/scales/biases at indices 0,1,2
+/// (via setQ4Buffer), input at 3, output at 4, dims at 5.
+/// Only the specialized pipeline path is supported for Q4.
+fn dispatchQ4MVf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    q4_buffer: metal.Q4Buffer,
+    input_buffer: objc.Object,
+    output_buffer: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(q4_buffer.packed_count > 0);
+
+    const pipeline = device.spec_q4mv_f16io orelse
+        unreachable; // Q4 requires specialized pipelines.
+
+    metal.setQ4Buffer(encoder, q4_buffer, 0);
+    setRawBuffer(encoder, input_buffer, 0, 3);
+    setRawBuffer(encoder, output_buffer, 0, 4);
+    metal.setBytes(encoder, QMVDims, &dims, 5);
+
+    const rows_per_tg: u32 = 32;
+    const threads_per_tg: u32 = 512;
+    const threadgroups =
+        (dims.M + rows_per_tg - 1) / rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch Q4 matrix-vector multiply: f16 input, f32 output.
+/// Used for the LM head projection where logits are f32.
+fn dispatchQ4MVf16in(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    q4_buffer: metal.Q4Buffer,
+    input_buffer: objc.Object,
+    output_buffer: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(q4_buffer.packed_count > 0);
+
+    const pipeline = device.spec_q4mv_f16in orelse
+        unreachable; // Q4 requires specialized pipelines.
+
+    metal.setQ4Buffer(encoder, q4_buffer, 0);
+    setRawBuffer(encoder, input_buffer, 0, 3);
+    setRawBuffer(encoder, output_buffer, 0, 4);
+    metal.setBytes(encoder, QMVDims, &dims, 5);
+
+    const rows_per_tg: u32 = 32;
+    const threads_per_tg: u32 = 512;
+    const threadgroups =
+        (dims.M + rows_per_tg - 1) / rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch Q4 QMV with fused f32 residual accumulate:
+/// residual[row] += dot(W_q4[row], input_f16).
+/// Selects single-group or multi-group pipeline based on
+/// dims.K matching spec_q4_hidden_K vs spec_q4_inter_K.
+fn dispatchQ4MVf16ioResadd(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    q4_buffer: metal.Q4Buffer,
+    input_buffer: objc.Object,
+    residual_buffer: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(q4_buffer.packed_count > 0);
+
+    // Select single-group (hidden) or multi-group (inter)
+    // pipeline based on K dimension.
+    const use_sg =
+        if (device.spec_q4mv_f16io_resadd) |s|
+            s.max_threads_per_group >= 512 and
+                dims.K == device.spec_q4_hidden_K
+        else
+            false;
+    const use_mg =
+        if (device.spec_q4mv_mg_f16io_resadd) |s|
+            s.max_threads_per_group >= 512 and
+                dims.K == device.spec_q4_inter_K
+        else
+            false;
+    const pipeline = if (use_sg)
+        device.spec_q4mv_f16io_resadd.?
+    else if (use_mg)
+        device.spec_q4mv_mg_f16io_resadd.?
+    else
+        unreachable; // Q4 resadd requires specialized pipelines.
+
+    metal.setQ4Buffer(encoder, q4_buffer, 0);
+    setRawBuffer(encoder, input_buffer, 0, 3);
+    setRawBuffer(encoder, residual_buffer, 0, 4);
+    metal.setBytes(encoder, QMVDims, &dims, 5);
+
+    const rows_per_tg: u32 = 32;
+    const threads_per_tg: u32 = 512;
+    const threadgroups =
+        (dims.M + rows_per_tg - 1) / rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch Q4 fused-pair QMV: f16 input, two f16 outputs.
+/// Two Q4 weight matrices share the same input vector.
+/// buffer(0-2): Q4 A, buffer(3): input, buffer(4): output A,
+/// buffer(5-7): Q4 B, buffer(8): output B, buffer(9): dims.
+fn dispatchQ4MVFusedPairf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.Q4Buffer,
+    packed_b: metal.Q4Buffer,
+    input_buffer: objc.Object,
+    output_a: objc.Object,
+    output_b: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+
+    const pipeline =
+        device.spec_q4mv_fused_pair_f16io orelse
+        unreachable; // Q4 fused pair requires specialized.
+
+    metal.setQ4Buffer(encoder, packed_a, 0);
+    setRawBuffer(encoder, input_buffer, 0, 3);
+    setRawBuffer(encoder, output_a, 0, 4);
+    metal.setQ4Buffer(encoder, packed_b, 5);
+    setRawBuffer(encoder, output_b, 0, 8);
+    metal.setBytes(encoder, QMVDims, &dims, 9);
+
+    const rows_per_tg: u32 = 16;
+    const threads_per_tg: u32 = 512;
+    const threadgroups =
+        (dims.M + rows_per_tg - 1) / rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch Q4 fused gate/up QMV + SiLU + elementwise mul.
+/// output[row] = silu(gate_row) * up_row.
+/// buffer(0-2): Q4 gate, buffer(3): input, buffer(4): output,
+/// buffer(5-7): Q4 up, buffer(8): dims.
+fn dispatchQ4MVFusedPairSiLUf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.Q4Buffer,
+    packed_b: metal.Q4Buffer,
+    input_buffer: objc.Object,
+    output: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+
+    const pipeline =
+        device.spec_q4mv_fused_pair_silu_f16io orelse
+        unreachable; // Q4 fused SiLU requires specialized.
+
+    metal.setQ4Buffer(encoder, packed_a, 0);
+    setRawBuffer(encoder, input_buffer, 0, 3);
+    setRawBuffer(encoder, output, 0, 4);
+    metal.setQ4Buffer(encoder, packed_b, 5);
+    metal.setBytes(encoder, QMVDims, &dims, 8);
+
+    const rows_per_tg: u32 = 16;
+    const threads_per_tg: u32 = 512;
+    const threadgroups =
+        (dims.M + rows_per_tg - 1) / rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch Q4 fused RMSNorm + single QMV: f32 residual in,
+/// f16 output.  Computes RMSNorm cooperatively in TG memory.
+/// buffer(0-2): Q4 weights, buffer(3): f32 residual,
+/// buffer(4): f16 output, buffer(5): dims,
+/// buffer(6): f16 norm_scale.
+fn dispatchQ4FusedNormQMVf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    q4_buffer: metal.Q4Buffer,
+    residual: objc.Object,
+    output: objc.Object,
+    norm_scale: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(q4_buffer.packed_count > 0);
+    std.debug.assert(residual.value != null);
+    std.debug.assert(norm_scale.value != null);
+
+    const pipeline =
+        device.spec_q4mv_fused_norm_f16io orelse
+        unreachable; // Q4 fused norm requires specialized.
+
+    metal.setQ4Buffer(encoder, q4_buffer, 0);
+    setRawBuffer(encoder, residual, 0, 3);
+    setRawBuffer(encoder, output, 0, 4);
+    metal.setBytes(encoder, QMVDims, &dims, 5);
+    setRawBuffer(encoder, norm_scale, 0, 6);
+
+    const rows_per_tg: u32 = 32;
+    const threads_per_tg: u32 = 512;
+    const threadgroups =
+        (dims.M + rows_per_tg - 1) / rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch Q4 fused RMSNorm + paired QMV: f32 residual in,
+/// two f16 outputs.
+/// buffer(0-2): Q4 A, buffer(3): f32 residual,
+/// buffer(4): f16 output A, buffer(5-7): Q4 B,
+/// buffer(8): f16 output B, buffer(9): dims,
+/// buffer(10): f16 norm_scale.
+fn dispatchQ4FusedNormPairQMVf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.Q4Buffer,
+    packed_b: metal.Q4Buffer,
+    residual: objc.Object,
+    output_a: objc.Object,
+    output_b: objc.Object,
+    norm_scale: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+    std.debug.assert(residual.value != null);
+    std.debug.assert(norm_scale.value != null);
+
+    const pipeline =
+        device.spec_q4mv_fused_norm_pair_f16io orelse
+        unreachable; // Q4 fused norm pair needs specialized.
+
+    metal.setQ4Buffer(encoder, packed_a, 0);
+    setRawBuffer(encoder, residual, 0, 3);
+    setRawBuffer(encoder, output_a, 0, 4);
+    metal.setQ4Buffer(encoder, packed_b, 5);
+    setRawBuffer(encoder, output_b, 0, 8);
+    metal.setBytes(encoder, QMVDims, &dims, 9);
+    setRawBuffer(encoder, norm_scale, 0, 10);
+
+    const rows_per_tg: u32 = 16;
+    const threads_per_tg: u32 = 512;
+    const threadgroups =
+        (dims.M + rows_per_tg - 1) / rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+/// Dispatch Q4 fused RMSNorm + paired QMV + SiLU:
+/// output[row] = silu(gate_row) * up_row with norm fused.
+/// buffer(0-2): Q4 gate, buffer(3): f32 residual,
+/// buffer(4): f16 output, buffer(5-7): Q4 up,
+/// buffer(8): dims, buffer(9): f16 norm_scale.
+fn dispatchQ4FusedNormPairSiLUf16io(
+    device: *const metal.Device,
+    encoder: objc.Object,
+    packed_a: metal.Q4Buffer,
+    packed_b: metal.Q4Buffer,
+    residual: objc.Object,
+    output: objc.Object,
+    norm_scale: objc.Object,
+    dims: QMVDims,
+) void {
+    std.debug.assert(dims.M > 0);
+    std.debug.assert(dims.K > 0);
+    std.debug.assert(dims.K % 32 == 0);
+    std.debug.assert(dims.group_size > 0);
+    std.debug.assert(packed_a.packed_count > 0);
+    std.debug.assert(packed_b.packed_count > 0);
+    std.debug.assert(residual.value != null);
+    std.debug.assert(norm_scale.value != null);
+
+    const pipeline =
+        device.spec_q4mv_fused_norm_pair_silu_f16io orelse
+        unreachable; // Q4 fused norm SiLU needs specialized.
+
+    metal.setQ4Buffer(encoder, packed_a, 0);
+    setRawBuffer(encoder, residual, 0, 3);
+    setRawBuffer(encoder, output, 0, 4);
+    metal.setQ4Buffer(encoder, packed_b, 5);
+    metal.setBytes(encoder, QMVDims, &dims, 8);
+    setRawBuffer(encoder, norm_scale, 0, 9);
+
+    const rows_per_tg: u32 = 16;
+    const threads_per_tg: u32 = 512;
+    const threadgroups =
+        (dims.M + rows_per_tg - 1) / rows_per_tg;
+    const grid = metal.MTLSize{
+        .width = @as(c_ulong, threadgroups),
+        .height = 1,
+        .depth = 1,
+    };
+    const group = metal.MTLSize{
+        .width = @as(c_ulong, threads_per_tg),
+        .height = 1,
+        .depth = 1,
+    };
+    device.dispatchCustom(encoder, pipeline, grid, group);
+}
+
+// ============================================================================
 // Single-block forward (Step 1.5)
 // ============================================================================
 
-/// All buffer handles needed to encode one decoder block.
-/// Packed weight buffers store 1-bit weights + f16 scales.
-/// Activation and cache buffers are raw `objc.Object` handles,
-/// following the convention of the individual dispatch helpers.
-pub const ForwardBlockArgs = struct {
-    // Packed weight buffers (1-bit, 7 projections).
-    q_proj: metal.PackedBuffer,
-    k_proj: metal.PackedBuffer,
-    v_proj: metal.PackedBuffer,
-    o_proj: metal.PackedBuffer,
-    gate_proj: metal.PackedBuffer,
-    up_proj: metal.PackedBuffer,
-    down_proj: metal.PackedBuffer,
-    // Norm scale buffers (f16).
-    attn_norm_scale: objc.Object,
-    ffn_norm_scale: objc.Object,
-    // QK norm scale buffers (f16, head_dim elements each).
-    q_norm_scale: objc.Object,
-    k_norm_scale: objc.Object,
-    // Activation scratch buffers (f16, except residual which is f32).
-    residual: objc.Object, // [hidden_size] f32 — modified in place.
-    norm_out: objc.Object, // [hidden_size] f16 — scratch.
-    q: objc.Object, // [query_dim] f16
-    k: objc.Object, // [kv_dim] f16
-    v: objc.Object, // [kv_dim] f16
-    attn_out: objc.Object, // [query_dim] f16
-    proj_out: objc.Object, // [hidden_size] f16 — O and down output.
-    attn_scratch: objc.Object, // [num_query_heads × max_ctx] f32
-    gate: objc.Object, // [intermediate_size] f16
-    up: objc.Object, // [intermediate_size] f16
-    mlp_out: objc.Object, // [intermediate_size] f16 — SiLU output.
-    // KV cache (f16).
-    k_cache: objc.Object,
-    v_cache: objc.Object,
-    // Sequence state.
-    position: u32,
-    seq_len: u32, // = position + 1 for single-token decode.
-};
+/// Parameterized block args — the weight buffer type depends
+/// on the quantization format (PackedBuffer for Q1, Q4Buffer
+/// for Q4 MLX).  The alias `ForwardBlockArgs` preserves
+/// backward compatibility with existing Q1 code.
+pub fn ForwardBlockArgsT(
+    comptime WeightBuf: type,
+) type {
+    return struct {
+        // Quantized weight buffers (7 projections per block).
+        q_proj: WeightBuf,
+        k_proj: WeightBuf,
+        v_proj: WeightBuf,
+        o_proj: WeightBuf,
+        gate_proj: WeightBuf,
+        up_proj: WeightBuf,
+        down_proj: WeightBuf,
+        // Norm scale buffers (f32).
+        attn_norm_scale: objc.Object,
+        ffn_norm_scale: objc.Object,
+        // QK norm scale buffers (f32, head_dim elements each).
+        q_norm_scale: objc.Object,
+        k_norm_scale: objc.Object,
+        // Activation scratch buffers (f16, except residual = f32).
+        residual: objc.Object,
+        norm_out: objc.Object,
+        q: objc.Object,
+        k: objc.Object,
+        v: objc.Object,
+        attn_out: objc.Object,
+        proj_out: objc.Object,
+        attn_scratch: objc.Object,
+        gate: objc.Object,
+        up: objc.Object,
+        mlp_out: objc.Object,
+        // KV cache (f16).
+        k_cache: objc.Object,
+        v_cache: objc.Object,
+        // Sequence state.
+        position: u32,
+        seq_len: u32,
+    };
+}
+
+/// Backward-compatible alias for 1-bit quantized blocks.
+pub const ForwardBlockArgs =
+    ForwardBlockArgsT(metal.PackedBuffer);
 
 /// Encode one full decoder block (attention + MLP) into a
 /// compute command encoder.  `Config` is a comptime
@@ -1799,7 +2346,7 @@ pub fn forwardBlock(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    args: ForwardBlockArgs,
+    args: ForwardBlockArgsT(Config.WeightBuffer),
 ) void {
     comptime {
         std.debug.assert(Config.hidden_size > 0);
@@ -1833,65 +2380,67 @@ pub fn forwardBlock(
 // Full-model forward decode (Step 2d)
 // ============================================================================
 
-/// All buffer handles needed to encode a single-token decode
-/// pass through the full transformer: embedding lookup →
-/// N × forwardBlock → final RMSNorm → LM head projection.
-///
-/// Per-layer arrays are slices of length `Config.num_layers`,
-/// borrowed from the model's fixed-size arrays.  Activation
-/// scratch buffers are shared across all layers.
-pub const ForwardDecodeArgs = struct {
-    // Model-level packed weights.
-    embedding: metal.PackedBuffer,
-    lm_head: metal.PackedBuffer, // = embedding when tied.
-    final_norm_scale: objc.Object, // f16 HalfBuffer.
+/// Parameterized full-model decode args — the weight buffer
+/// type depends on the quantization format.  The alias
+/// `ForwardDecodeArgs` preserves backward compatibility
+/// with existing Q1 code.
+pub fn ForwardDecodeArgsT(
+    comptime WeightBuf: type,
+) type {
+    return struct {
+        // Model-level quantized weights.
+        embedding: WeightBuf,
+        lm_head: WeightBuf,
+        final_norm_scale: objc.Object,
 
-    // Per-layer packed weight buffers (indexed by layer).
-    q_proj: []const metal.PackedBuffer,
-    k_proj: []const metal.PackedBuffer,
-    v_proj: []const metal.PackedBuffer,
-    o_proj: []const metal.PackedBuffer,
-    gate_proj: []const metal.PackedBuffer,
-    up_proj: []const metal.PackedBuffer,
-    down_proj: []const metal.PackedBuffer,
+        // Per-layer quantized weight buffers.
+        q_proj: []const WeightBuf,
+        k_proj: []const WeightBuf,
+        v_proj: []const WeightBuf,
+        o_proj: []const WeightBuf,
+        gate_proj: []const WeightBuf,
+        up_proj: []const WeightBuf,
+        down_proj: []const WeightBuf,
 
-    // Per-layer norm scale buffers (f16, indexed by layer).
-    attn_norm: []const metal.HalfBuffer,
-    ffn_norm: []const metal.HalfBuffer,
-    q_norm: []const metal.HalfBuffer,
-    k_norm: []const metal.HalfBuffer,
+        // Per-layer norm scale buffers (f32).
+        attn_norm: []const metal.Buffer,
+        ffn_norm: []const metal.Buffer,
+        q_norm: []const metal.Buffer,
+        k_norm: []const metal.Buffer,
 
-    // Per-layer KV caches (f16, indexed by layer).
-    k_cache: []const metal.HalfBuffer,
-    v_cache: []const metal.HalfBuffer,
+        // Per-layer KV caches (f16).
+        k_cache: []const metal.HalfBuffer,
+        v_cache: []const metal.HalfBuffer,
 
-    // Activation scratch (shared across all layers, f32).
-    residual: objc.Object,
-    norm_out: objc.Object,
-    q: objc.Object,
-    k: objc.Object,
-    v: objc.Object,
-    attn_out: objc.Object,
-    proj_out: objc.Object,
-    attn_scratch: objc.Object,
-    gate: objc.Object,
-    up: objc.Object,
-    mlp_out: objc.Object,
+        // Activation scratch (shared across all layers).
+        residual: objc.Object,
+        norm_out: objc.Object,
+        q: objc.Object,
+        k: objc.Object,
+        v: objc.Object,
+        attn_out: objc.Object,
+        proj_out: objc.Object,
+        attn_scratch: objc.Object,
+        gate: objc.Object,
+        up: objc.Object,
+        mlp_out: objc.Object,
 
-    // Forward pass I/O.
-    token_ids: objc.Object, // u32 buffer — written by CPU.
-    logits: objc.Object, // [vocab_size] f32 output.
+        // Forward pass I/O.
+        token_ids: objc.Object,
+        logits: objc.Object,
 
-    // GPU completion flag for spin-wait (Rule 26).
-    // The GPU writes 1 here when done; the CPU spin-reads
-    // it to avoid waitUntilCompleted Mach kernel trap.
-    flag_buf: objc.Object,
-    flag_ptr: *volatile u32,
+        // GPU completion flag for spin-wait.
+        flag_buf: objc.Object,
+        flag_ptr: *volatile u32,
 
-    // Sequence state.
-    token_id: u32,
-    position: u32,
-};
+        // Sequence state.
+        token_id: u32,
+        position: u32,
+    };
+}
+
+pub const ForwardDecodeArgs =
+    ForwardDecodeArgsT(metal.PackedBuffer);
 
 /// Encode a full single-token decode pass into one compute
 /// command encoder:
@@ -1911,7 +2460,7 @@ pub fn forwardDecode(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    args: ForwardDecodeArgs,
+    args: ForwardDecodeArgsT(Config.WeightBuffer),
 ) void {
     comptime {
         std.debug.assert(Config.num_layers > 0);
@@ -1973,33 +2522,63 @@ fn encodeEmbeddingLookup(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    args: ForwardDecodeArgs,
+    args: ForwardDecodeArgsT(Config.WeightBuffer),
 ) void {
     std.debug.assert(args.embedding.packed_count > 0);
     std.debug.assert(args.token_ids.value != null);
 
-    setRawBuffer(encoder, args.token_ids, 0, 0);
-    setRawBuffer(encoder, args.embedding.obj, 0, 1);
-    setRawBuffer(
-        encoder,
-        args.embedding.obj,
-        args.embedding.scaleOffset(),
-        2,
-    );
-    setRawBuffer(encoder, args.residual, 0, 3);
-    metal.setBytes(encoder, EmbedDims, &.{
+    const embed_dims = EmbedDims{
         .vocab_size = Config.vocab_size,
         .hidden_size = Config.hidden_size,
         .num_tokens = 1,
         .group_size = Config.group_size,
-    }, 4);
+    };
 
-    // One token × hidden_size output elements.
-    device.dispatch1D(
-        encoder,
-        pipelines.embedding_lookup,
-        Config.hidden_size,
-    );
+    if (comptime Config.quant_format == .q4_mlx) {
+        // Q4 embedding: nibbles at buf(0), scales at buf(1),
+        // biases at buf(2) via setQ4Buffer; token_ids at
+        // buf(3), output at buf(4), dims at buf(5).
+        setRawBuffer(encoder, args.token_ids, 0, 0);
+        metal.setQ4Buffer(encoder, args.embedding, 1);
+        setRawBuffer(encoder, args.residual, 0, 4);
+        metal.setBytes(
+            encoder,
+            EmbedDims,
+            &embed_dims,
+            5,
+        );
+        device.dispatch1D(
+            encoder,
+            pipelines.embedding_lookup_q4,
+            Config.hidden_size,
+        );
+    } else {
+        setRawBuffer(encoder, args.token_ids, 0, 0);
+        setRawBuffer(
+            encoder,
+            args.embedding.obj,
+            0,
+            1,
+        );
+        setRawBuffer(
+            encoder,
+            args.embedding.obj,
+            args.embedding.scaleOffset(),
+            2,
+        );
+        setRawBuffer(encoder, args.residual, 0, 3);
+        metal.setBytes(
+            encoder,
+            EmbedDims,
+            &embed_dims,
+            4,
+        );
+        device.dispatch1D(
+            encoder,
+            pipelines.embedding_lookup,
+            Config.hidden_size,
+        );
+    }
 }
 
 /// Encode all N decoder blocks sequentially.  Each block
@@ -2011,7 +2590,7 @@ fn encodeAllBlocks(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    args: ForwardDecodeArgs,
+    args: ForwardDecodeArgsT(Config.WeightBuffer),
 ) void {
     std.debug.assert(
         args.q_proj.len == Config.num_layers,
@@ -2021,7 +2600,8 @@ fn encodeAllBlocks(
     const seq_len: u32 = args.position + 1;
     for (0..Config.num_layers) |i| {
         const idx: u32 = @intCast(i);
-        const block_args = blockArgsFromDecode(
+        const block_args = blockArgsFromDecodeT(
+            Config.WeightBuffer,
             args,
             idx,
             seq_len,
@@ -2043,7 +2623,7 @@ fn encodeFinalNormAndLMHead(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    args: ForwardDecodeArgs,
+    args: ForwardDecodeArgsT(Config.WeightBuffer),
 ) void {
     std.debug.assert(args.lm_head.packed_count > 0);
     std.debug.assert(args.final_norm_scale.value != null);
@@ -2051,7 +2631,10 @@ fn encodeFinalNormAndLMHead(
     dispatchRMSNorm(
         device,
         encoder,
-        pipelines.rms_norm_f16out,
+        if (comptime Config.quant_format == .q4_mlx)
+            pipelines.rms_norm_bf16_f16out
+        else
+            pipelines.rms_norm_f16out,
         args.residual,
         args.final_norm_scale,
         args.norm_out,
@@ -2062,28 +2645,41 @@ fn encodeFinalNormAndLMHead(
         },
     );
     bufferBarrier(encoder);
-    dispatchQMVf16in(
-        device,
-        encoder,
-        args.lm_head,
-        args.norm_out,
-        args.logits,
-        .{
-            .M = Config.vocab_size,
-            .K = Config.hidden_size,
-            .group_size = Config.group_size,
-        },
-    );
+    const lm_dims = QMVDims{
+        .M = Config.vocab_size,
+        .K = Config.hidden_size,
+        .group_size = Config.group_size,
+    };
+    if (comptime Config.quant_format == .q4_mlx) {
+        dispatchQ4MVf16in(
+            device,
+            encoder,
+            args.lm_head,
+            args.norm_out,
+            args.logits,
+            lm_dims,
+        );
+    } else {
+        dispatchQMVf16in(
+            device,
+            encoder,
+            args.lm_head,
+            args.norm_out,
+            args.logits,
+            lm_dims,
+        );
+    }
 }
 
-/// Construct a `ForwardBlockArgs` for one layer by indexing
-/// into the per-layer slices of `ForwardDecodeArgs`.
-/// Activation scratch buffers are shared across all layers.
-fn blockArgsFromDecode(
-    args: ForwardDecodeArgs,
+/// Construct block args for one layer by indexing into the
+/// per-layer slices of the decode args.  Activation scratch
+/// buffers are shared across all layers.
+fn blockArgsFromDecodeT(
+    comptime WeightBuf: type,
+    args: ForwardDecodeArgsT(WeightBuf),
     layer_index: u32,
     seq_len: u32,
-) ForwardBlockArgs {
+) ForwardBlockArgsT(WeightBuf) {
     std.debug.assert(layer_index < args.q_proj.len);
     std.debug.assert(seq_len > 0);
 
@@ -2173,7 +2769,7 @@ fn encodeAttentionHalf(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    a: ForwardBlockArgs,
+    a: ForwardBlockArgsT(Config.WeightBuffer),
 ) void {
     encodeAttentionProjections(
         Config,
@@ -2199,7 +2795,7 @@ fn encodeAttentionProjections(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    a: ForwardBlockArgs,
+    a: ForwardBlockArgsT(Config.WeightBuffer),
 ) void {
     const kv_qmv = QMVDims{
         .M = Config.kv_dim,
@@ -2217,21 +2813,43 @@ fn encodeAttentionProjections(
         (Config.hidden_size <= 4096) and
         (Config.hidden_size >= 256) and
         (Config.hidden_size / 32 <= Config.group_size);
-    const use_fused_norm = can_fuse_norm and
-        device.spec_qmv_fused_norm_f16io != null and
-        device.spec_qmv_fused_norm_f16io.?
-            .max_threads_per_group >= 512 and
-        device.spec_qmv_fused_norm_pair_f16io != null and
-        device.spec_qmv_fused_norm_pair_f16io.?
-            .max_threads_per_group >= 512 and
-        q_qmv.K == device.spec_hidden_K;
+    const use_fused_norm =
+        if (comptime Config.quant_format == .q4_mlx)
+            can_fuse_norm and
+                device.spec_q4mv_fused_norm_f16io != null and
+                device.spec_q4mv_fused_norm_f16io.?
+                    .max_threads_per_group >= 512 and
+                device.spec_q4mv_fused_norm_pair_f16io != null and
+                device.spec_q4mv_fused_norm_pair_f16io.?
+                    .max_threads_per_group >= 512 and
+                q_qmv.K == device.spec_q4_hidden_K
+        else
+            can_fuse_norm and
+                device.spec_qmv_fused_norm_f16io != null and
+                device.spec_qmv_fused_norm_f16io.?
+                    .max_threads_per_group >= 512 and
+                device.spec_qmv_fused_norm_pair_f16io != null and
+                device.spec_qmv_fused_norm_pair_f16io.?
+                    .max_threads_per_group >= 512 and
+                q_qmv.K == device.spec_hidden_K;
     if (use_fused_norm) {
         encodeAttnProjFusedNorm(
-            Config, device, encoder, a, q_qmv, kv_qmv,
+            Config,
+            device,
+            encoder,
+            a,
+            q_qmv,
+            kv_qmv,
         );
     } else {
         encodeAttnProjSeparateNorm(
-            Config, device, encoder, pipelines, a, q_qmv, kv_qmv,
+            Config,
+            device,
+            encoder,
+            pipelines,
+            a,
+            q_qmv,
+            kv_qmv,
         );
     }
     // Q/K norm + RoPE + KV cache update are now fused into
@@ -2248,35 +2866,59 @@ fn encodeAttnProjFusedNorm(
     comptime Config: type,
     device: *const metal.Device,
     encoder: objc.Object,
-    a: ForwardBlockArgs,
+    a: ForwardBlockArgsT(Config.WeightBuffer),
     q_qmv: QMVDims,
     kv_qmv: QMVDims,
 ) void {
     std.debug.assert(q_qmv.K == Config.hidden_size);
     std.debug.assert(kv_qmv.K == Config.hidden_size);
-    // Q projection: fused norm + single QMV.
-    dispatchFusedNormQMVf16io(
-        device,
-        encoder,
-        a.q_proj,
-        a.residual,
-        a.q,
-        a.attn_norm_scale,
-        q_qmv,
-    );
-    // KV projection: fused norm + paired QMV (concurrent
-    // with Q — both read residual and norm_scale read-only).
-    dispatchFusedNormPairQMVf16io(
-        device,
-        encoder,
-        a.k_proj,
-        a.v_proj,
-        a.residual,
-        a.k,
-        a.v,
-        a.attn_norm_scale,
-        kv_qmv,
-    );
+    if (comptime Config.quant_format == .q4_mlx) {
+        // Q projection: fused norm + single Q4 QMV.
+        dispatchQ4FusedNormQMVf16io(
+            device,
+            encoder,
+            a.q_proj,
+            a.residual,
+            a.q,
+            a.attn_norm_scale,
+            q_qmv,
+        );
+        // KV projection: fused norm + paired Q4 QMV.
+        dispatchQ4FusedNormPairQMVf16io(
+            device,
+            encoder,
+            a.k_proj,
+            a.v_proj,
+            a.residual,
+            a.k,
+            a.v,
+            a.attn_norm_scale,
+            kv_qmv,
+        );
+    } else {
+        // Q projection: fused norm + single QMV.
+        dispatchFusedNormQMVf16io(
+            device,
+            encoder,
+            a.q_proj,
+            a.residual,
+            a.q,
+            a.attn_norm_scale,
+            q_qmv,
+        );
+        // KV projection: fused norm + paired QMV.
+        dispatchFusedNormPairQMVf16io(
+            device,
+            encoder,
+            a.k_proj,
+            a.v_proj,
+            a.residual,
+            a.k,
+            a.v,
+            a.attn_norm_scale,
+            kv_qmv,
+        );
+    }
     bufferBarrier(encoder);
 }
 
@@ -2287,7 +2929,7 @@ fn encodeAttnProjSeparateNorm(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    a: ForwardBlockArgs,
+    a: ForwardBlockArgsT(Config.WeightBuffer),
     q_qmv: QMVDims,
     kv_qmv: QMVDims,
 ) void {
@@ -2296,7 +2938,10 @@ fn encodeAttnProjSeparateNorm(
     dispatchRMSNorm(
         device,
         encoder,
-        pipelines.rms_norm_f16out,
+        if (comptime Config.quant_format == .q4_mlx)
+            pipelines.rms_norm_bf16_f16out
+        else
+            pipelines.rms_norm_f16out,
         a.residual,
         a.attn_norm_scale,
         a.norm_out,
@@ -2307,27 +2952,86 @@ fn encodeAttnProjSeparateNorm(
         },
     );
     bufferBarrier(encoder);
-    dispatchQMVf16io(
-        device, encoder, a.q_proj, a.norm_out, a.q, q_qmv,
-    );
-    const can_fuse_kv = comptime
-        (Config.hidden_size % Config.group_size == 0) and
+    const can_fuse_kv = comptime (Config.hidden_size % Config.group_size == 0) and
         (Config.hidden_size <= 6144) and
         (Config.hidden_size >= 256) and
         (Config.hidden_size / 32 <= Config.group_size);
-    if (can_fuse_kv) {
-        dispatchQMVFusedPairf16io(
-            device, encoder,
-            a.k_proj, a.v_proj, a.norm_out,
-            a.k, a.v, kv_qmv,
+    if (comptime Config.quant_format == .q4_mlx) {
+        dispatchQ4MVf16io(
+            device,
+            encoder,
+            a.q_proj,
+            a.norm_out,
+            a.q,
+            q_qmv,
         );
+        if (can_fuse_kv) {
+            dispatchQ4MVFusedPairf16io(
+                device,
+                encoder,
+                a.k_proj,
+                a.v_proj,
+                a.norm_out,
+                a.k,
+                a.v,
+                kv_qmv,
+            );
+        } else {
+            dispatchQ4MVf16io(
+                device,
+                encoder,
+                a.k_proj,
+                a.norm_out,
+                a.k,
+                kv_qmv,
+            );
+            dispatchQ4MVf16io(
+                device,
+                encoder,
+                a.v_proj,
+                a.norm_out,
+                a.v,
+                kv_qmv,
+            );
+        }
     } else {
         dispatchQMVf16io(
-            device, encoder, a.k_proj, a.norm_out, a.k, kv_qmv,
+            device,
+            encoder,
+            a.q_proj,
+            a.norm_out,
+            a.q,
+            q_qmv,
         );
-        dispatchQMVf16io(
-            device, encoder, a.v_proj, a.norm_out, a.v, kv_qmv,
-        );
+        if (can_fuse_kv) {
+            dispatchQMVFusedPairf16io(
+                device,
+                encoder,
+                a.k_proj,
+                a.v_proj,
+                a.norm_out,
+                a.k,
+                a.v,
+                kv_qmv,
+            );
+        } else {
+            dispatchQMVf16io(
+                device,
+                encoder,
+                a.k_proj,
+                a.norm_out,
+                a.k,
+                kv_qmv,
+            );
+            dispatchQMVf16io(
+                device,
+                encoder,
+                a.v_proj,
+                a.norm_out,
+                a.v,
+                kv_qmv,
+            );
+        }
     }
     bufferBarrier(encoder);
 }
@@ -2383,7 +3087,7 @@ fn encodeAttentionGather(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    a: ForwardBlockArgs,
+    a: ForwardBlockArgsT(Config.WeightBuffer),
 ) void {
     // Use the fused kernel that applies Q/K norm + RoPE +
     // KV cache update inside GQA when seq_len fits in TG
@@ -2418,9 +3122,11 @@ fn encodeAttentionGather(
         // Long-sequence fallback: separate norm+RoPE+cache,
         // then the scratch-based GQA kernel.
         dispatchFusedNormRoPE(
-            device, encoder,
+            device,
+            encoder,
             pipelines.fused_norm_rope_f16,
-            a.q, a.q_norm_scale,
+            a.q,
+            a.q_norm_scale,
             .{
                 .num_heads = Config.num_query_heads,
                 .head_dim = Config.head_dim,
@@ -2430,9 +3136,13 @@ fn encodeAttentionGather(
             },
         );
         dispatchFusedKNormRoPEKVCache(
-            device, encoder,
+            device,
+            encoder,
             pipelines.fused_k_norm_rope_kv_cache_f16,
-            a.k, a.v, a.k_cache, a.v_cache,
+            a.k,
+            a.v,
+            a.k_cache,
+            a.v_cache,
             a.k_norm_scale,
             .{
                 .num_kv_heads = Config.num_kv_heads,
@@ -2445,10 +3155,14 @@ fn encodeAttentionGather(
         );
         bufferBarrier(encoder);
         dispatchGQAAttention(
-            device, encoder,
+            device,
+            encoder,
             pipelines.gqa_attention_f16io,
-            a.q, a.k_cache, a.v_cache,
-            a.attn_out, a.attn_scratch,
+            a.q,
+            a.k_cache,
+            a.v_cache,
+            a.attn_out,
+            a.attn_scratch,
             .{
                 .num_query_heads = Config.num_query_heads,
                 .num_kv_heads = Config.num_kv_heads,
@@ -2464,18 +3178,30 @@ fn encodeAttentionGather(
     // is added directly to the f32 residual (residual[row] += acc)
     // instead of writing f16 to proj_out then dispatching
     // residual_add_f16.  Saves one dispatch + one barrier.
-    dispatchQMVf16ioResadd(
-        device,
-        encoder,
-        a.o_proj,
-        a.attn_out,
-        a.residual,
-        .{
-            .M = Config.hidden_size,
-            .K = Config.query_dim,
-            .group_size = Config.group_size,
-        },
-    );
+    const o_dims = QMVDims{
+        .M = Config.hidden_size,
+        .K = Config.query_dim,
+        .group_size = Config.group_size,
+    };
+    if (comptime Config.quant_format == .q4_mlx) {
+        dispatchQ4MVf16ioResadd(
+            device,
+            encoder,
+            a.o_proj,
+            a.attn_out,
+            a.residual,
+            o_dims,
+        );
+    } else {
+        dispatchQMVf16ioResadd(
+            device,
+            encoder,
+            a.o_proj,
+            a.attn_out,
+            a.residual,
+            o_dims,
+        );
+    }
     bufferBarrier(encoder);
 }
 
@@ -2487,7 +3213,7 @@ fn encodeMLPHalf(
     device: *const metal.Device,
     encoder: objc.Object,
     pipelines: *const TransformerPipelines,
-    a: ForwardBlockArgs,
+    a: ForwardBlockArgsT(Config.WeightBuffer),
 ) void {
     const mlp_qmv = QMVDims{
         .M = Config.intermediate_size,
@@ -2505,37 +3231,73 @@ fn encodeMLPHalf(
     // Fused norm needs K <= 4096 for threadgroup memory.
     const can_fuse_norm = can_fuse and
         comptime (Config.hidden_size <= 4096);
-    const use_fused_norm_silu = can_fuse_norm and
-        device.spec_qmv_fused_norm_pair_silu_f16io != null and
-        device.spec_qmv_fused_norm_pair_silu_f16io.?
-            .max_threads_per_group >= 512 and
-        mlp_qmv.K == device.spec_hidden_K;
-    const use_fused_silu = !use_fused_norm_silu and can_fuse and
-        device.spec_qmv_fused_pair_silu_f16io != null and
-        device.spec_qmv_fused_pair_silu_f16io.?
-            .max_threads_per_group >= 512 and
-        mlp_qmv.K == device.spec_hidden_K;
+    const use_fused_norm_silu =
+        if (comptime Config.quant_format == .q4_mlx)
+            can_fuse_norm and
+                device.spec_q4mv_fused_norm_pair_silu_f16io !=
+                    null and
+                device.spec_q4mv_fused_norm_pair_silu_f16io.?
+                    .max_threads_per_group >= 512 and
+                mlp_qmv.K == device.spec_q4_hidden_K
+        else
+            can_fuse_norm and
+                device.spec_qmv_fused_norm_pair_silu_f16io !=
+                    null and
+                device.spec_qmv_fused_norm_pair_silu_f16io.?
+                    .max_threads_per_group >= 512 and
+                mlp_qmv.K == device.spec_hidden_K;
+    const use_fused_silu =
+        if (comptime Config.quant_format == .q4_mlx)
+            !use_fused_norm_silu and can_fuse and
+                device.spec_q4mv_fused_pair_silu_f16io !=
+                    null and
+                device.spec_q4mv_fused_pair_silu_f16io.?
+                    .max_threads_per_group >= 512 and
+                mlp_qmv.K == device.spec_q4_hidden_K
+        else
+            !use_fused_norm_silu and can_fuse and
+                device.spec_qmv_fused_pair_silu_f16io !=
+                    null and
+                device.spec_qmv_fused_pair_silu_f16io.?
+                    .max_threads_per_group >= 512 and
+                mlp_qmv.K == device.spec_hidden_K;
     if (use_fused_norm_silu) {
         // Fused norm+gate+up+SiLU: reads f32 residual
         // directly, computes RMSNorm in TG memory, then
         // gate+up QMV with SiLU.  Skips norm_out, gate,
         // and up buffers entirely.
-        dispatchFusedNormPairSiLUf16io(
-            device,
-            encoder,
-            a.gate_proj,
-            a.up_proj,
-            a.residual,
-            a.mlp_out,
-            a.ffn_norm_scale,
-            mlp_qmv,
-        );
+        if (comptime Config.quant_format == .q4_mlx) {
+            dispatchQ4FusedNormPairSiLUf16io(
+                device,
+                encoder,
+                a.gate_proj,
+                a.up_proj,
+                a.residual,
+                a.mlp_out,
+                a.ffn_norm_scale,
+                mlp_qmv,
+            );
+        } else {
+            dispatchFusedNormPairSiLUf16io(
+                device,
+                encoder,
+                a.gate_proj,
+                a.up_proj,
+                a.residual,
+                a.mlp_out,
+                a.ffn_norm_scale,
+                mlp_qmv,
+            );
+        }
     } else if (use_fused_silu) {
         // Fused gate+up+SiLU: needs separate RMSNorm first.
         dispatchRMSNorm(
             device,
             encoder,
-            pipelines.rms_norm_f16out,
+            if (comptime Config.quant_format == .q4_mlx)
+                pipelines.rms_norm_bf16_f16out
+            else
+                pipelines.rms_norm_f16out,
             a.residual,
             a.ffn_norm_scale,
             a.norm_out,
@@ -2546,21 +3308,36 @@ fn encodeMLPHalf(
             },
         );
         bufferBarrier(encoder);
-        dispatchQMVFusedPairSiLUf16io(
-            device,
-            encoder,
-            a.gate_proj,
-            a.up_proj,
-            a.norm_out,
-            a.mlp_out,
-            mlp_qmv,
-        );
+        if (comptime Config.quant_format == .q4_mlx) {
+            dispatchQ4MVFusedPairSiLUf16io(
+                device,
+                encoder,
+                a.gate_proj,
+                a.up_proj,
+                a.norm_out,
+                a.mlp_out,
+                mlp_qmv,
+            );
+        } else {
+            dispatchQMVFusedPairSiLUf16io(
+                device,
+                encoder,
+                a.gate_proj,
+                a.up_proj,
+                a.norm_out,
+                a.mlp_out,
+                mlp_qmv,
+            );
+        }
     } else {
         // Non-fused-norm paths need separate RMSNorm.
         dispatchRMSNorm(
             device,
             encoder,
-            pipelines.rms_norm_f16out,
+            if (comptime Config.quant_format == .q4_mlx)
+                pipelines.rms_norm_bf16_f16out
+            else
+                pipelines.rms_norm_f16out,
             a.residual,
             a.ffn_norm_scale,
             a.norm_out,
@@ -2571,54 +3348,106 @@ fn encodeMLPHalf(
             },
         );
         bufferBarrier(encoder);
-        if (can_fuse) {
-            dispatchQMVFusedPairf16io(
-                device,
-                encoder,
-                a.gate_proj,
-                a.up_proj,
-                a.norm_out,
-                a.gate,
-                a.up,
-                mlp_qmv,
-            );
-            bufferBarrier(encoder);
-            dispatchSiLUElementwiseMul(
-                device,
-                encoder,
-                pipelines.silu_elementwise_mul_f16,
-                a.gate,
-                a.up,
-                a.mlp_out,
-                Config.intermediate_size,
-            );
+        if (comptime Config.quant_format == .q4_mlx) {
+            if (can_fuse) {
+                dispatchQ4MVFusedPairf16io(
+                    device,
+                    encoder,
+                    a.gate_proj,
+                    a.up_proj,
+                    a.norm_out,
+                    a.gate,
+                    a.up,
+                    mlp_qmv,
+                );
+                bufferBarrier(encoder);
+                dispatchSiLUElementwiseMul(
+                    device,
+                    encoder,
+                    pipelines.silu_elementwise_mul_f16,
+                    a.gate,
+                    a.up,
+                    a.mlp_out,
+                    Config.intermediate_size,
+                );
+            } else {
+                dispatchQ4MVf16io(
+                    device,
+                    encoder,
+                    a.gate_proj,
+                    a.norm_out,
+                    a.gate,
+                    mlp_qmv,
+                );
+                dispatchQ4MVf16io(
+                    device,
+                    encoder,
+                    a.up_proj,
+                    a.norm_out,
+                    a.up,
+                    mlp_qmv,
+                );
+                bufferBarrier(encoder);
+                dispatchSiLUElementwiseMul(
+                    device,
+                    encoder,
+                    pipelines.silu_elementwise_mul_f16,
+                    a.gate,
+                    a.up,
+                    a.mlp_out,
+                    Config.intermediate_size,
+                );
+            }
         } else {
-            dispatchQMVf16io(
-                device,
-                encoder,
-                a.gate_proj,
-                a.norm_out,
-                a.gate,
-                mlp_qmv,
-            );
-            dispatchQMVf16io(
-                device,
-                encoder,
-                a.up_proj,
-                a.norm_out,
-                a.up,
-                mlp_qmv,
-            );
-            bufferBarrier(encoder);
-            dispatchSiLUElementwiseMul(
-                device,
-                encoder,
-                pipelines.silu_elementwise_mul_f16,
-                a.gate,
-                a.up,
-                a.mlp_out,
-                Config.intermediate_size,
-            );
+            if (can_fuse) {
+                dispatchQMVFusedPairf16io(
+                    device,
+                    encoder,
+                    a.gate_proj,
+                    a.up_proj,
+                    a.norm_out,
+                    a.gate,
+                    a.up,
+                    mlp_qmv,
+                );
+                bufferBarrier(encoder);
+                dispatchSiLUElementwiseMul(
+                    device,
+                    encoder,
+                    pipelines.silu_elementwise_mul_f16,
+                    a.gate,
+                    a.up,
+                    a.mlp_out,
+                    Config.intermediate_size,
+                );
+            } else {
+                dispatchQMVf16io(
+                    device,
+                    encoder,
+                    a.gate_proj,
+                    a.norm_out,
+                    a.gate,
+                    mlp_qmv,
+                );
+                dispatchQMVf16io(
+                    device,
+                    encoder,
+                    a.up_proj,
+                    a.norm_out,
+                    a.up,
+                    mlp_qmv,
+                );
+                bufferBarrier(encoder);
+                dispatchSiLUElementwiseMul(
+                    device,
+                    encoder,
+                    pipelines.silu_elementwise_mul_f16,
+                    a.gate,
+                    a.up,
+                    a.mlp_out,
+                    Config.intermediate_size,
+                );
+            }
         }
     }
     bufferBarrier(encoder);
@@ -2626,18 +3455,30 @@ fn encodeMLPHalf(
     // result is added directly to the f32 residual instead of
     // writing f16 to proj_out then dispatching residual_add_f16.
     // Saves one dispatch + one barrier.
-    dispatchQMVf16ioResadd(
-        device,
-        encoder,
-        a.down_proj,
-        a.mlp_out,
-        a.residual,
-        .{
-            .M = Config.hidden_size,
-            .K = Config.intermediate_size,
-            .group_size = Config.group_size,
-        },
-    );
+    const down_dims = QMVDims{
+        .M = Config.hidden_size,
+        .K = Config.intermediate_size,
+        .group_size = Config.group_size,
+    };
+    if (comptime Config.quant_format == .q4_mlx) {
+        dispatchQ4MVf16ioResadd(
+            device,
+            encoder,
+            a.down_proj,
+            a.mlp_out,
+            a.residual,
+            down_dims,
+        );
+    } else {
+        dispatchQMVf16ioResadd(
+            device,
+            encoder,
+            a.down_proj,
+            a.mlp_out,
+            a.residual,
+            down_dims,
+        );
+    }
     bufferBarrier(encoder);
 }
 
@@ -2939,7 +3780,7 @@ pub fn generate(
     comptime Config: type,
     device: *const metal.Device,
     pipelines: *const TransformerPipelines,
-    args: *ForwardDecodeArgs,
+    args: *ForwardDecodeArgsT(Config.WeightBuffer),
     opts: GenerateOpts,
 ) GenerateResult {
     std.debug.assert(opts.prompt_ids.len > 0);
@@ -3029,7 +3870,7 @@ fn chunkedPrefill(
     comptime Config: type,
     device: *const metal.Device,
     pipelines: *const TransformerPipelines,
-    args: *ForwardDecodeArgs,
+    args: *ForwardDecodeArgsT(Config.WeightBuffer),
     prompt_ids: []const u32,
 ) void {
     std.debug.assert(prompt_ids.len > 0);
@@ -3069,7 +3910,7 @@ fn decodeOneToken(
     comptime Config: type,
     device: *const metal.Device,
     pipelines: *const TransformerPipelines,
-    args: *ForwardDecodeArgs,
+    args: *ForwardDecodeArgsT(Config.WeightBuffer),
     token_id: u32,
     position: u32,
     params: SamplingParams,
@@ -3185,7 +4026,6 @@ fn compileTransformerLibrary(
 
     return objc.Object.fromId(lib_raw);
 }
-
 
 test {
     _ = @import("transformer_test.zig");

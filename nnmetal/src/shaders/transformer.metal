@@ -5,18 +5,20 @@ using namespace metal;
 // Transformer primitives — Step 1 of the Bonsai implementation plan.
 //
 // Every kernel here operates on f32 activations.  Weights are either
-// f16 (norm scales) or 1-bit packed (embeddings).  The KV cache
-// stores f16 values; conversions happen at explicit boundaries
-// (kv_cache_update writes f32→f16, gqa_attention reads f16→f32).
+// f32 (norm scales), 1-bit packed, or 4-bit packed (embeddings).
+// The KV cache stores f16 values; conversions happen at explicit
+// boundaries (kv_cache_update writes f32→f16, gqa_attention reads
+// f16→f32).
 //
 // Kernel list:
-//   rms_norm             — RMSNorm with f16 scale vector
+//   rms_norm             — RMSNorm with f32 scale vector
 //   silu                 — x * sigmoid(x), elementwise
 //   silu_elementwise_mul — fused silu(gate) ⊙ up for SwiGLU
 //   rope                 — rotary position embeddings
 //   kv_cache_update      — append f32 K/V to f16 cache
 //   gqa_attention        — grouped query attention (decode, M=1)
 //   embedding_lookup     — gather + dequantize from 1-bit table
+//   embedding_lookup_q4  — gather + dequantize from 4-bit table
 //   residual_add         — in-place a[i] += b[i]
 // ============================================================================
 
@@ -34,7 +36,7 @@ struct RMSNormDims {
 /// RMSNorm: output[i] = input[i] * rsqrt(mean(input²) + eps) * scale[i].
 ///
 /// Input is [num_tokens × hidden_size] in f32.
-/// Scale is [hidden_size] in f16 (shared across all tokens).
+/// Scale is [hidden_size] in f32 (shared across all tokens).
 /// Output is [num_tokens × hidden_size] in f32.
 ///
 /// Dispatch: threadgroups = num_tokens, threads_per_group = 256.
@@ -46,7 +48,7 @@ struct RMSNormDims {
 /// to every head.
 kernel void rms_norm(
     device const float*    input  [[buffer(0)]],
-    device const half*     scale  [[buffer(1)]],
+    device const float*    scale  [[buffer(1)]],
     device float*          output [[buffer(2)]],
     constant RMSNormDims&  dims   [[buffer(3)]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -473,6 +475,74 @@ kernel void embedding_lookup(
 }
 
 // ============================================================================
+// Embedding Lookup (4-bit packed, Q4 MLX)
+// ============================================================================
+
+/// Gather + dequantize rows from a 4-bit packed embedding table.
+///
+/// The embedding table is stored in Q4 MLX format:
+///   packed_nibs: vocab_size * hidden_size / 2 bytes
+///                (each uint32 holds 8 sequential 4-bit nibbles)
+///   scales: vocab_size * hidden_size / group_size f32 values
+///   biases: vocab_size * hidden_size / group_size f32 values
+///
+/// For each token, the kernel dequantizes the corresponding row:
+///   flat_pos  = token_id * hidden_size + d
+///   word_idx  = flat_pos / 8
+///   nib_pos   = flat_pos % 8
+///   nibble    = (words[word_idx] >> (nib_pos * 4)) & 0xF
+///   output    = scale * float(nibble) + bias
+///
+/// Output is [num_tokens × hidden_size] in f32.
+///
+/// Dispatch: 1D, count = num_tokens * hidden_size.
+kernel void embedding_lookup_q4(
+    device const uint*    token_ids   [[buffer(0)]],
+    device const uint8_t* packed_nibs [[buffer(1)]],
+    device const ushort*  scales      [[buffer(2)]],
+    device const ushort*  biases      [[buffer(3)]],
+    device float*         output      [[buffer(4)]],
+    constant EmbedDims&   dims        [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint total = dims.num_tokens * dims.hidden_size;
+
+    if (gid >= total) return;
+
+    const uint token_idx = gid / dims.hidden_size;
+    const uint d = gid % dims.hidden_size;
+    const uint row = token_ids[token_idx];
+
+    // Flat nibble position in the packed table.
+    const uint flat_pos = row * dims.hidden_size + d;
+    // Each uint32 holds 8 nibbles; nibble i is at bits
+    // 4*i..4*i+3.
+    const uint word_idx = flat_pos / 8;
+    const uint nib_pos = flat_pos % 8;
+    // Read the uint32 containing our nibble and extract it.
+    device const uint32_t* words =
+        (device const uint32_t*)packed_nibs;
+    const uint nibble =
+        (words[word_idx] >> (nib_pos * 4)) & 0xFu;
+
+    // Scale group from flat position.
+    const uint group_idx = flat_pos / dims.group_size;
+    // BF16→F32: raw uint16 bit pattern occupies upper
+    // 16 bits of IEEE 754 f32.
+    const float scale =
+        as_type<float>(uint(scales[group_idx]) << 16);
+    const float bias =
+        as_type<float>(uint(biases[group_idx]) << 16);
+
+    // BF16-round the dequantized output to match MLX's
+    // BF16 arithmetic precision.
+    const float val = scale * float(nibble) + bias;
+    output[gid] = as_type<float>(
+        as_type<uint>(val) & 0xFFFF0000u
+    );
+}
+
+// ============================================================================
 // RMSNorm with f16 output
 // ============================================================================
 
@@ -484,7 +554,7 @@ kernel void embedding_lookup(
 /// Dispatch: 1D threadgroups (one per token), 256 threads.
 kernel void rms_norm_f16out(
     device const float*    input  [[buffer(0)]],
-    device const half*     scale  [[buffer(1)]],
+    device const float*    scale  [[buffer(1)]],
     device half*           output [[buffer(2)]],
     constant RMSNormDims&  dims   [[buffer(3)]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -532,6 +602,75 @@ kernel void rms_norm_f16out(
 }
 
 // ============================================================================
+// RMSNorm with f16 output and BF16 rounding
+// ============================================================================
+
+/// RMSNorm with f32 input, f32 scale, and f16 output.  Identical
+/// to rms_norm_f16out but applies BF16 precision rounding (zeroing
+/// the lower 16 mantissa bits) before narrowing to f16.  This
+/// matches MLX's BF16 arithmetic: the output stored in f16 is the
+/// same value MLX would produce with BF16 intermediates.
+///
+/// Used in the Q4 BF16-faithful pipeline for standalone norm
+/// dispatch (final norm, separate-norm fallback).
+///
+/// Dispatch: 1D threadgroups (one per token), 256 threads.
+kernel void rms_norm_bf16_f16out(
+    device const float*    input  [[buffer(0)]],
+    device const float*    scale  [[buffer(1)]],
+    device half*           output [[buffer(2)]],
+    constant RMSNormDims&  dims   [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]])
+{
+    const uint THREADS = 256;
+    const uint token = tgid;
+    const uint hidden_size = dims.hidden_size;
+
+    // Out-of-bounds threadgroups exit early.
+    if (token >= dims.num_tokens) return;
+
+    device const float* x = input + token * hidden_size;
+    device half* out = output + token * hidden_size;
+
+    // Step 1: Each thread accumulates partial sum of squares.
+    float partial_sum_sq = 0.0f;
+    for (uint i = tid; i < hidden_size; i += THREADS) {
+        const float val = x[i];
+        partial_sum_sq += val * val;
+    }
+
+    // Step 2: Threadgroup reduction for total sum of squares.
+    threadgroup float shared[256];
+    shared[tid] = partial_sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = THREADS / 2; stride > 0;
+         stride /= 2) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // rsqrt(mean(x²) + eps).  Every thread reads the same value.
+    const float rms = rsqrt(
+        shared[0] / float(hidden_size) + dims.eps
+    );
+
+    // Step 3: Normalize, scale, BF16-round, and narrow to f16.
+    for (uint i = tid; i < hidden_size; i += THREADS) {
+        const float val = x[i] * rms * float(scale[i]);
+        // BF16-round: zero the lower 16 mantissa bits to
+        // match MLX's BF16 intermediate precision.
+        const float bf16_val = as_type<float>(
+            as_type<uint>(val) & 0xFFFF0000u
+        );
+        out[i] = half(bf16_val);
+    }
+}
+
+// ============================================================================
 // Residual Add (in-place)
 // ============================================================================
 
@@ -569,14 +708,14 @@ kernel void residual_add(
 /// RMSNorm with f16 input and f16 output for QK head norms.
 ///
 /// Input is [num_tokens × hidden_size] in f16.
-/// Scale is [hidden_size] in f16 (shared across all tokens).
+/// Scale is [hidden_size] in f32 (shared across all tokens).
 /// Output is [num_tokens × hidden_size] in f16.
 /// Internal accumulation stays f32 for precision.
 ///
 /// Dispatch: threadgroups = num_tokens, threads_per_group = 256.
 kernel void rms_norm_f16(
     device const half*     input  [[buffer(0)]],
-    device const half*     scale  [[buffer(1)]],
+    device const float*    scale  [[buffer(1)]],
     device half*           output [[buffer(2)]],
     constant RMSNormDims&  dims   [[buffer(3)]],
     uint tgid [[threadgroup_position_in_grid]],
@@ -694,7 +833,7 @@ struct FusedNormRoPEDims {
 /// Dispatch: threadgroups = num_heads, threads = 256.
 kernel void fused_norm_rope_f16(
     device half*                data   [[buffer(0)]],
-    device const half*          scale  [[buffer(1)]],
+    device const float*         scale  [[buffer(1)]],
     constant FusedNormRoPEDims& dims   [[buffer(2)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]])
@@ -797,7 +936,7 @@ kernel void fused_k_norm_rope_kv_cache_f16(
     device const half*            v_proj   [[buffer(1)]],
     device half*                  k_cache  [[buffer(2)]],
     device half*                  v_cache  [[buffer(3)]],
-    device const half*            k_scale  [[buffer(4)]],
+    device const float*           k_scale  [[buffer(4)]],
     constant FusedKNormRoPEKVDims& dims    [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]])
@@ -1309,8 +1448,8 @@ kernel void gqa_attention_fused_f16io_tg(
     device half*          output     [[buffer(3)]],
     device const half*    K_raw      [[buffer(4)]],
     device const half*    V_raw      [[buffer(5)]],
-    device const half*    q_norm_sc  [[buffer(6)]],
-    device const half*    k_norm_sc  [[buffer(7)]],
+    device const float*   q_norm_sc  [[buffer(6)]],
+    device const float*   k_norm_sc  [[buffer(7)]],
     constant GQAFusedDims& dims      [[buffer(8)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]])

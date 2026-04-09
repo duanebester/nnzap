@@ -1084,7 +1084,7 @@ kernel void qmv_spec_fused_pair_silu_f16io(
 // Kernel 7: qmv_spec_fused_norm_pair_silu_f16io
 // ====================================================================
 /// Fused FFN-RMSNorm + gate/up projection + SiLU activation.
-/// Reads the f32 residual and f16 norm_scale directly, computes
+/// Reads the f32 residual and f32 norm_scale directly, computes
 /// RMSNorm cooperatively in threadgroup memory, then performs
 /// the gate+up QMV with SiLU.  Eliminates 1 dispatch + 1 barrier
 /// per block vs the separate RMSNorm → gate+up+SiLU path.
@@ -1100,7 +1100,7 @@ kernel void qmv_spec_fused_norm_pair_silu_f16io(
     device half*          output     [[buffer(3)]],
     device const uint8_t* packed_b   [[buffer(4)]],
     device const half*    scales_b   [[buffer(5)]],
-    device const half*    norm_scale [[buffer(6)]],
+    device const float*   norm_scale [[buffer(6)]],
     constant QMVDims&     dims       [[buffer(7)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]])
@@ -1281,7 +1281,7 @@ kernel void qmv_spec_fused_norm_pair_silu_f16io(
 // ====================================================================
 // Kernel 8: qmv_spec_fused_norm_f16io — fused RMSNorm + single QMV
 // ====================================================================
-/// Reads the f32 residual and f16 norm_scale directly, computes
+/// Reads the f32 residual and f32 norm_scale directly, computes
 /// RMSNorm cooperatively in threadgroup memory, then performs a
 /// single QMV from the TG-cached normalized input.  Used for the
 /// Q attention projection to avoid a separate RMSNorm dispatch.
@@ -1292,7 +1292,7 @@ kernel void qmv_spec_fused_norm_f16io(
     device const half*    scales      [[buffer(1)]],
     device const float*   residual    [[buffer(2)]],
     device half*          output      [[buffer(3)]],
-    device const half*    norm_scale  [[buffer(4)]],
+    device const float*   norm_scale  [[buffer(4)]],
     constant QMVDims&     dims        [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]])
@@ -1437,7 +1437,7 @@ kernel void qmv_spec_fused_norm_f16io(
 // ====================================================================
 // Kernel 9: qmv_spec_fused_norm_pair_f16io — fused RMSNorm + pair QMV
 // ====================================================================
-/// Reads the f32 residual and f16 norm_scale directly, computes
+/// Reads the f32 residual and f32 norm_scale directly, computes
 /// RMSNorm cooperatively in threadgroup memory, then performs a
 /// paired QMV (two weight matrices, two outputs) from the
 /// TG-cached normalized input.  Used for fused K+V attention
@@ -1452,7 +1452,7 @@ kernel void qmv_spec_fused_norm_pair_f16io(
     device const uint8_t* packed_b   [[buffer(4)]],
     device const half*    scales_b   [[buffer(5)]],
     device half*          output_b   [[buffer(6)]],
-    device const half*    norm_scale [[buffer(7)]],
+    device const float*   norm_scale [[buffer(7)]],
     constant QMVDims&     dims       [[buffer(8)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]])
