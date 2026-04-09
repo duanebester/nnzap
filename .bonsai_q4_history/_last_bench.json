@@ -1,0 +1,20 @@
+{
+  "timestamp_utc": "2026-04-09T19:18:33Z",
+  "model": "Qwen3-1.7B-Q4",
+  "quant": "Q4_MLX_g64",
+  "prompt_tokens": 19,
+  "warmup_tokens": 8,
+  "measured_tokens": 64,
+  "load_ms": 85.6,
+  "prefill_tok_per_sec": 108.1,
+  "decode_tok_per_sec": 234.4,
+  "decode_p50_us": 4251,
+  "decode_p99_us": 4385,
+  "power_source": "ac"
+,
+  "reference_decode_tok_per_sec": 239.1,
+  "reference_prefill_tok_per_sec": 383.0,
+  "reference_decode_p50_us": 4186,
+  "reference_decode_p99_us": 4218,
+  "parity_pct": 98.0
+}

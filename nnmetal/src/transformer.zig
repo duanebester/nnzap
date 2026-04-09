@@ -1020,7 +1020,7 @@ fn dispatchGQAAttentionFusedTG(
         .depth = 1,
     };
     const group = metal.MTLSize{
-        .width = 256,
+        .width = 512,
         .height = 1,
         .depth = 1,
     };

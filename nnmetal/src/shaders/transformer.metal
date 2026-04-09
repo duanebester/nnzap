@@ -1454,7 +1454,7 @@ kernel void gqa_attention_fused_f16io_tg(
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]])
 {
-    const uint THREADS = 256;
+    const uint THREADS = 512;
     const uint SIMD_SIZE = 32;
     const uint NUM_SIMD_GROUPS = THREADS / SIMD_SIZE;
     const uint TG_SEQ_MAX = 1024;
@@ -1479,7 +1479,7 @@ kernel void gqa_attention_fused_f16io_tg(
 
     const float inv_sqrt_d = rsqrt(float(head_dim));
 
-    threadgroup float shared_buf[256];
+    threadgroup float shared_buf[512];
     threadgroup float tg_scores[TG_SEQ_MAX];
 
     // ── Phase 1: Q — load, per-head RMSNorm, RoPE ──────────
@@ -1588,9 +1588,8 @@ kernel void gqa_attention_fused_f16io_tg(
 
     // ── Phase 3: Attention scores Q·K (SIMD-cooperative) ───
     // Each SIMD group computes one dot product cooperatively:
-    // 32 lanes split head_dim (64 / 32 = 2 elements each),
-    // then simd_sum reduces.  8 SIMD groups process 8 tokens
-    // per iteration — all 256 threads active.
+    // 32 lanes split head_dim, then simd_sum reduces.
+    // 16 SIMD groups process 16 tokens per iteration.
     for (uint t = simd_group; t < seq_len;
          t += NUM_SIMD_GROUPS)
     {
@@ -1648,10 +1647,8 @@ kernel void gqa_attention_fused_f16io_tg(
 
     // ── Phase 5: Weighted V sum (SIMD-cooperative) ──────────
     // Each SIMD group handles one output dimension: 32 lanes
-    // split seq_len, then simd_sum reduces.  8 SIMD groups
-    // process 8 dimensions per iteration (64 / 8 = 8 iters).
-    // All 256 threads active vs only 64 in the per-thread
-    // version.
+    // split seq_len, then simd_sum reduces.  16 SIMD groups
+    // process 16 dims per iteration (128 / 16 = 8 iters).
     for (uint d = simd_group; d < head_dim;
          d += NUM_SIMD_GROUPS)
     {
