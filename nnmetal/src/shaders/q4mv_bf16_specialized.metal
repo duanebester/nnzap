@@ -15,9 +15,11 @@
 // Dot product:    row = scale * Sum(nibble_i * x_i)
 //                     + bias  * Sum(x_i)
 //
-// Each lane tracks two accumulators per group:
-//   nib_dot: the weighted dot product Sum(nibble * x)
-//   grp_sum: the input sum Sum(x)  (shared across rows)
+// Memory access pattern: weight reads use an interleaved SIMD layout
+// where adjacent lanes read adjacent uint32 words for fully coalesced
+// 128-byte memory transactions.  Each lane accumulates per-word
+// scale/bias contributions since words from different groups are
+// visited in interleaved order.
 //
 // Packing layout: each uint32 holds 8 sequential nibbles.
 //   nibble i at bits [i*4 .. i*4+3].
@@ -79,13 +81,13 @@ struct QMVDims {
 };
 
 // ====================================================================
-// Kernel 1: q4mv_spec_f16io — single-group, half in, half out
+// Kernel 1: q4mv_spec_f16io — half in, half out
 // ====================================================================
-/// Specialized single-group Q4 QMV with K = SPEC_HIDDEN_K and
+/// Specialized Q4 QMV with K = SPEC_HIDDEN_K and
 /// group_size = SPEC_GS.  Half-precision input (constant cache)
-/// and half-precision output.  Two accumulators per row (nib_dot
-/// and grp_sum) enable the affine dequant identity:
-///   row = scale * Sum(nibble * x) + bias * Sum(x)
+/// and half-precision output.  Interleaved SIMD access pattern:
+/// adjacent lanes read adjacent uint32 words for coalesced
+/// memory transactions.  Per-word scale/bias accumulation.
 ///
 /// Dispatch: threadgroups = ceil(M / 32), threads = 512.
 kernel void q4mv_spec_f16io(
@@ -104,14 +106,10 @@ kernel void q4mv_spec_f16io(
         "K must be SIMD-aligned.");
     static_assert(K % group_size == 0,
         "K must be group-aligned.");
-    static_assert(K / 32 <= group_size,
-        "Single-group: each lane's columns "
-        "must fit in one scale group.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 32) % 8 == 0,
-        "cols_per_lane must be a multiple of 8 "
-        "(8 nibbles per uint32).");
+    static_assert(group_size % 8 == 0,
+        "Group size must be 8-aligned.");
     const uint M = dims.M;
 
     const uint simdgroup_idx = tid / 32;
@@ -120,75 +118,63 @@ kernel void q4mv_spec_f16io(
     const uint row1 = row0 + 1;
 
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint cols_per_lane = K / 32;
-    constexpr uint uint32s_per_lane = cols_per_lane / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-    const uint grp = col_start / group_size;
 
     const bool row0_valid = row0 < M;
     const bool row1_valid = row1 < M;
+    const uint safe_row0 = min(row0, M - 1);
+    const uint safe_row1 = min(row1, M - 1);
 
     device const uint32_t* w32_r0 =
         (device const uint32_t*)(
-            packed_nibs + row0 * nibble_bytes_per_row
-        ) + word_off;
+            packed_nibs + safe_row0 * nibble_bytes_per_row);
     device const uint32_t* w32_r1 =
         (device const uint32_t*)(
-            packed_nibs + row1 * nibble_bytes_per_row
-        ) + word_off;
+            packed_nibs + safe_row1 * nibble_bytes_per_row);
 
-    float nib_dot0 = 0.0f, nib_dot1 = 0.0f;
-    float grp_sum = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
 
-    // Process 8 nibbles (8 columns) per uint32.
+    // Interleaved access: adjacent lanes read adjacent words.
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t word0 =
-            row0_valid ? w32_r0[w] : 0;
-        const uint32_t word1 =
-            row1_valid ? w32_r1[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t word0 = w32_r0[word_idx];
+        const uint32_t word1 = w32_r1[word_idx];
+
+        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint ci =
-                col_start + w * 8 + ni;
-            const float x = float(input[ci]);
-            const uint n0 =
-                (word0 >> (ni * 4)) & 0xFu;
-            const uint n1 =
-                (word1 >> (ni * 4)) & 0xFu;
-            nib_dot0 += float(n0) * x;
-            nib_dot1 += float(n1) * x;
-            grp_sum += x;
+            const float x = float(input[col_base + ni]);
+            nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
+            nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
+
+        const uint sc0 = safe_row0 * groups_per_row + grp;
+        const uint sc1 = safe_row1 * groups_per_row + grp;
+        acc0 += bf16_to_f32(scales[sc0]) * nd0
+              + bf16_to_f32(biases[sc0]) * gs;
+        acc1 += bf16_to_f32(scales[sc1]) * nd1
+              + bf16_to_f32(biases[sc1]) * gs;
     }
 
-    // Affine dequant: row = scale * nib_dot + bias * grp_sum.
-    const uint sc_off0 =
-        row0 * groups_per_row + grp;
-    const uint sc_off1 =
-        row1 * groups_per_row + grp;
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
 
-    if (row0_valid) {
-        float acc0 =
-            bf16_to_f32(scales[sc_off0]) * nib_dot0
-            + bf16_to_f32(biases[sc_off0]) * grp_sum;
-        acc0 = simd_sum(acc0);
-        if (lane == 0) output[row0] = half(bf16_round(acc0));
+    if (row0_valid && lane == 0) {
+        output[row0] = half(bf16_round(acc0));
     }
-
-    if (row1_valid) {
-        float acc1 =
-            bf16_to_f32(scales[sc_off1]) * nib_dot1
-            + bf16_to_f32(biases[sc_off1]) * grp_sum;
-        acc1 = simd_sum(acc1);
-        if (lane == 0) output[row1] = half(bf16_round(acc1));
+    if (row1_valid && lane == 0) {
+        output[row1] = half(bf16_round(acc1));
     }
 }
 
 // ====================================================================
-// Kernel 2: q4mv_spec_f16io_resadd — single-group, fused residual
+// Kernel 2: q4mv_spec_f16io_resadd — fused residual add
 // ====================================================================
 /// Identical to q4mv_spec_f16io but accumulates the f32 result
 /// directly into the residual buffer (residual[row] += acc)
@@ -212,14 +198,10 @@ kernel void q4mv_spec_f16io_resadd(
         "K must be SIMD-aligned.");
     static_assert(K % group_size == 0,
         "K must be group-aligned.");
-    static_assert(K / 32 <= group_size,
-        "Single-group: each lane's columns "
-        "must fit in one scale group.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 32) % 8 == 0,
-        "cols_per_lane must be a multiple of 8 "
-        "(8 nibbles per uint32).");
+    static_assert(group_size % 8 == 0,
+        "Group size must be 8-aligned.");
     const uint M = dims.M;
 
     const uint simdgroup_idx = tid / 32;
@@ -228,69 +210,55 @@ kernel void q4mv_spec_f16io_resadd(
     const uint row1 = row0 + 1;
 
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint cols_per_lane = K / 32;
-    constexpr uint uint32s_per_lane = cols_per_lane / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-    const uint grp = col_start / group_size;
 
     const bool row0_valid = row0 < M;
     const bool row1_valid = row1 < M;
+    const uint safe_row0 = min(row0, M - 1);
+    const uint safe_row1 = min(row1, M - 1);
 
     device const uint32_t* w32_r0 =
         (device const uint32_t*)(
-            packed_nibs + row0 * nibble_bytes_per_row
-        ) + word_off;
+            packed_nibs + safe_row0 * nibble_bytes_per_row);
     device const uint32_t* w32_r1 =
         (device const uint32_t*)(
-            packed_nibs + row1 * nibble_bytes_per_row
-        ) + word_off;
+            packed_nibs + safe_row1 * nibble_bytes_per_row);
 
-    float nib_dot0 = 0.0f, nib_dot1 = 0.0f;
-    float grp_sum = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
 
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t word0 =
-            row0_valid ? w32_r0[w] : 0;
-        const uint32_t word1 =
-            row1_valid ? w32_r1[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t word0 = w32_r0[word_idx];
+        const uint32_t word1 = w32_r1[word_idx];
+
+        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint ci =
-                col_start + w * 8 + ni;
-            const float x = float(input[ci]);
-            const uint n0 =
-                (word0 >> (ni * 4)) & 0xFu;
-            const uint n1 =
-                (word1 >> (ni * 4)) & 0xFu;
-            nib_dot0 += float(n0) * x;
-            nib_dot1 += float(n1) * x;
-            grp_sum += x;
+            const float x = float(input[col_base + ni]);
+            nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
+            nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
+
+        const uint sc0 = safe_row0 * groups_per_row + grp;
+        const uint sc1 = safe_row1 * groups_per_row + grp;
+        acc0 += bf16_to_f32(scales[sc0]) * nd0
+              + bf16_to_f32(biases[sc0]) * gs;
+        acc1 += bf16_to_f32(scales[sc1]) * nd1
+              + bf16_to_f32(biases[sc1]) * gs;
     }
 
-    const uint sc_off0 =
-        row0 * groups_per_row + grp;
-    const uint sc_off1 =
-        row1 * groups_per_row + grp;
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
 
-    // Lane 0 accumulates the f32 result into the residual.
-    if (row0_valid) {
-        float acc0 =
-            bf16_to_f32(scales[sc_off0]) * nib_dot0
-            + bf16_to_f32(biases[sc_off0]) * grp_sum;
-        acc0 = simd_sum(acc0);
-        if (lane == 0) residual[row0] += bf16_round(acc0);
-    }
-
-    if (row1_valid) {
-        float acc1 =
-            bf16_to_f32(scales[sc_off1]) * nib_dot1
-            + bf16_to_f32(biases[sc_off1]) * grp_sum;
-        acc1 = simd_sum(acc1);
-        if (lane == 0) residual[row1] += bf16_round(acc1);
+    if (lane == 0) {
+        if (row0_valid) residual[row0] += bf16_round(acc0);
+        if (row1_valid) residual[row1] += bf16_round(acc1);
     }
 }
 
@@ -300,9 +268,7 @@ kernel void q4mv_spec_f16io_resadd(
 /// Specialized fused-pair Q4 QMV with K = SPEC_HIDDEN_K.  Processes
 /// two weight matrices (A and B) against a single shared input
 /// vector in one dispatch, halving kernel launch overhead for
-/// K/V projection and gate/up projection pairs.  Three
-/// accumulators per lane: nib_dot_a, nib_dot_b, and grp_sum
-/// (shared across both matrices since it depends only on input).
+/// K/V projection and gate/up projection pairs.
 ///
 /// Uses 1 row per simdgroup (not 2) to manage register pressure
 /// from the two concurrent weight streams.
@@ -328,88 +294,70 @@ kernel void q4mv_spec_fused_pair_f16io(
         "K must be SIMD-aligned.");
     static_assert(K % group_size == 0,
         "K must be group-aligned.");
-    static_assert(K / 32 <= group_size,
-        "Single-group: each lane's columns "
-        "must fit in one scale group.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 32) % 8 == 0,
-        "cols_per_lane must be a multiple of 8 "
-        "(8 nibbles per uint32).");
+    static_assert(group_size % 8 == 0,
+        "Group size must be 8-aligned.");
     const uint M = dims.M;
 
-    // 1 row per simdgroup: 16 simdgroups x 1 = 16 rows/TG.
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
     const uint row = tgid * 16 + simdgroup_idx;
 
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint cols_per_lane = K / 32;
-    constexpr uint uint32s_per_lane = cols_per_lane / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-    const uint grp = col_start / group_size;
 
     const bool row_valid = row < M;
-    const uint row_nib_base =
-        row * nibble_bytes_per_row;
+    const uint safe_row = min(row, M - 1);
 
     device const uint32_t* w32_a =
         (device const uint32_t*)(
-            packed_a + row_nib_base
-        ) + word_off;
+            packed_a + safe_row * nibble_bytes_per_row);
     device const uint32_t* w32_b =
         (device const uint32_t*)(
-            packed_b + row_nib_base
-        ) + word_off;
+            packed_b + safe_row * nibble_bytes_per_row);
 
-    float nib_dot_a = 0.0f, nib_dot_b = 0.0f;
-    float grp_sum = 0.0f;
+    float acc_a = 0.0f, acc_b = 0.0f;
 
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t wa =
-            row_valid ? w32_a[w] : 0;
-        const uint32_t wb =
-            row_valid ? w32_b[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t wa = w32_a[word_idx];
+        const uint32_t wb = w32_b[word_idx];
+
+        float nda = 0.0f, ndb = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint ci =
-                col_start + w * 8 + ni;
-            const float x = float(input[ci]);
-            const uint na =
-                (wa >> (ni * 4)) & 0xFu;
-            const uint nb =
-                (wb >> (ni * 4)) & 0xFu;
-            nib_dot_a += float(na) * x;
-            nib_dot_b += float(nb) * x;
-            grp_sum += x;
+            const float x = float(input[col_base + ni]);
+            nda += float((wa >> (ni * 4)) & 0xFu) * x;
+            ndb += float((wb >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
+
+        const uint sc = safe_row * groups_per_row + grp;
+        acc_a += bf16_to_f32(scales_a[sc]) * nda
+               + bf16_to_f32(biases_a[sc]) * gs;
+        acc_b += bf16_to_f32(scales_b[sc]) * ndb
+               + bf16_to_f32(biases_b[sc]) * gs;
     }
 
-    if (row_valid) {
-        const uint sc_off =
-            row * groups_per_row + grp;
-        float acc_a =
-            bf16_to_f32(scales_a[sc_off]) * nib_dot_a
-            + bf16_to_f32(biases_a[sc_off]) * grp_sum;
-        float acc_b =
-            bf16_to_f32(scales_b[sc_off]) * nib_dot_b
-            + bf16_to_f32(biases_b[sc_off]) * grp_sum;
-        acc_a = simd_sum(acc_a);
-        acc_b = simd_sum(acc_b);
-        if (lane == 0) {
-            output_a[row] = half(bf16_round(acc_a));
-            output_b[row] = half(bf16_round(acc_b));
-        }
+    acc_a = simd_sum(acc_a);
+    acc_b = simd_sum(acc_b);
+
+    if (row_valid && lane == 0) {
+        output_a[row] = half(bf16_round(acc_a));
+        output_b[row] = half(bf16_round(acc_b));
     }
 }
 
 // ====================================================================
-// Kernel 4: q4mv_spec_f16in — single-group, half in, float out
+// Kernel 4: q4mv_spec_f16in — half in, float out
 // ====================================================================
-/// Specialized single-group Q4 QMV with K = SPEC_HIDDEN_K.  Reads
+/// Specialized Q4 QMV with K = SPEC_HIDDEN_K.  Reads
 /// the activation vector as half through the constant address
 /// space and writes full f32 output.  Used for LM head projection
 /// that feeds into f32 accumulation (e.g. logits).
@@ -431,14 +379,10 @@ kernel void q4mv_spec_f16in(
         "K must be SIMD-aligned.");
     static_assert(K % group_size == 0,
         "K must be group-aligned.");
-    static_assert(K / 32 <= group_size,
-        "Single-group: each lane's columns "
-        "must fit in one scale group.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 32) % 8 == 0,
-        "cols_per_lane must be a multiple of 8 "
-        "(8 nibbles per uint32).");
+    static_assert(group_size % 8 == 0,
+        "Group size must be 8-aligned.");
     const uint M = dims.M;
 
     const uint simdgroup_idx = tid / 32;
@@ -447,68 +391,57 @@ kernel void q4mv_spec_f16in(
     const uint row1 = row0 + 1;
 
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint cols_per_lane = K / 32;
-    constexpr uint uint32s_per_lane = cols_per_lane / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-    const uint grp = col_start / group_size;
 
     const bool row0_valid = row0 < M;
     const bool row1_valid = row1 < M;
+    const uint safe_row0 = min(row0, M - 1);
+    const uint safe_row1 = min(row1, M - 1);
 
     device const uint32_t* w32_r0 =
         (device const uint32_t*)(
-            packed_nibs + row0 * nibble_bytes_per_row
-        ) + word_off;
+            packed_nibs + safe_row0 * nibble_bytes_per_row);
     device const uint32_t* w32_r1 =
         (device const uint32_t*)(
-            packed_nibs + row1 * nibble_bytes_per_row
-        ) + word_off;
+            packed_nibs + safe_row1 * nibble_bytes_per_row);
 
-    float nib_dot0 = 0.0f, nib_dot1 = 0.0f;
-    float grp_sum = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
 
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t word0 =
-            row0_valid ? w32_r0[w] : 0;
-        const uint32_t word1 =
-            row1_valid ? w32_r1[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t word0 = w32_r0[word_idx];
+        const uint32_t word1 = w32_r1[word_idx];
+
+        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint ci =
-                col_start + w * 8 + ni;
-            const float x = float(input[ci]);
-            const uint n0 =
-                (word0 >> (ni * 4)) & 0xFu;
-            const uint n1 =
-                (word1 >> (ni * 4)) & 0xFu;
-            nib_dot0 += float(n0) * x;
-            nib_dot1 += float(n1) * x;
-            grp_sum += x;
+            const float x = float(input[col_base + ni]);
+            nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
+            nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
+
+        const uint sc0 = safe_row0 * groups_per_row + grp;
+        const uint sc1 = safe_row1 * groups_per_row + grp;
+        acc0 += bf16_to_f32(scales[sc0]) * nd0
+              + bf16_to_f32(biases[sc0]) * gs;
+        acc1 += bf16_to_f32(scales[sc1]) * nd1
+              + bf16_to_f32(biases[sc1]) * gs;
     }
 
-    const uint sc_off0 =
-        row0 * groups_per_row + grp;
-    const uint sc_off1 =
-        row1 * groups_per_row + grp;
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
 
-    if (row0_valid) {
-        float acc0 =
-            bf16_to_f32(scales[sc_off0]) * nib_dot0
-            + bf16_to_f32(biases[sc_off0]) * grp_sum;
-        acc0 = simd_sum(acc0);
-        if (lane == 0) output[row0] = bf16_round(acc0);
+    if (row0_valid && lane == 0) {
+        output[row0] = bf16_round(acc0);
     }
-
-    if (row1_valid) {
-        float acc1 =
-            bf16_to_f32(scales[sc_off1]) * nib_dot1
-            + bf16_to_f32(biases[sc_off1]) * grp_sum;
-        acc1 = simd_sum(acc1);
-        if (lane == 0) output[row1] = bf16_round(acc1);
+    if (row1_valid && lane == 0) {
+        output[row1] = bf16_round(acc1);
     }
 }
 
@@ -516,16 +449,9 @@ kernel void q4mv_spec_f16in(
 // Kernel 5: q4mv_spec_mg_f16io_resadd — multi-group, fused residual
 // ====================================================================
 /// Specialized multi-group Q4 QMV with K = SPEC_INTER_K for down
-/// projections where K exceeds 32 * group_size.  Uses byte-aligned
-/// lane assignment and explicit group-boundary tracking to flush
-/// per-group scale+bias multiplications.  Accumulates the f32
+/// projections where K exceeds 32 * group_size.  Uses interleaved
+/// SIMD access with per-word group tracking.  Accumulates the f32
 /// result directly into the residual buffer (residual[row] += acc).
-///
-/// Unlike single-group kernels, each lane may span multiple scale
-/// groups.  The inner loop tracks group boundaries via a word
-/// counter (group_size % 8 == 0 ensures boundaries align with
-/// uint32 boundaries) and flushes the nib_dot and grp_sum
-/// accumulators at each crossing.
 ///
 /// Input is cached in threadgroup memory to avoid constant-cache
 /// pressure (SPEC_INTER_K may exceed per-CU constant cache).
@@ -552,9 +478,6 @@ kernel void q4mv_spec_mg_f16io_resadd(
         "for uint32 boundary alignment.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 2) % 32 == 0,
-        "Nibble bytes per row must divide evenly "
-        "across 32 lanes.");
     static_assert(K % 512 == 0,
         "K must be divisible by 512 "
         "for cooperative TG load.");
@@ -562,9 +485,7 @@ kernel void q4mv_spec_mg_f16io_resadd(
         "K must fit in 24 KB threadgroup memory.");
     const uint M = dims.M;
 
-    // Cache input in threadgroup memory to avoid
-    // constant-cache pressure (SPEC_INTER_K may
-    // exceed per-CU constant cache on Apple Silicon).
+    // Cache input in threadgroup memory.
     threadgroup half tg_input[K];
     constexpr uint elems_per_thread = K / 512;
     for (uint j = 0; j < elems_per_thread; j++) {
@@ -583,100 +504,47 @@ kernel void q4mv_spec_mg_f16io_resadd(
 
     constexpr uint groups_per_row = K / group_size;
     constexpr uint nibble_bytes_per_row = K / 2;
-    constexpr uint bytes_per_lane =
-        nibble_bytes_per_row / 32;
-    constexpr uint cols_per_lane = bytes_per_lane * 2;
-    constexpr uint uint32s_per_lane =
-        bytes_per_lane / 4;
-    constexpr uint words_per_group = group_size / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
 
-    static_assert(bytes_per_lane % 4 == 0,
-        "bytes_per_lane must be 4-byte aligned "
-        "for uint32 reads.");
-
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-
-    // Use safe_row to avoid reading scales/biases at
-    // invalid row offsets during the flush loop.  The
-    // result for invalid rows is discarded at output.
     const uint safe_row0 = min(row0, M - 1);
     const uint safe_row1 = min(row1, M - 1);
-    const uint row_sc0 =
-        safe_row0 * groups_per_row;
-    const uint row_sc1 =
-        safe_row1 * groups_per_row;
 
     device const uint32_t* w32_r0 =
         (device const uint32_t*)(
-            packed_nibs
-            + safe_row0 * nibble_bytes_per_row
-        ) + word_off;
+            packed_nibs + safe_row0 * nibble_bytes_per_row);
     device const uint32_t* w32_r1 =
         (device const uint32_t*)(
-            packed_nibs
-            + safe_row1 * nibble_bytes_per_row
-        ) + word_off;
+            packed_nibs + safe_row1 * nibble_bytes_per_row);
 
-    // Dual-row accumulation with group tracking.
     float acc0 = 0.0f, acc1 = 0.0f;
-    float nib_dot0 = 0.0f, nib_dot1 = 0.0f;
-    float grp_sum = 0.0f;
-    uint cur_grp = col_start / group_size;
-    uint words_in_group =
-        (col_start % group_size) / 8;
 
+    // Interleaved access with per-word group accumulation.
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t word0 =
-            row0_valid ? w32_r0[w] : 0;
-        const uint32_t word1 =
-            row1_valid ? w32_r1[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t word0 = w32_r0[word_idx];
+        const uint32_t word1 = w32_r1[word_idx];
+
+        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint ci =
-                col_start + w * 8 + ni;
-            const float x =
-                float(tg_input[ci]);
-            const uint n0 =
-                (word0 >> (ni * 4)) & 0xFu;
-            const uint n1 =
-                (word1 >> (ni * 4)) & 0xFu;
-            nib_dot0 += float(n0) * x;
-            nib_dot1 += float(n1) * x;
-            grp_sum += x;
+            const float x = float(tg_input[col_base + ni]);
+            nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
+            nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
 
-        // Flush at group boundary (every words_per_group
-        // uint32s processed).
-        words_in_group++;
-        if (words_in_group == words_per_group) {
-            const uint s0 = row_sc0 + cur_grp;
-            const uint s1 = row_sc1 + cur_grp;
-            acc0 +=
-                bf16_to_f32(scales[s0]) * nib_dot0
-                + bf16_to_f32(biases[s0]) * grp_sum;
-            acc1 +=
-                bf16_to_f32(scales[s1]) * nib_dot1
-                + bf16_to_f32(biases[s1]) * grp_sum;
-            nib_dot0 = 0.0f;
-            nib_dot1 = 0.0f;
-            grp_sum = 0.0f;
-            cur_grp++;
-            words_in_group = 0;
-        }
-    }
-
-    // Flush remaining partial group.
-    if (words_in_group > 0) {
-        const uint s0 = row_sc0 + cur_grp;
-        const uint s1 = row_sc1 + cur_grp;
-        acc0 +=
-            bf16_to_f32(scales[s0]) * nib_dot0
-            + bf16_to_f32(biases[s0]) * grp_sum;
-        acc1 +=
-            bf16_to_f32(scales[s1]) * nib_dot1
-            + bf16_to_f32(biases[s1]) * grp_sum;
+        const uint sc0 =
+            safe_row0 * groups_per_row + grp;
+        const uint sc1 =
+            safe_row1 * groups_per_row + grp;
+        acc0 += bf16_to_f32(scales[sc0]) * nd0
+              + bf16_to_f32(biases[sc0]) * gs;
+        acc1 += bf16_to_f32(scales[sc1]) * nd1
+              + bf16_to_f32(biases[sc1]) * gs;
     }
 
     acc0 = simd_sum(acc0);
@@ -720,82 +588,63 @@ kernel void q4mv_spec_fused_pair_silu_f16io(
         "K must be SIMD-aligned.");
     static_assert(K % group_size == 0,
         "K must be group-aligned.");
-    static_assert(K / 32 <= group_size,
-        "Single-group requirement.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 32) % 8 == 0,
-        "cols_per_lane must be a multiple of 8 "
-        "(8 nibbles per uint32).");
+    static_assert(group_size % 8 == 0,
+        "Group size must be 8-aligned.");
     const uint M = dims.M;
 
-    // 1 row per simdgroup: 16 simdgroups x 1 = 16 rows/TG.
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
     const uint row = tgid * 16 + simdgroup_idx;
 
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint cols_per_lane = K / 32;
-    constexpr uint uint32s_per_lane = cols_per_lane / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-    const uint grp = col_start / group_size;
 
     const bool row_valid = row < M;
-    const uint row_nib_base =
-        row * nibble_bytes_per_row;
+    const uint safe_row = min(row, M - 1);
 
     device const uint32_t* w32_a =
         (device const uint32_t*)(
-            packed_a + row_nib_base
-        ) + word_off;
+            packed_a + safe_row * nibble_bytes_per_row);
     device const uint32_t* w32_b =
         (device const uint32_t*)(
-            packed_b + row_nib_base
-        ) + word_off;
+            packed_b + safe_row * nibble_bytes_per_row);
 
-    float nib_dot_a = 0.0f, nib_dot_b = 0.0f;
-    float grp_sum = 0.0f;
+    float acc_g = 0.0f, acc_u = 0.0f;
 
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t wa =
-            row_valid ? w32_a[w] : 0;
-        const uint32_t wb =
-            row_valid ? w32_b[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t wa = w32_a[word_idx];
+        const uint32_t wb = w32_b[word_idx];
+
+        float nda = 0.0f, ndb = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint ci =
-                col_start + w * 8 + ni;
-            const float x = float(input[ci]);
-            const uint na =
-                (wa >> (ni * 4)) & 0xFu;
-            const uint nb =
-                (wb >> (ni * 4)) & 0xFu;
-            nib_dot_a += float(na) * x;
-            nib_dot_b += float(nb) * x;
-            grp_sum += x;
+            const float x = float(input[col_base + ni]);
+            nda += float((wa >> (ni * 4)) & 0xFu) * x;
+            ndb += float((wb >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
+
+        const uint sc = safe_row * groups_per_row + grp;
+        acc_g += bf16_to_f32(scales_a[sc]) * nda
+               + bf16_to_f32(biases_a[sc]) * gs;
+        acc_u += bf16_to_f32(scales_b[sc]) * ndb
+               + bf16_to_f32(biases_b[sc]) * gs;
     }
 
-    // Fused SiLU(gate) * up with affine dequant.
-    if (row_valid) {
-        const uint sc_off =
-            row * groups_per_row + grp;
-        float g =
-            bf16_to_f32(scales_a[sc_off]) * nib_dot_a
-            + bf16_to_f32(biases_a[sc_off]) * grp_sum;
-        float u =
-            bf16_to_f32(scales_b[sc_off]) * nib_dot_b
-            + bf16_to_f32(biases_b[sc_off]) * grp_sum;
-        g = simd_sum(g);
-        u = simd_sum(u);
-        if (lane == 0) {
-            const float silu =
-                g / (1.0f + exp(-g));
-            output[row] = half(bf16_round(silu * u));
-        }
+    acc_g = simd_sum(acc_g);
+    acc_u = simd_sum(acc_u);
+
+    if (row_valid && lane == 0) {
+        const float silu = acc_g / (1.0f + exp(-acc_g));
+        output[row] = half(bf16_round(silu * acc_u));
     }
 }
 
@@ -805,11 +654,8 @@ kernel void q4mv_spec_fused_pair_silu_f16io(
 /// Fused FFN-RMSNorm + gate/up projection + SiLU activation.
 /// Reads the f32 residual and f16 norm_scale directly, computes
 /// RMSNorm cooperatively in threadgroup memory, then performs
-/// the gate+up Q4 QMV with SiLU.  Eliminates 1 dispatch +
-/// 1 barrier per block vs the separate RMSNorm -> gate+up+SiLU.
-///
-/// Uses padded threadgroup stride (cols_per_lane + 2) to avoid
-/// bank conflicts when 32 lanes read from TG memory.
+/// the gate+up Q4 QMV with SiLU.  Linear TG layout for the
+/// normalized input, read with interleaved SIMD access pattern.
 ///
 /// Dispatch: threadgroups = ceil(M / 16), threads = 512.
 kernel void q4mv_spec_fused_norm_pair_silu_f16io(
@@ -832,31 +678,25 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
         "K must be SIMD-aligned.");
     static_assert(K % group_size == 0,
         "K must be group-aligned.");
-    static_assert(K / 32 <= group_size,
-        "Single-group requirement.");
     static_assert(K <= 4096,
         "K must fit in threadgroup memory.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 32) % 8 == 0,
-        "cols_per_lane must be a multiple of 8 "
-        "(8 nibbles per uint32).");
+    static_assert(group_size % 8 == 0,
+        "Group size must be 8-aligned.");
     static_assert(K % 512 == 0,
         "K must be divisible by 512 "
         "for cooperative load.");
     const uint M = dims.M;
 
-    constexpr uint cols_per_lane = K / 32;
-    // Pad stride by 2 so adjacent lanes hit different
-    // TG memory banks: gcd((cols_per_lane+2)/2, 32)=1.
-    constexpr uint padded_stride = cols_per_lane + 2;
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint uint32s_per_lane = cols_per_lane / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
     constexpr uint elems_per_thread = K / 512;
 
-    // TG memory: padded normalized input + reduction.
-    threadgroup half tg_input[32 * padded_stride];
+    // Linear TG layout — no padding needed with interleaved access.
+    threadgroup half tg_input[K];
     threadgroup float tg_reduce[16];
 
     const uint simdgroup_idx = tid / 32;
@@ -869,14 +709,12 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
             residual[tid * elems_per_thread + j];
         partial_sos += v * v;
     }
-    // Reduce within simdgroup, then across simdgroups.
     partial_sos = simd_sum(partial_sos);
     if (lane == 0) {
         tg_reduce[simdgroup_idx] = partial_sos;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // First simdgroup reduces the 16 partial sums.
     if (simdgroup_idx == 0) {
         const float v = (lane < 16)
             ? tg_reduce[lane] : 0.0f;
@@ -890,80 +728,60 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float rms_inv = tg_reduce[0];
 
-    // ── Phase 2: Normalize to padded TG memory ─────
+    // ── Phase 2: Normalize to linear TG memory ─────
     for (uint j = 0; j < elems_per_thread; j++) {
         const uint elem =
             tid * elems_per_thread + j;
         const float val = residual[elem] * rms_inv
             * float(norm_scale[elem]);
-        const uint qmv_lane =
-            elem / cols_per_lane;
-        const uint lane_off =
-            elem % cols_per_lane;
-        tg_input[
-            qmv_lane * padded_stride + lane_off
-        ] = half(bf16_round(val));
+        tg_input[elem] = half(bf16_round(val));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ── Phase 3: Gate+Up Q4 QMV with SiLU ──────────
     const uint row = tgid * 16 + simdgroup_idx;
     const bool row_valid = row < M;
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-    const uint grp = col_start / group_size;
-    const uint tg_base = lane * padded_stride;
+    const uint safe_row = min(row, M - 1);
 
     device const uint32_t* w32_a =
         (device const uint32_t*)(
-            packed_a + row * nibble_bytes_per_row
-        ) + word_off;
+            packed_a + safe_row * nibble_bytes_per_row);
     device const uint32_t* w32_b =
         (device const uint32_t*)(
-            packed_b + row * nibble_bytes_per_row
-        ) + word_off;
+            packed_b + safe_row * nibble_bytes_per_row);
 
-    float nib_dot_a = 0.0f, nib_dot_b = 0.0f;
-    float grp_sum = 0.0f;
+    float acc_g = 0.0f, acc_u = 0.0f;
 
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t wa =
-            row_valid ? w32_a[w] : 0;
-        const uint32_t wb =
-            row_valid ? w32_b[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t wa = w32_a[word_idx];
+        const uint32_t wb = w32_b[word_idx];
+
+        float nda = 0.0f, ndb = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint lo = w * 8 + ni;
-            const float x =
-                float(tg_input[tg_base + lo]);
-            const uint na =
-                (wa >> (ni * 4)) & 0xFu;
-            const uint nb =
-                (wb >> (ni * 4)) & 0xFu;
-            nib_dot_a += float(na) * x;
-            nib_dot_b += float(nb) * x;
-            grp_sum += x;
+            const float x = float(tg_input[col_base + ni]);
+            nda += float((wa >> (ni * 4)) & 0xFu) * x;
+            ndb += float((wb >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
+
+        const uint sc = safe_row * groups_per_row + grp;
+        acc_g += bf16_to_f32(scales_a[sc]) * nda
+               + bf16_to_f32(biases_a[sc]) * gs;
+        acc_u += bf16_to_f32(scales_b[sc]) * ndb
+               + bf16_to_f32(biases_b[sc]) * gs;
     }
 
-    // Fused SiLU(gate) * up with affine dequant.
-    if (row_valid) {
-        const uint sc_off =
-            row * groups_per_row + grp;
-        float g =
-            bf16_to_f32(scales_a[sc_off]) * nib_dot_a
-            + bf16_to_f32(biases_a[sc_off]) * grp_sum;
-        float u =
-            bf16_to_f32(scales_b[sc_off]) * nib_dot_b
-            + bf16_to_f32(biases_b[sc_off]) * grp_sum;
-        g = simd_sum(g);
-        u = simd_sum(u);
-        if (lane == 0) {
-            const float silu =
-                g / (1.0f + exp(-g));
-            output[row] = half(bf16_round(silu * u));
-        }
+    acc_g = simd_sum(acc_g);
+    acc_u = simd_sum(acc_u);
+
+    if (row_valid && lane == 0) {
+        const float silu = acc_g / (1.0f + exp(-acc_g));
+        output[row] = half(bf16_round(silu * acc_u));
     }
 }
 
@@ -974,7 +792,7 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
 /// RMSNorm cooperatively in threadgroup memory, then performs a
 /// single Q4 QMV from the TG-cached normalized input.  Used for
 /// the Q attention projection to avoid a separate RMSNorm
-/// dispatch.
+/// dispatch.  Linear TG layout with interleaved SIMD reads.
 ///
 /// Uses 2 rows per simdgroup (lower register pressure than pair
 /// kernels allows it), giving 32 rows per threadgroup.
@@ -997,28 +815,24 @@ kernel void q4mv_spec_fused_norm_f16io(
         "K must be SIMD-aligned.");
     static_assert(K % group_size == 0,
         "K must be group-aligned.");
-    static_assert(K / 32 <= group_size,
-        "Single-group requirement.");
     static_assert(K <= 4096,
         "K must fit in threadgroup memory.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 32) % 8 == 0,
-        "cols_per_lane must be a multiple of 8 "
-        "(8 nibbles per uint32).");
+    static_assert(group_size % 8 == 0,
+        "Group size must be 8-aligned.");
     static_assert(K % 512 == 0,
         "K must be divisible by 512 "
         "for cooperative load.");
     const uint M = dims.M;
 
-    constexpr uint cols_per_lane = K / 32;
-    constexpr uint padded_stride = cols_per_lane + 2;
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint uint32s_per_lane = cols_per_lane / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
     constexpr uint elems_per_thread = K / 512;
 
-    threadgroup half tg_input[32 * padded_stride];
+    threadgroup half tg_input[K];
     threadgroup float tg_reduce[16];
 
     const uint simdgroup_idx = tid / 32;
@@ -1050,19 +864,13 @@ kernel void q4mv_spec_fused_norm_f16io(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float rms_inv = tg_reduce[0];
 
-    // ── Phase 2: Normalize to padded TG memory ─────
+    // ── Phase 2: Normalize to linear TG memory ─────
     for (uint j = 0; j < elems_per_thread; j++) {
         const uint elem =
             tid * elems_per_thread + j;
         const float val = residual[elem] * rms_inv
             * float(norm_scale[elem]);
-        const uint qmv_lane =
-            elem / cols_per_lane;
-        const uint lane_off =
-            elem % cols_per_lane;
-        tg_input[
-            qmv_lane * padded_stride + lane_off
-        ] = half(bf16_round(val));
+        tg_input[elem] = half(bf16_round(val));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1072,65 +880,56 @@ kernel void q4mv_spec_fused_norm_f16io(
     const uint row1 = row0 + 1;
     const bool row0_valid = row0 < M;
     const bool row1_valid = row1 < M;
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-    const uint grp = col_start / group_size;
-    const uint tg_base = lane * padded_stride;
+    const uint safe_row0 = min(row0, M - 1);
+    const uint safe_row1 = min(row1, M - 1);
 
     device const uint32_t* w32_r0 =
         (device const uint32_t*)(
             packed_nibs
-            + row0 * nibble_bytes_per_row
-        ) + word_off;
+            + safe_row0 * nibble_bytes_per_row);
     device const uint32_t* w32_r1 =
         (device const uint32_t*)(
             packed_nibs
-            + row1 * nibble_bytes_per_row
-        ) + word_off;
+            + safe_row1 * nibble_bytes_per_row);
 
-    float nib_dot0 = 0.0f, nib_dot1 = 0.0f;
-    float grp_sum = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f;
 
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t word0 =
-            row0_valid ? w32_r0[w] : 0;
-        const uint32_t word1 =
-            row1_valid ? w32_r1[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t word0 = w32_r0[word_idx];
+        const uint32_t word1 = w32_r1[word_idx];
+
+        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint lo = w * 8 + ni;
             const float x =
-                float(tg_input[tg_base + lo]);
-            const uint n0 =
-                (word0 >> (ni * 4)) & 0xFu;
-            const uint n1 =
-                (word1 >> (ni * 4)) & 0xFu;
-            nib_dot0 += float(n0) * x;
-            nib_dot1 += float(n1) * x;
-            grp_sum += x;
+                float(tg_input[col_base + ni]);
+            nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
+            nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
+
+        const uint sc0 =
+            safe_row0 * groups_per_row + grp;
+        const uint sc1 =
+            safe_row1 * groups_per_row + grp;
+        acc0 += bf16_to_f32(scales[sc0]) * nd0
+              + bf16_to_f32(biases[sc0]) * gs;
+        acc1 += bf16_to_f32(scales[sc1]) * nd1
+              + bf16_to_f32(biases[sc1]) * gs;
     }
 
-    const uint sc_off0 =
-        row0 * groups_per_row + grp;
-    const uint sc_off1 =
-        row1 * groups_per_row + grp;
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
 
-    if (row0_valid) {
-        float acc0 =
-            bf16_to_f32(scales[sc_off0]) * nib_dot0
-            + bf16_to_f32(biases[sc_off0]) * grp_sum;
-        acc0 = simd_sum(acc0);
-        if (lane == 0) output[row0] = half(bf16_round(acc0));
+    if (row0_valid && lane == 0) {
+        output[row0] = half(bf16_round(acc0));
     }
-
-    if (row1_valid) {
-        float acc1 =
-            bf16_to_f32(scales[sc_off1]) * nib_dot1
-            + bf16_to_f32(biases[sc_off1]) * grp_sum;
-        acc1 = simd_sum(acc1);
-        if (lane == 0) output[row1] = half(bf16_round(acc1));
+    if (row1_valid && lane == 0) {
+        output[row1] = half(bf16_round(acc1));
     }
 }
 
@@ -1142,6 +941,7 @@ kernel void q4mv_spec_fused_norm_f16io(
 /// paired Q4 QMV (two weight matrices, two outputs) from the
 /// TG-cached normalized input.  Used for fused K+V attention
 /// projections to avoid a separate RMSNorm dispatch.
+/// Linear TG layout with interleaved SIMD reads.
 ///
 /// Dispatch: threadgroups = ceil(M / 16), threads = 512.
 kernel void q4mv_spec_fused_norm_pair_f16io(
@@ -1165,28 +965,24 @@ kernel void q4mv_spec_fused_norm_pair_f16io(
         "K must be SIMD-aligned.");
     static_assert(K % group_size == 0,
         "K must be group-aligned.");
-    static_assert(K / 32 <= group_size,
-        "Single-group requirement.");
     static_assert(K <= 4096,
         "K must fit in threadgroup memory.");
     static_assert(K >= 256,
         "K must be >= 256 for Q4 uint32 path.");
-    static_assert((K / 32) % 8 == 0,
-        "cols_per_lane must be a multiple of 8 "
-        "(8 nibbles per uint32).");
+    static_assert(group_size % 8 == 0,
+        "Group size must be 8-aligned.");
     static_assert(K % 512 == 0,
         "K must be divisible by 512 "
         "for cooperative load.");
     const uint M = dims.M;
 
-    constexpr uint cols_per_lane = K / 32;
-    constexpr uint padded_stride = cols_per_lane + 2;
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint uint32s_per_lane = cols_per_lane / 8;
+    constexpr uint words_per_row = K / 8;
+    constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
     constexpr uint elems_per_thread = K / 512;
 
-    threadgroup half tg_input[32 * padded_stride];
+    threadgroup half tg_input[K];
     threadgroup float tg_reduce[16];
 
     const uint simdgroup_idx = tid / 32;
@@ -1218,77 +1014,61 @@ kernel void q4mv_spec_fused_norm_pair_f16io(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float rms_inv = tg_reduce[0];
 
-    // ── Phase 2: Normalize to padded TG memory ─────
+    // ── Phase 2: Normalize to linear TG memory ─────
     for (uint j = 0; j < elems_per_thread; j++) {
         const uint elem =
             tid * elems_per_thread + j;
         const float val = residual[elem] * rms_inv
             * float(norm_scale[elem]);
-        const uint qmv_lane =
-            elem / cols_per_lane;
-        const uint lane_off =
-            elem % cols_per_lane;
-        tg_input[
-            qmv_lane * padded_stride + lane_off
-        ] = half(bf16_round(val));
+        tg_input[elem] = half(bf16_round(val));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ── Phase 3: Paired Q4 QMV from TG memory ──────
     const uint row = tgid * 16 + simdgroup_idx;
     const bool row_valid = row < M;
-    const uint col_start = lane * cols_per_lane;
-    const uint word_off = col_start / 8;
-    const uint grp = col_start / group_size;
-    const uint tg_base = lane * padded_stride;
+    const uint safe_row = min(row, M - 1);
 
     device const uint32_t* w32_a =
         (device const uint32_t*)(
-            packed_a + row * nibble_bytes_per_row
-        ) + word_off;
+            packed_a + safe_row * nibble_bytes_per_row);
     device const uint32_t* w32_b =
         (device const uint32_t*)(
-            packed_b + row * nibble_bytes_per_row
-        ) + word_off;
+            packed_b + safe_row * nibble_bytes_per_row);
 
-    float nib_dot_a = 0.0f, nib_dot_b = 0.0f;
-    float grp_sum = 0.0f;
+    float acc_a = 0.0f, acc_b = 0.0f;
 
     #pragma clang loop unroll(disable)
     for (uint w = 0; w < uint32s_per_lane; w++) {
-        const uint32_t wa =
-            row_valid ? w32_a[w] : 0;
-        const uint32_t wb =
-            row_valid ? w32_b[w] : 0;
+        const uint word_idx = w * 32 + lane;
+        const uint col_base = word_idx * 8;
+        const uint grp = col_base / group_size;
 
+        const uint32_t wa = w32_a[word_idx];
+        const uint32_t wb = w32_b[word_idx];
+
+        float nda = 0.0f, ndb = 0.0f, gs = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
-            const uint lo = w * 8 + ni;
             const float x =
-                float(tg_input[tg_base + lo]);
-            const uint na =
-                (wa >> (ni * 4)) & 0xFu;
-            const uint nb =
-                (wb >> (ni * 4)) & 0xFu;
-            nib_dot_a += float(na) * x;
-            nib_dot_b += float(nb) * x;
-            grp_sum += x;
+                float(tg_input[col_base + ni]);
+            nda += float((wa >> (ni * 4)) & 0xFu) * x;
+            ndb += float((wb >> (ni * 4)) & 0xFu) * x;
+            gs += x;
         }
+
+        const uint sc =
+            safe_row * groups_per_row + grp;
+        acc_a += bf16_to_f32(scales_a[sc]) * nda
+               + bf16_to_f32(biases_a[sc]) * gs;
+        acc_b += bf16_to_f32(scales_b[sc]) * ndb
+               + bf16_to_f32(biases_b[sc]) * gs;
     }
 
-    if (row_valid) {
-        const uint sc_off =
-            row * groups_per_row + grp;
-        float acc_a =
-            bf16_to_f32(scales_a[sc_off]) * nib_dot_a
-            + bf16_to_f32(biases_a[sc_off]) * grp_sum;
-        float acc_b =
-            bf16_to_f32(scales_b[sc_off]) * nib_dot_b
-            + bf16_to_f32(biases_b[sc_off]) * grp_sum;
-        acc_a = simd_sum(acc_a);
-        acc_b = simd_sum(acc_b);
-        if (lane == 0) {
-            out_a[row] = half(bf16_round(acc_a));
-            out_b[row] = half(bf16_round(acc_b));
-        }
+    acc_a = simd_sum(acc_a);
+    acc_b = simd_sum(acc_b);
+
+    if (row_valid && lane == 0) {
+        out_a[row] = half(bf16_round(acc_a));
+        out_b[row] = half(bf16_round(acc_b));
     }
 }
