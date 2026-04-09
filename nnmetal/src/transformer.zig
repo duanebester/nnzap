@@ -984,14 +984,29 @@ fn dispatchGQAAttentionFusedTG(
     );
     std.debug.assert(dims.seq_len <= 1024);
 
-    setRawBuffer(encoder, q_buffer, 0, 0);
-    setRawBuffer(encoder, k_cache_buffer, 0, 1);
-    setRawBuffer(encoder, v_cache_buffer, 0, 2);
-    setRawBuffer(encoder, output_buffer, 0, 3);
-    setRawBuffer(encoder, k_raw_buffer, 0, 4);
-    setRawBuffer(encoder, v_raw_buffer, 0, 5);
-    setRawBuffer(encoder, q_norm_scale, 0, 6);
-    setRawBuffer(encoder, k_norm_scale, 0, 7);
+    // Batch-bind all 8 buffers (indices 0-7) in a single
+    // ObjC call.  Saves 7 message sends per dispatch.
+    const ptrs = [8]?*anyopaque{
+        q_buffer.value,
+        k_cache_buffer.value,
+        v_cache_buffer.value,
+        output_buffer.value,
+        k_raw_buffer.value,
+        v_raw_buffer.value,
+        q_norm_scale.value,
+        k_norm_scale.value,
+    };
+    const offsets = [8]c_ulong{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    const range = [2]c_ulong{ 0, 8 };
+    encoder.msgSend(
+        void,
+        "setBuffers:offsets:withRange:",
+        .{
+            @as(*const anyopaque, @ptrCast(&ptrs)),
+            @as(*const anyopaque, @ptrCast(&offsets)),
+            @as([2]c_ulong, range),
+        },
+    );
     metal.setBytes(
         encoder,
         GQAFusedDims,
@@ -2004,9 +2019,30 @@ fn dispatchQ4MVf16ioResadd(
     else
         unreachable; // Q4 resadd requires specialized pipelines.
 
-    metal.setQ4Buffer(encoder, q4_buffer, 0);
-    setRawBuffer(encoder, input_buffer, 0, 3);
-    setRawBuffer(encoder, residual_buffer, 0, 4);
+    // Batch-bind indices 0-4 (Q4 + input + residual)
+    // in a single ObjC call.
+    const ptrs = [5]?*anyopaque{
+        q4_buffer.obj.value, q4_buffer.obj.value,
+        q4_buffer.obj.value, input_buffer.value,
+        residual_buffer.value,
+    };
+    const offsets = [5]c_ulong{
+        0,
+        @as(c_ulong, q4_buffer.scaleOffset()),
+        @as(c_ulong, q4_buffer.biasOffset()),
+        0,
+        0,
+    };
+    const range = [2]c_ulong{ 0, 5 };
+    encoder.msgSend(
+        void,
+        "setBuffers:offsets:withRange:",
+        .{
+            @as(*const anyopaque, @ptrCast(&ptrs)),
+            @as(*const anyopaque, @ptrCast(&offsets)),
+            @as([2]c_ulong, range),
+        },
+    );
     metal.setBytes(encoder, QMVDims, &dims, 5);
 
     const rows_per_tg: u32 = 32;
@@ -2148,9 +2184,30 @@ fn dispatchQ4FusedNormQMVf16io(
         device.spec_q4mv_fused_norm_f16io orelse
         unreachable; // Q4 fused norm requires specialized.
 
-    metal.setQ4Buffer(encoder, q4_buffer, 0);
-    setRawBuffer(encoder, residual, 0, 3);
-    setRawBuffer(encoder, output, 0, 4);
+    // Batch-bind indices 0-4 (Q4 + residual + output)
+    // in a single ObjC call.
+    const ptrs = [5]?*anyopaque{
+        q4_buffer.obj.value, q4_buffer.obj.value,
+        q4_buffer.obj.value, residual.value,
+        output.value,
+    };
+    const offsets = [5]c_ulong{
+        0,
+        @as(c_ulong, q4_buffer.scaleOffset()),
+        @as(c_ulong, q4_buffer.biasOffset()),
+        0,
+        0,
+    };
+    const range = [2]c_ulong{ 0, 5 };
+    encoder.msgSend(
+        void,
+        "setBuffers:offsets:withRange:",
+        .{
+            @as(*const anyopaque, @ptrCast(&ptrs)),
+            @as(*const anyopaque, @ptrCast(&offsets)),
+            @as([2]c_ulong, range),
+        },
+    );
     metal.setBytes(encoder, QMVDims, &dims, 5);
     setRawBuffer(encoder, norm_scale, 0, 6);
 
@@ -2201,10 +2258,37 @@ fn dispatchQ4FusedNormPairQMVf16io(
         device.spec_q4mv_fused_norm_pair_f16io orelse
         unreachable; // Q4 fused norm pair needs specialized.
 
-    metal.setQ4Buffer(encoder, packed_a, 0);
-    setRawBuffer(encoder, residual, 0, 3);
-    setRawBuffer(encoder, output_a, 0, 4);
-    metal.setQ4Buffer(encoder, packed_b, 5);
+    // Batch-bind indices 0-7 (Q4 A + residual + output A
+    // + Q4 B) in a single ObjC call.
+    const ptrs_07 = [8]?*anyopaque{
+        packed_a.obj.value, packed_a.obj.value,
+        packed_a.obj.value, residual.value,
+        output_a.value, packed_b.obj.value,
+        packed_b.obj.value, packed_b.obj.value,
+    };
+    const offsets_07 = [8]c_ulong{
+        0,
+        @as(c_ulong, packed_a.scaleOffset()),
+        @as(c_ulong, packed_a.biasOffset()),
+        0,
+        0,
+        0,
+        @as(c_ulong, packed_b.scaleOffset()),
+        @as(c_ulong, packed_b.biasOffset()),
+    };
+    const range_07 = [2]c_ulong{ 0, 8 };
+    encoder.msgSend(
+        void,
+        "setBuffers:offsets:withRange:",
+        .{
+            @as(*const anyopaque, @ptrCast(&ptrs_07)),
+            @as(
+                *const anyopaque,
+                @ptrCast(&offsets_07),
+            ),
+            @as([2]c_ulong, range_07),
+        },
+    );
     setRawBuffer(encoder, output_b, 0, 8);
     metal.setBytes(encoder, QMVDims, &dims, 9);
     setRawBuffer(encoder, norm_scale, 0, 10);
@@ -2254,10 +2338,34 @@ fn dispatchQ4FusedNormPairSiLUf16io(
         device.spec_q4mv_fused_norm_pair_silu_f16io orelse
         unreachable; // Q4 fused norm SiLU needs specialized.
 
-    metal.setQ4Buffer(encoder, packed_a, 0);
-    setRawBuffer(encoder, residual, 0, 3);
-    setRawBuffer(encoder, output, 0, 4);
-    metal.setQ4Buffer(encoder, packed_b, 5);
+    // Batch-bind indices 0-7 (Q4 A + residual + output
+    // + Q4 B) in a single ObjC call.
+    const ptrs = [8]?*anyopaque{
+        packed_a.obj.value, packed_a.obj.value,
+        packed_a.obj.value, residual.value,
+        output.value, packed_b.obj.value,
+        packed_b.obj.value, packed_b.obj.value,
+    };
+    const offsets = [8]c_ulong{
+        0,
+        @as(c_ulong, packed_a.scaleOffset()),
+        @as(c_ulong, packed_a.biasOffset()),
+        0,
+        0,
+        0,
+        @as(c_ulong, packed_b.scaleOffset()),
+        @as(c_ulong, packed_b.biasOffset()),
+    };
+    const range = [2]c_ulong{ 0, 8 };
+    encoder.msgSend(
+        void,
+        "setBuffers:offsets:withRange:",
+        .{
+            @as(*const anyopaque, @ptrCast(&ptrs)),
+            @as(*const anyopaque, @ptrCast(&offsets)),
+            @as([2]c_ulong, range),
+        },
+    );
     metal.setBytes(encoder, QMVDims, &dims, 8);
     setRawBuffer(encoder, norm_scale, 0, 9);
 
