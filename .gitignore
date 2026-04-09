@@ -21,6 +21,7 @@ zap/data/mnist/*
 .agent_history/
 .engine_agent_history/
 .bonsai_history/
+.bonsai_q4_history/
 .mnist_history/
 
 # MNIST snapshots (local experiment state)
