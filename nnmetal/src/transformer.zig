@@ -2593,7 +2593,8 @@ pub fn forwardDecode(
         pipelines,
         args,
     );
-    bufferBarrier(encoder);
+    // Targeted: only flush residual (embedding output).
+    resourceBarrier1(encoder, args.residual);
     encodeAllBlocks(Config, device, encoder, pipelines, args);
     encodeFinalNormAndLMHead(
         Config,
@@ -2752,7 +2753,8 @@ fn encodeFinalNormAndLMHead(
             .eps = 1e-6,
         },
     );
-    bufferBarrier(encoder);
+    // Targeted: only flush norm_out for LM head.
+    resourceBarrier1(encoder, args.norm_out);
     const lm_dims = QMVDims{
         .M = Config.vocab_size,
         .K = Config.hidden_size,
@@ -2832,6 +2834,56 @@ fn bufferBarrier(encoder: objc.Object) void {
         void,
         "memoryBarrierWithScope:",
         .{@as(c_ulong, 1)},
+    );
+}
+
+/// Targeted resource barrier: flush only the specified
+/// buffer to avoid invalidating unrelated cache lines.
+/// Saves GPU cache-flush work vs the broad scope barrier.
+fn resourceBarrier1(
+    encoder: objc.Object,
+    r0: objc.Object,
+) void {
+    std.debug.assert(encoder.value != null);
+    std.debug.assert(r0.value != null);
+    const resources = [1]?*anyopaque{r0.value};
+    encoder.msgSend(
+        void,
+        "memoryBarrierWithResources:count:",
+        .{
+            @as(
+                *const anyopaque,
+                @ptrCast(&resources),
+            ),
+            @as(c_ulong, 1),
+        },
+    );
+}
+
+/// Targeted resource barrier for 3 buffers.
+fn resourceBarrier3(
+    encoder: objc.Object,
+    r0: objc.Object,
+    r1: objc.Object,
+    r2: objc.Object,
+) void {
+    std.debug.assert(encoder.value != null);
+    std.debug.assert(r0.value != null);
+    std.debug.assert(r1.value != null);
+    std.debug.assert(r2.value != null);
+    const resources = [3]?*anyopaque{
+        r0.value, r1.value, r2.value,
+    };
+    encoder.msgSend(
+        void,
+        "memoryBarrierWithResources:count:",
+        .{
+            @as(
+                *const anyopaque,
+                @ptrCast(&resources),
+            ),
+            @as(c_ulong, 3),
+        },
     );
 }
 
@@ -2962,9 +3014,8 @@ fn encodeAttentionProjections(
     }
     // Q/K norm + RoPE + KV cache update are now fused into
     // the GQA attention kernel (encodeAttentionGather).
-    // Single barrier: wait for Q/K/V projection writes
-    // before the fused GQA kernel reads them.
-    bufferBarrier(encoder);
+    // Targeted barrier: only flush Q/K/V projection outputs.
+    resourceBarrier3(encoder, a.q, a.k, a.v);
 }
 
 /// Fused-norm path: each QMV kernel reads the f32 residual
@@ -3281,7 +3332,8 @@ fn encodeAttentionGather(
             },
         );
     }
-    bufferBarrier(encoder);
+    // Targeted: only flush attn_out (GQA output) for O proj.
+    resourceBarrier1(encoder, a.attn_out);
     // Fused QMV + residual accumulate: the O-projection result
     // is added directly to the f32 residual (residual[row] += acc)
     // instead of writing f16 to proj_out then dispatching
@@ -3310,7 +3362,8 @@ fn encodeAttentionGather(
             o_dims,
         );
     }
-    bufferBarrier(encoder);
+    // Targeted: only flush residual for MLP norm.
+    resourceBarrier1(encoder, a.residual);
 }
 
 /// Encode the MLP half of a decoder block:
@@ -3558,7 +3611,8 @@ fn encodeMLPHalf(
             }
         }
     }
-    bufferBarrier(encoder);
+    // Targeted: only flush mlp_out for down projection.
+    resourceBarrier1(encoder, a.mlp_out);
     // Fused QMV + residual accumulate: the down-projection
     // result is added directly to the f32 residual instead of
     // writing f16 to proj_out then dispatching residual_add_f16.
@@ -3587,7 +3641,8 @@ fn encodeMLPHalf(
             down_dims,
         );
     }
-    bufferBarrier(encoder);
+    // Targeted: only flush residual for next block.
+    resourceBarrier1(encoder, a.residual);
 }
 
 // ============================================================================
