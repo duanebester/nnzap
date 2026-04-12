@@ -13,6 +13,8 @@ zap/.zig-cache/
 
 nn/data/mnist/*
 zap/data/mnist/*
+nnmetal/data/
+labrat/data/
 
 # Engine research snapshots (local experiment state)
 .engine_snapshots/
