@@ -7,7 +7,7 @@ path.
 ## Goal
 
 Maximise decode tok/s for Bonsai 1.7B Q4.
-Target: 224 tok/s (PrismML MLX on same M2 Max).
+Target: match or exceed MLX reference on same machine.
 Primary metric: decode_tok_per_sec from bench.
 
 The Q4 MLX format stores weights as 4-bit unsigned
@@ -60,48 +60,49 @@ Norm scales are stored as f32 (lossless from BF16).
 
 ## Protocol
 
-1. **Hypothesis first.** Call experiment_start and
-   state your hypothesis: what you will change, why
-   it should improve throughput.
+1. **Orient.** Review history, run bench for a
+   baseline, and form a hypothesis. Take the time
+   you need to read and understand code — but stay
+   focused on one idea per experiment.
 
-2. **Read only what you need.** The initial context
-   includes function outlines for the hot path.
-   Use run_command with grep/sed only for code NOT
-   already in context.
+2. **Start.** Call experiment_start with your
+   hypothesis: what you will change, why it should
+   improve throughput.
 
-3. **Edit, then validate.** Make your change, then
-   run check → test → bench. If check fails, fix
-   within 2 attempts or abandon.
+3. **Implement and validate.** Edit → check → test →
+   bench. If check fails, fix within 2 attempts or
+   abandon.
 
 4. **Finish.** Call experiment_finish with decision:
-   - keep: consistently better by a few percent
-     (run bench 2–3 times to confirm stability).
+   - keep: consistently better (run bench 2–3 times
+     to confirm stability).
    - abandon: regression, flat, or within noise.
+     Abandon quickly — don't burn turns debugging a
+     regression.
 
 5. **STOP.** Outer loop starts the next experiment.
 
 ## Turn economy
 
-Every tool call costs time and tokens. Prefer
-targeted reads over broad exploration.
+You have 80 turns. Aim to finish in ~40. The
+codebase scope section below describes the hot path
+in detail — use it to avoid redundant reads. A few
+guidelines:
 
-- Do NOT re-read code that is already in context.
-- Prefer one targeted sed command over several
-  exploratory reads.
 - Each experiment should test ONE hypothesis.
+- Prefer targeted reads (sed with line ranges, grep)
+  over reading entire files.
+- Batch related sed calls in one run_command when
+  possible.
+- The codebase scope below gives line ranges, kernel
+  names, buffer bindings, and dispatch patterns —
+  check there before reading the file.
 
 ## Navigation
-
-When you need code NOT already in context, use
-run_command with CLI tools:
 
 - Read range: sed -n '100,150p' <file>
 - Search: grep -rn 'pattern' nnmetal/src/
 - Outline: grep -n 'fn ' <file>
-- Find files: find nnmetal/src -name '\*.zig'
-
-Use show only for files under ~200 lines.
-Use show_function when you know the exact name.
 
 ## Codebase scope — Q4 hot path
 
@@ -248,3 +249,38 @@ projections share input vector loading.
   kernels.
 - After a structural change, always run test before
   bench to catch correctness issues early.
+
+## What has already been tried
+
+Previous experiments have established these facts.
+Do NOT re-attempt these — they all regressed:
+
+- **Increasing rows per SIMD group** (2→4 rows in
+  single-matrix kernels, 1→2 rows in paired kernels):
+  register pressure kills occupancy every time.
+- **Loop unrolling** (full or partial unroll_count(2)):
+  register pressure regression, even 2× is too much.
+- **Fusing final RMSNorm into LM head**: 4748 TGs each
+  redundantly computing norm → massive regression.
+- **Float threadgroup memory** (half→float in fused
+  norm kernels): doubled TG memory, reduced occupancy.
+- **Broad targeted resource barriers**: converting
+  bufferBarrier to resourceBarrier was tested but
+  auto-abandoned before benchmarking twice — results
+  inconclusive.
+
+- **Merging Q proj + K/V proj into one kernel**: there
+  is NO barrier between these two dispatches — Metal
+  already overlaps them on the GPU. A merged triple
+  kernel would lose the 2-rows/SG optimization for Q,
+  inflate TG count (64+64→256), add divergent control
+  flow, and lose the pair kernel's shared gs amortization.
+  Net negative — do not attempt.
+
+The GPU kernels are at the occupancy sweet spot.
+Any change that increases register pressure or
+threadgroup memory will regress. Focus on:
+reducing dispatch/barrier count, reducing CPU-side
+overhead, restructuring the pipeline, or improving
+memory access patterns WITHOUT increasing per-thread
+resource usage.

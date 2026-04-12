@@ -188,9 +188,41 @@ pub fn build(b: *std.Build) void {
     const run_toolbox_tests = b.addRunArtifact(
         toolbox_tests,
     );
+
+    const tools_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "tools.zig", .module = tools_module },
+            },
+        }),
+    });
+    const run_tools_tests = b.addRunArtifact(
+        tools_tests,
+    );
+
+    const toolbox_ext_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/toolbox_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "toolbox.zig", .module = toolbox_module },
+                .{ .name = "tools.zig", .module = tools_module },
+            },
+        }),
+    });
+    const run_toolbox_ext_tests = b.addRunArtifact(
+        toolbox_ext_tests,
+    );
+
     const test_step = b.step(
         "test",
-        "Run toolbox unit tests",
+        "Run unit tests",
     );
     test_step.dependOn(&run_toolbox_tests.step);
+    test_step.dependOn(&run_tools_tests.step);
+    test_step.dependOn(&run_toolbox_ext_tests.step);
 }

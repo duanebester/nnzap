@@ -73,7 +73,6 @@ const mnist_tools = [_]core.ToolDef{
             .type = .string_array,
             .required = true,
         }},
-        .shape_override = .json_payload,
     },
     .{
         .name = "config_backup",
@@ -106,7 +105,6 @@ const mnist_tools = [_]core.ToolDef{
                 "description, e.g. " ++
                 "adam-lr-sweep",
         }},
-        .shape_override = .json_payload,
     },
     .{
         .name = "diff",
@@ -137,7 +135,6 @@ const mnist_tools = [_]core.ToolDef{
                     "and why it succeeded or failed.",
             },
         },
-        .shape_override = .json_payload,
     },
     // ---- Build / test / bench ----
     .{
@@ -307,7 +304,6 @@ const mnist_tools = [_]core.ToolDef{
                 "execute. Use single quotes " ++
                 "for patterns.",
         }},
-        .shape_override = .json_payload,
     },
 };
 

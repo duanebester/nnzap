@@ -57,7 +57,6 @@ const bonsai_tools = [_]core.ToolDef{
                 "description, e.g. " ++
                 "simd-rms-norm",
         }},
-        .shape_override = .json_payload,
     },
     .{
         .name = "diff",
@@ -88,7 +87,6 @@ const bonsai_tools = [_]core.ToolDef{
                     "and why it succeeded or failed.",
             },
         },
-        .shape_override = .json_payload,
     },
     // ---- Build / test / bench ----
     .{
@@ -258,7 +256,6 @@ const bonsai_tools = [_]core.ToolDef{
                 "execute. Use single quotes " ++
                 "for patterns.",
         }},
-        .shape_override = .json_payload,
     },
 };
 

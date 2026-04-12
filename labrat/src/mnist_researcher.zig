@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const zjson = std.json;
 const tools = @import("tools.zig");
 const toolbox = @import("toolbox.zig");
 
@@ -102,14 +103,14 @@ pub fn main() void {
 fn mnistDispatch(
     arena: Allocator,
     cmd: []const u8,
-    args: []const []const u8,
+    obj: zjson.ObjectMap,
 ) !bool {
     if (tools.eql(cmd, "config-show")) {
         try toolConfigShow(arena);
         return true;
     }
     if (tools.eql(cmd, "config-set")) {
-        try toolConfigSet(arena, args);
+        try toolConfigSet(arena, obj);
         return true;
     }
     if (tools.eql(cmd, "config-backup")) {
@@ -364,73 +365,65 @@ fn formatConfigJson(
 // config-set — modify hyperparameters in source file
 // ============================================================
 
-fn resolveConfigArgs(
-    arena: Allocator,
-    args: []const []const u8,
-) []const []const u8 {
-    std.debug.assert(args.len > 0);
-
-    // Check for -f flag.
-    if (args.len >= 2 and tools.eql(args[0], "-f")) {
-        const path = args[1];
-        const content = tools.readFile(
-            arena,
-            path,
-        ) catch return args;
-
-        // Clean up temp file.
-        std.fs.cwd().deleteFile(path) catch {};
-
-        const parsed = std.json.parseFromSliceLeaky(
-            std.json.Value,
-            arena,
-            content,
-            .{},
-        ) catch return args;
-
-        const obj = switch (parsed) {
-            .object => |o| o,
-            else => return args,
-        };
-
-        const arr_val = obj.get("settings") orelse
-            return args;
-        const arr = switch (arr_val) {
-            .array => |a| a.items,
-            else => return args,
-        };
-        if (arr.len == 0) return args;
-
-        const result = arena.alloc(
-            []const u8,
-            arr.len,
-        ) catch return args;
-        var count: usize = 0;
-        for (arr) |item| {
-            switch (item) {
-                .string => |s| {
-                    result[count] = s;
-                    count += 1;
-                },
-                else => {},
-            }
-        }
-        if (count == 0) return args;
-        return result[0..count];
-    }
-
-    // No -f flag — use positional args as-is.
-    return args;
-}
-
 fn toolConfigSet(
     arena: Allocator,
-    args: []const []const u8,
+    obj: zjson.ObjectMap,
 ) !void {
-    if (args.len == 0) return error.NoConfigArgs;
+    const arr_val = obj.get("settings") orelse {
+        try tools.writeStdout(
+            "{\"status\": \"error\", " ++
+                "\"error\": \"missing " ++
+                "'settings' field\"}\n",
+        );
+        std.process.exit(1);
+    };
+    const arr = switch (arr_val) {
+        .array => |a| a.items,
+        else => {
+            try tools.writeStdout(
+                "{\"status\": \"error\", " ++
+                    "\"error\": \"'settings' " ++
+                    "must be an array\"}\n",
+            );
+            std.process.exit(1);
+        },
+    };
+    if (arr.len == 0) {
+        try tools.writeStdout(
+            "{\"status\": \"error\", " ++
+                "\"error\": \"empty settings " ++
+                "array\"}\n",
+        );
+        std.process.exit(1);
+    }
 
-    const resolved = resolveConfigArgs(arena, args);
-    const changes = parseConfigArgs(resolved);
+    // Convert JSON string array to string slice.
+    const resolved = arena.alloc(
+        []const u8,
+        arr.len,
+    ) catch return error.OutOfMemory;
+    var count: usize = 0;
+    for (arr) |item| {
+        switch (item) {
+            .string => |s| {
+                resolved[count] = s;
+                count += 1;
+            },
+            else => {},
+        }
+    }
+    if (count == 0) {
+        try tools.writeStdout(
+            "{\"status\": \"error\", " ++
+                "\"error\": \"no valid " ++
+                "settings\"}\n",
+        );
+        std.process.exit(1);
+    }
+
+    const changes = parseConfigArgs(
+        resolved[0..count],
+    );
     const main_fs = try tools.resolveToFs(
         arena,
         config.fs_root,
@@ -444,21 +437,21 @@ fn toolConfigSet(
     );
     try tools.writeFile(main_fs, modified);
 
-    var count: u32 = 0;
-    if (changes.lr != null) count += 1;
-    if (changes.batch != null) count += 1;
-    if (changes.epochs != null) count += 1;
-    if (changes.seed != null) count += 1;
-    if (changes.optimizer != null) count += 1;
-    if (changes.arch != null) count += 1;
+    var change_count: u32 = 0;
+    if (changes.lr != null) change_count += 1;
+    if (changes.batch != null) change_count += 1;
+    if (changes.epochs != null) change_count += 1;
+    if (changes.seed != null) change_count += 1;
+    if (changes.optimizer != null) change_count += 1;
+    if (changes.arch != null) change_count += 1;
 
-    const json = try std.fmt.allocPrint(
+    const result_json = try std.fmt.allocPrint(
         arena,
         "{{\"status\": \"ok\", " ++
             "\"changes_applied\": {d}}}\n",
-        .{count},
+        .{change_count},
     );
-    try tools.writeStdout(json);
+    try tools.writeStdout(result_json);
 }
 
 fn parseConfigArgs(

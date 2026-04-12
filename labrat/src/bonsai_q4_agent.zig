@@ -53,7 +53,6 @@ const bonsai_q4_tools = [_]core.ToolDef{
                 "description, e.g. " ++
                 "q4-simd-rms-norm",
         }},
-        .shape_override = .json_payload,
     },
     .{
         .name = "diff",
@@ -84,7 +83,6 @@ const bonsai_q4_tools = [_]core.ToolDef{
                     "and why it succeeded or failed.",
             },
         },
-        .shape_override = .json_payload,
     },
     // ---- Build / test / bench ----
     .{
@@ -254,7 +252,6 @@ const bonsai_q4_tools = [_]core.ToolDef{
                 "execute. Use single quotes " ++
                 "for patterns.",
         }},
-        .shape_override = .json_payload,
     },
 };
 
@@ -274,7 +271,7 @@ const config = core.AgentConfig{
         .{ .json_key = "prefill_tok_per_sec", .label = "prefill" },
         .{ .json_key = "decode_p99_us", .label = "p99_us" },
     },
-    .max_turns_per_experiment = 50,
+    .max_turns_per_experiment = 80,
     .build_context_fn = &buildBonsaiQ4Context,
 };
 

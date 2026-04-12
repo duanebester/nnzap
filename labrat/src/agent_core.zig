@@ -51,26 +51,12 @@ pub const ApiResponse = api.ApiResponse;
 // Types
 // ============================================================
 
-/// How the agent passes input to the toolbox binary.
-pub const ToolShape = enum {
-    /// Tool takes no parameters.
-    no_input,
-    /// Extract one JSON field, pass as positional arg.
-    string_arg,
-    /// Write full JSON to temp file, pass -f.
-    json_payload,
-};
-
 /// Maps an LLM tool name to a CLI subcommand.
 pub const ToolMapping = struct {
     /// LLM-facing name: "read_file".
     tool_name: []const u8,
     /// CLI-facing name: "read-file".
     subcommand: []const u8,
-    /// How the agent passes input to the toolbox.
-    shape: ToolShape,
-    /// For string_arg: which JSON field to extract.
-    field: ?[]const u8 = null,
 };
 
 // ============================================================
@@ -109,35 +95,6 @@ pub const ToolDef = struct {
     description: []const u8,
     /// Input properties (empty = no parameters).
     properties: []const Property = &.{},
-    /// Override auto-derived dispatch shape.  null =
-    /// derive: 0 props → no_input, 1 → string_arg,
-    /// 2+ → json_payload.
-    shape_override: ?ToolShape = null,
-
-    /// Resolve the dispatch shape for this tool.
-    fn resolveShape(
-        comptime self: ToolDef,
-    ) ToolShape {
-        if (self.shape_override) |s| return s;
-        return switch (self.properties.len) {
-            0 => .no_input,
-            1 => .string_arg,
-            else => .json_payload,
-        };
-    }
-
-    /// Derive the field name for string_arg dispatch.
-    fn resolveField(
-        comptime self: ToolDef,
-    ) ?[]const u8 {
-        if (self.resolveShape() != .string_arg) {
-            return null;
-        }
-        comptime std.debug.assert(
-            self.properties.len == 1,
-        );
-        return self.properties[0].name;
-    }
 };
 
 /// Generate a ToolMapping slice from ToolDef array.
@@ -150,8 +107,6 @@ pub fn toolMappings(
             maps[i] = .{
                 .tool_name = def.name,
                 .subcommand = def.subcommand,
-                .shape = def.resolveShape(),
-                .field = def.resolveField(),
             };
         }
         const final = maps;
@@ -997,25 +952,12 @@ pub fn dispatchTool(
 
     for (config.tool_map) |mapping| {
         if (api.eql(call.name, mapping.tool_name)) {
-            return switch (mapping.shape) {
-                .no_input => callToolbox(
-                    config,
-                    arena,
-                    &.{mapping.subcommand},
-                ),
-                .string_arg => dispatchStringArg(
-                    config,
-                    arena,
-                    mapping,
-                    call.input_json,
-                ),
-                .json_payload => dispatchJsonPayload(
-                    config,
-                    arena,
-                    mapping.subcommand,
-                    call.input_json,
-                ),
-            };
+            return dispatchJson(
+                config,
+                arena,
+                mapping.subcommand,
+                call.input_json,
+            );
         }
     }
 
@@ -1025,71 +967,8 @@ pub fn dispatchTool(
     };
 }
 
-/// Extract one JSON field, pass as positional arg.
-fn dispatchStringArg(
-    config: *const AgentConfig,
-    arena: Allocator,
-    mapping: ToolMapping,
-    input_json: []const u8,
-) ToolOutput {
-    const field_name = mapping.field orelse {
-        return .{
-            .stdout = "Error: no field for string_arg",
-            .success = false,
-        };
-    };
-
-    const parsed = std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena,
-        input_json,
-        .{},
-    ) catch {
-        return .{
-            .stdout = "Error: invalid JSON input",
-            .success = false,
-        };
-    };
-    const obj = switch (parsed) {
-        .object => |o| o,
-        else => return .{
-            .stdout = "Error: expected JSON object",
-            .success = false,
-        },
-    };
-    const val = obj.get(field_name) orelse {
-        const msg = std.fmt.allocPrint(
-            arena,
-            "Error: missing '{s}' field",
-            .{field_name},
-        ) catch "Error: missing field";
-        return .{ .stdout = msg, .success = false };
-    };
-    const str_val = switch (val) {
-        .string => |s| s,
-        .integer => |i| std.fmt.allocPrint(
-            arena,
-            "{d}",
-            .{i},
-        ) catch return .{
-            .stdout = "Error: format failed",
-            .success = false,
-        },
-        else => return .{
-            .stdout = "Error: field not a string",
-            .success = false,
-        },
-    };
-
-    return callToolbox(
-        config,
-        arena,
-        &.{ mapping.subcommand, str_val },
-    );
-}
-
 /// Write full JSON input to temp file, pass -f.
-fn dispatchJsonPayload(
+fn dispatchJson(
     config: *const AgentConfig,
     arena: Allocator,
     subcommand: []const u8,
@@ -2237,28 +2116,20 @@ test "comptime tool schema generation" {
     // Mapping count matches def count.
     comptime std.debug.assert(maps.len == 3);
 
-    // Shapes derived correctly from property count.
-    comptime std.debug.assert(maps[0].shape == .no_input);
-    comptime std.debug.assert(maps[1].shape == .string_arg);
-    comptime std.debug.assert(maps[2].shape == .json_payload);
-
-    // Field derived for the string_arg tool.
-    comptime std.debug.assert(
-        std.mem.eql(u8, maps[1].field.?, "path"),
-    );
-    comptime std.debug.assert(maps[0].field == null);
-    comptime std.debug.assert(maps[2].field == null);
-
     // JSON is a valid array envelope.
     comptime std.debug.assert(json[0] == '[');
-    comptime std.debug.assert(json[json.len - 1] == ']');
+    comptime std.debug.assert(
+        json[json.len - 1] == ']',
+    );
 
     // JSON contains each tool name.
     comptime std.debug.assert(
-        std.mem.indexOf(u8, json, "list_items") != null,
+        std.mem.indexOf(u8, json, "list_items") !=
+            null,
     );
     comptime std.debug.assert(
-        std.mem.indexOf(u8, json, "read_file") != null,
+        std.mem.indexOf(u8, json, "read_file") !=
+            null,
     );
     comptime std.debug.assert(
         std.mem.indexOf(u8, json, "search") != null,

@@ -42,6 +42,10 @@ pub const ToolboxConfig = struct {
     /// Display name for log messages.
     name: []const u8,
 
+    /// When true, log tool inputs and outputs to stderr
+    /// for debugging.
+    debug: bool = false,
+
     /// Working directory for build/test/bench commands.
     project_root: []const u8,
 
@@ -91,7 +95,7 @@ pub const ToolboxConfig = struct {
     custom_dispatch: ?*const fn (
         std.mem.Allocator,
         []const u8,
-        []const []const u8,
+        std.json.ObjectMap,
     ) anyerror!bool = null,
 };
 
@@ -110,7 +114,7 @@ const MAX_PATH_LEN: u32 = 512;
 const MAX_HISTORY_SIZE: usize = 2 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT: usize = 1 * 1024 * 1024;
 const MAX_SHOW_LINES: u32 = 200;
-const MAX_OUTLINE_FUNCTIONS: u32 = 512;
+pub const MAX_OUTLINE_FUNCTIONS: u32 = 512;
 
 // ============================================================
 // Internal result types
@@ -123,7 +127,7 @@ const FunctionBounds = struct {
 
 /// A function name and its starting line number,
 /// used by show-outline and show-function suggestions.
-const FunctionEntry = struct {
+pub const FunctionEntry = struct {
     name: []const u8,
     line: u32,
 };
@@ -174,6 +178,19 @@ fn getJsonString(
     };
 }
 
+fn writeJsonErrorMsg(
+    arena: Allocator,
+    msg: []const u8,
+) !void {
+    const json = try std.fmt.allocPrint(
+        arena,
+        "{{\"status\": \"error\", " ++
+            "\"error\": \"{s}\"}}\n",
+        .{msg},
+    );
+    try tools.writeStdout(json);
+}
+
 // ============================================================
 // Entry point
 // ============================================================
@@ -181,10 +198,10 @@ fn getJsonString(
 /// Run the toolbox with the given configuration.
 /// Parses CLI args, dispatches to the matching tool,
 /// and handles errors.  Does not return on failure.
-pub fn run(config: *const ToolboxConfig) void {
-    std.debug.assert(config.write_scope.len > 0);
-    std.debug.assert(config.read_scope.len > 0);
-    std.debug.assert(config.bench_command.len > 0);
+pub fn run(config_arg: *const ToolboxConfig) void {
+    std.debug.assert(config_arg.write_scope.len > 0);
+    std.debug.assert(config_arg.read_scope.len > 0);
+    std.debug.assert(config_arg.bench_command.len > 0);
 
     var arena_state = std.heap.ArenaAllocator.init(
         std.heap.page_allocator,
@@ -198,17 +215,49 @@ pub fn run(config: *const ToolboxConfig) void {
     std.debug.assert(args.len >= 1);
 
     if (args.len < 2) {
-        toolHelp(config) catch {};
+        toolHelp(config_arg) catch {};
         std.process.exit(1);
     }
 
-    const cmd = args[1];
-    const rest: []const []const u8 = if (args.len > 2)
-        args[2..]
-    else
-        &.{};
+    // Check for --debug flag before the subcommand.
+    var debug = config_arg.debug;
+    var cmd_index: usize = 1;
+    if (args.len > 1 and
+        tools.eql(args[1], "--debug"))
+    {
+        debug = true;
+        cmd_index = 2;
+    }
+    if (args.len <= cmd_index) {
+        toolHelp(config_arg) catch {};
+        std.process.exit(1);
+    }
 
-    dispatch(config, arena, cmd, rest) catch |err| {
+    // Copy config with resolved debug flag.
+    var config = config_arg.*;
+    config.debug = debug;
+
+    const cmd = args[cmd_index];
+    const rest_start = cmd_index + 1;
+    const rest: []const []const u8 =
+        if (args.len > rest_start)
+            args[rest_start..]
+        else
+            &.{};
+
+    // Parse JSON input once — all tools receive the
+    // same ObjectMap.  No-input tools get an empty map.
+    var obj = readJsonInput(arena, rest) orelse
+        std.json.ObjectMap.init(arena);
+
+    if (config.debug) {
+        std.debug.print(
+            "[debug] tool={s} input_keys={d}\n",
+            .{ cmd, obj.count() },
+        );
+    }
+
+    dispatch(&config, arena, cmd, obj) catch |err| {
         tools.writeJsonError(err) catch {};
         std.process.exit(1);
     };
@@ -218,7 +267,7 @@ fn dispatch(
     config: *const ToolboxConfig,
     arena: Allocator,
     cmd: []const u8,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
     std.debug.assert(cmd.len > 0);
     std.debug.assert(cmd.len < MAX_PATH_LEN);
@@ -236,32 +285,38 @@ fn dispatch(
         return toolBench(config, arena);
     }
     if (tools.eql(cmd, "show")) {
-        return toolShow(config, arena, args);
+        return toolShow(config, arena, obj);
     }
     if (tools.eql(cmd, "show-function")) {
-        return toolShowFunction(config, arena, args);
+        return toolShowFunction(
+            config,
+            arena,
+            obj,
+        );
     }
     if (tools.eql(cmd, "read-file")) {
-        return toolReadFile(config, arena, args);
+        return toolReadFile(config, arena, obj);
     }
     if (tools.eql(cmd, "write-file")) {
-        return toolWriteFile(config, arena, args);
+        return toolWriteFile(config, arena, obj);
     }
     if (tools.eql(cmd, "edit-file")) {
-        return toolEditFile(config, arena, args);
+        return toolEditFile(config, arena, obj);
     }
     if (tools.eql(cmd, "list-dir")) {
-        return toolListDir(config, arena, args);
+        return toolListDir(config, arena, obj);
     }
-    if (tools.eql(cmd, "cwd")) return toolCwd(arena);
+    if (tools.eql(cmd, "cwd")) {
+        return toolCwd(arena);
+    }
     if (tools.eql(cmd, "run-cmd")) {
-        return toolRunCmd(arena, args);
+        return toolRunCmd(arena, obj);
     }
     if (tools.eql(cmd, "experiment-start")) {
         return toolExperimentStart(
             config,
             arena,
-            args,
+            obj,
         );
     }
     if (tools.eql(cmd, "diff")) {
@@ -271,11 +326,11 @@ fn dispatch(
         return toolExperimentFinish(
             config,
             arena,
-            args,
+            obj,
         );
     }
     if (tools.eql(cmd, "history")) {
-        return toolHistory(config, arena, args);
+        return toolHistory(config, arena, obj);
     }
 
     // Extra benchmark commands from config.
@@ -287,7 +342,7 @@ fn dispatch(
 
     // Domain-specific dispatch.
     if (config.custom_dispatch) |custom| {
-        if (try custom(arena, cmd, args)) return;
+        if (try custom(arena, cmd, obj)) return;
     }
 
     try toolHelp(config);
@@ -522,7 +577,7 @@ fn runBenchCommand(
 
 /// Extract a float field from a JSON string by key.
 /// Simple substring scan — no allocation, no JSON parse.
-fn extractJsonFloat(
+pub fn extractJsonFloat(
     json: []const u8,
     key: []const u8,
 ) ?f64 {
@@ -779,18 +834,15 @@ fn runExtraBench(
 fn toolShow(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
-    if (args.len < 1) {
-        try tools.writeStdout(
-            "{\"status\": \"error\", " ++
-                "\"error\": \"usage: " ++
-                "show <file>\"}\n",
+    const path = getJsonString(obj, "file") orelse {
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'file' field",
         );
         return;
-    }
-
-    const path = args[0];
+    };
     std.debug.assert(path.len > 0);
 
     if (!isAllowedReadPath(config, path)) {
@@ -891,20 +943,25 @@ fn toolShow(
 fn toolShowFunction(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
-    if (args.len < 2) {
-        try tools.writeStdout(
-            "{\"status\": \"error\", " ++
-                "\"error\": \"usage: " ++
-                "show-function " ++
-                "<file> <function_name>\"}\n",
+    const path = getJsonString(obj, "file") orelse {
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'file' field",
         );
         return;
-    }
-
-    const path = args[0];
-    const function_name = args[1];
+    };
+    const function_name = getJsonString(
+        obj,
+        "function_name",
+    ) orelse {
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'function_name' field",
+        );
+        return;
+    };
     std.debug.assert(path.len > 0);
     std.debug.assert(function_name.len > 0);
 
@@ -1175,7 +1232,7 @@ fn scanForFunction(
 /// depth.  Ignores braces inside string literals (basic
 /// handling for double-quoted strings and single-quoted
 /// chars).
-fn countBracesOnLine(
+pub fn countBracesOnLine(
     line: []const u8,
     depth: i32,
 ) i32 {
@@ -1203,7 +1260,7 @@ fn countBracesOnLine(
 /// from file content.  Detects Zig-style `fn name(`
 /// and Metal-style `kernel void name(` patterns.
 /// Returns at most MAX_OUTLINE_FUNCTIONS entries.
-fn collectFunctionNames(
+pub fn collectFunctionNames(
     arena: Allocator,
     content: []const u8,
 ) []const FunctionEntry {
@@ -1237,7 +1294,7 @@ fn collectFunctionNames(
 /// Extract the function name from a line, if it
 /// contains a function signature.  Returns null if
 /// the line is not a function declaration.
-fn extractFunctionName(line: []const u8) ?[]const u8 {
+pub fn extractFunctionName(line: []const u8) ?[]const u8 {
     if (line.len < 4) return null;
 
     // Zig: look for "fn " followed by "(".
@@ -1278,7 +1335,7 @@ fn extractFunctionName(line: []const u8) ?[]const u8 {
 
 /// Extract lines [start..end] (1-based, inclusive) from
 /// content.  Returns the raw text of those lines.
-fn extractLineRange(
+pub fn extractLineRange(
     arena: Allocator,
     content: []const u8,
     start_line: u32,
@@ -1423,40 +1480,54 @@ fn countLines(content: []const u8) u32 {
 fn toolReadFile(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
-    if (args.len < 1) {
-        try tools.writeJsonError(
-            error.MissingArgument,
+    const path = getJsonString(obj, "path") orelse {
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'path' field",
         );
         std.process.exit(1);
-    }
-    const path = args[0];
+    };
     std.debug.assert(path.len > 0);
     if (!isAllowedReadPath(config, path)) {
         const msg = try std.fmt.allocPrint(
             arena,
-            "Error: read not allowed for '{s}'. " ++
-                "Only project files are accessible.",
+            "read not allowed for '{s}'",
             .{path},
         );
-        try tools.writeStdout(msg);
+        try writeJsonErrorMsg(arena, msg);
         std.process.exit(1);
     }
-    const fs_path = try tools.resolveToFs(arena, config.fs_root, path);
+    const fs_path = try tools.resolveToFs(
+        arena,
+        config.fs_root,
+        path,
+    );
     const content = tools.readFile(
         arena,
         fs_path,
     ) catch {
         const msg = try std.fmt.allocPrint(
             arena,
-            "Error: cannot read '{s}'",
+            "cannot read '{s}'",
             .{path},
         );
-        try tools.writeStdout(msg);
+        try writeJsonErrorMsg(arena, msg);
         std.process.exit(1);
     };
-    try tools.writeStdout(content);
+    const escaped = try tools.jsonEscape(
+        arena,
+        content,
+    );
+    const json = try std.fmt.allocPrint(
+        arena,
+        "{{\"status\": \"ok\", " ++
+            "\"path\": \"{s}\", " ++
+            "\"content\": \"{s}\"}}\n",
+        .{ path, escaped },
+    );
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -1466,18 +1537,15 @@ fn toolReadFile(
 fn toolWriteFile(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
-    const obj = readJsonInput(arena, args) orelse {
-        try tools.writeJsonError(error.InvalidInput);
-        std.process.exit(1);
-    };
     const path = getJsonString(
         obj,
         "path",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'path' field",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'path' field",
         );
         std.process.exit(1);
     };
@@ -1485,22 +1553,27 @@ fn toolWriteFile(
         obj,
         "content",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'content' field",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'content' field",
         );
         std.process.exit(1);
     };
     std.debug.assert(path.len > 0);
     if (!isAllowedWritePath(config, path)) {
-        const err_msg = try std.fmt.allocPrint(
+        const msg = try std.fmt.allocPrint(
             arena,
-            "Error: write not allowed to '{s}'",
+            "write not allowed to '{s}'",
             .{path},
         );
-        try tools.writeStdout(err_msg);
+        try writeJsonErrorMsg(arena, msg);
         std.process.exit(1);
     }
-    const fs_path = try tools.resolveToFs(arena, config.fs_root, path);
+    const fs_path = try tools.resolveToFs(
+        arena,
+        config.fs_root,
+        path,
+    );
     const file = try std.fs.cwd().createFile(
         fs_path,
         .{},
@@ -1509,8 +1582,10 @@ fn toolWriteFile(
     try file.writeAll(content);
     const ok_msg = try std.fmt.allocPrint(
         arena,
-        "OK: wrote {d} bytes to {s}",
-        .{ content.len, path },
+        "{{\"status\": \"ok\", " ++
+            "\"path\": \"{s}\", " ++
+            "\"bytes_written\": {d}}}\n",
+        .{ path, content.len },
     );
     try tools.writeStdout(ok_msg);
 }
@@ -1522,18 +1597,15 @@ fn toolWriteFile(
 fn toolEditFile(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
-    const obj = readJsonInput(arena, args) orelse {
-        try tools.writeJsonError(error.InvalidInput);
-        std.process.exit(1);
-    };
     const path = getJsonString(
         obj,
         "path",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'path' field",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'path' field",
         );
         std.process.exit(1);
     };
@@ -1541,8 +1613,9 @@ fn toolEditFile(
         obj,
         "old_content",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'old_content'",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'old_content'",
         );
         std.process.exit(1);
     };
@@ -1550,24 +1623,26 @@ fn toolEditFile(
         obj,
         "new_content",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'new_content'",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'new_content'",
         );
         std.process.exit(1);
     };
     std.debug.assert(path.len > 0);
     if (!isAllowedWritePath(config, path)) {
-        const err_msg = try std.fmt.allocPrint(
+        const msg = try std.fmt.allocPrint(
             arena,
-            "Error: edit not allowed for '{s}'",
+            "edit not allowed for '{s}'",
             .{path},
         );
-        try tools.writeStdout(err_msg);
+        try writeJsonErrorMsg(arena, msg);
         std.process.exit(1);
     }
     if (old_text.len == 0) {
-        try tools.stdout_file.writeAll(
-            "Error: old_content is empty",
+        try writeJsonErrorMsg(
+            arena,
+            "old_content is empty",
         );
         std.process.exit(1);
     }
@@ -1597,12 +1672,12 @@ fn applyEdit(
         const preview = tools.truncate(old_text, 100);
         const err_msg = try std.fmt.allocPrint(
             arena,
-            "Error: old_content not found in " ++
+            "old_content not found in " ++
                 "{s}. Searched for: \"{s}...\" " ++
                 "({d} chars).",
             .{ path, preview, old_text.len },
         );
-        try tools.writeStdout(err_msg);
+        try writeJsonErrorMsg(arena, err_msg);
         std.process.exit(1);
     };
     // Check for ambiguous matches.
@@ -1613,10 +1688,11 @@ fn applyEdit(
             current[after_first..],
             old_text,
         ) != null) {
-            try tools.stdout_file.writeAll(
-                "Error: old_content matches " ++
-                    "multiple locations. Make " ++
-                    "it more specific.",
+            try writeJsonErrorMsg(
+                arena,
+                "old_content matches multiple " ++
+                    "locations — make it " ++
+                    "more specific",
             );
             std.process.exit(1);
         }
@@ -1638,8 +1714,11 @@ fn applyEdit(
     try file.writeAll(new_file);
     const ok_msg = try std.fmt.allocPrint(
         arena,
-        "OK: edited {s} (-{d} +{d} chars, " ++
-            "{d} bytes total)",
+        "{{\"status\": \"ok\", " ++
+            "\"path\": \"{s}\", " ++
+            "\"removed\": {d}, " ++
+            "\"added\": {d}, " ++
+            "\"total\": {d}}}\n",
         .{
             path,
             old_text.len,
@@ -1657,37 +1736,41 @@ fn applyEdit(
 fn toolListDir(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
-    if (args.len < 1) {
-        try tools.writeJsonError(
-            error.MissingArgument,
+    const path = getJsonString(obj, "path") orelse {
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'path' field",
         );
         std.process.exit(1);
-    }
-    const path = args[0];
+    };
     std.debug.assert(path.len > 0);
     if (!isAllowedReadPath(config, path)) {
-        const err_msg = try std.fmt.allocPrint(
+        const msg = try std.fmt.allocPrint(
             arena,
-            "Error: listing not allowed for '{s}'",
+            "listing not allowed for '{s}'",
             .{path},
         );
-        try tools.writeStdout(err_msg);
+        try writeJsonErrorMsg(arena, msg);
         std.process.exit(1);
     }
-    const fs_path = try tools.resolveToFs(arena, config.fs_root, path);
+    const fs_path = try tools.resolveToFs(
+        arena,
+        config.fs_root,
+        path,
+    );
     const result = std.process.Child.run(.{
         .allocator = arena,
         .argv = &.{ "/bin/ls", "-la", fs_path },
         .max_output_bytes = MAX_COMMAND_OUTPUT,
     }) catch |err| {
-        const err_msg = try std.fmt.allocPrint(
+        const msg = try std.fmt.allocPrint(
             arena,
-            "Error: ls failed: {s}",
+            "ls failed: {s}",
             .{@errorName(err)},
         );
-        try tools.writeStdout(err_msg);
+        try writeJsonErrorMsg(arena, msg);
         std.process.exit(1);
     };
     const ok = switch (result.term) {
@@ -1695,7 +1778,21 @@ fn toolListDir(
         else => false,
     };
     if (result.stdout.len > 0) {
-        try tools.writeStdout(result.stdout);
+        const escaped = try tools.jsonEscape(
+            arena,
+            result.stdout,
+        );
+        const json = try std.fmt.allocPrint(
+            arena,
+            "{{\"status\": \"ok\", " ++
+                "\"path\": \"{s}\", " ++
+                "\"listing\": \"{s}\"}}\n",
+            .{ path, escaped },
+        );
+        try tools.writeStdout(json);
+    } else {
+        try writeJsonErrorMsg(arena, "empty listing");
+        std.process.exit(1);
     }
     if (!ok) std.process.exit(1);
 }
@@ -1706,7 +1803,13 @@ fn toolListDir(
 
 fn toolCwd(arena: Allocator) !void {
     const abs = try tools.cwdAbsolute(arena);
-    try tools.writeStdout(abs);
+    const json = try std.fmt.allocPrint(
+        arena,
+        "{{\"status\": \"ok\", " ++
+            "\"cwd\": \"{s}\"}}\n",
+        .{abs},
+    );
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -1715,75 +1818,97 @@ fn toolCwd(arena: Allocator) !void {
 
 fn toolRunCmd(
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
-    const obj = readJsonInput(arena, args) orelse {
-        try tools.writeJsonError(error.InvalidInput);
-        std.process.exit(1);
-    };
     const command = getJsonString(
         obj,
         "command",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'command' field",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'command' field",
         );
         std.process.exit(1);
     };
     if (command.len == 0) {
-        try tools.stdout_file.writeAll(
-            "Error: empty command",
+        try writeJsonErrorMsg(
+            arena,
+            "empty command",
         );
         std.process.exit(1);
     }
-    try runShellCommand(arena, command);
+    const result = runShellCapture(arena, command);
+    const escaped = try tools.jsonEscape(
+        arena,
+        result.output,
+    );
+    const exit_str = if (result.exit_code) |code|
+        try std.fmt.allocPrint(
+            arena,
+            "{d}",
+            .{code},
+        )
+    else
+        "null";
+    const json = try std.fmt.allocPrint(
+        arena,
+        "{{\"status\": \"ok\", " ++
+            "\"exit_code\": {s}, " ++
+            "\"output\": \"{s}\"}}\n",
+        .{ exit_str, escaped },
+    );
+    try tools.writeStdout(json);
 }
 
-/// Execute a shell command via /bin/sh -c and write
-/// combined stdout/stderr to our stdout.
-fn runShellCommand(
+const ShellResult = struct {
+    output: []const u8,
+    exit_code: ?u32,
+};
+
+/// Execute a shell command via /bin/sh -c and return
+/// combined stdout/stderr with exit code.
+fn runShellCapture(
     arena: Allocator,
     command: []const u8,
-) !void {
+) ShellResult {
     std.debug.assert(command.len > 0);
     const result = std.process.Child.run(.{
         .allocator = arena,
         .argv = &.{ "/bin/sh", "-c", command },
         .max_output_bytes = MAX_COMMAND_OUTPUT,
     }) catch |err| {
-        const err_msg = try std.fmt.allocPrint(
-            arena,
-            "Error: spawn failed: {s}",
+        std.debug.print(
+            "shell spawn failed: {s}\n",
             .{@errorName(err)},
         );
-        try tools.writeStdout(err_msg);
-        std.process.exit(1);
+        return .{ .output = "", .exit_code = null };
     };
     const exit_code: ?u32 = switch (result.term) {
         .Exited => |code| @as(?u32, code),
         else => null,
     };
-    if (result.stdout.len > 0) {
-        try tools.stdout_file.writeAll(result.stdout);
+    // Combine stdout and stderr into one buffer.
+    if (result.stderr.len == 0) {
+        return .{
+            .output = result.stdout,
+            .exit_code = exit_code,
+        };
     }
-    if (result.stderr.len > 0) {
-        if (result.stdout.len > 0) {
-            try tools.stdout_file.writeAll(
-                "\n--- stderr ---\n",
-            );
-        }
-        try tools.stdout_file.writeAll(result.stderr);
+    if (result.stdout.len == 0) {
+        return .{
+            .output = result.stderr,
+            .exit_code = exit_code,
+        };
     }
-    if (exit_code) |code| {
-        if (code != 0) {
-            const exit_msg = try std.fmt.allocPrint(
-                arena,
-                "\n(exit code {d})",
-                .{code},
-            );
-            try tools.writeStdout(exit_msg);
-        }
-    }
+    const combined = std.fmt.allocPrint(
+        arena,
+        "{s}\n{s}",
+        .{ result.stdout, result.stderr },
+    ) catch result.stdout;
+    return .{
+        .output = combined,
+        .exit_code = exit_code,
+    };
 }
 
 // ============================================================
@@ -1793,25 +1918,23 @@ fn runShellCommand(
 fn toolExperimentStart(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
     _ = config;
-    const obj = readJsonInput(arena, args) orelse {
-        try tools.writeJsonError(error.InvalidInput);
-        std.process.exit(1);
-    };
     const raw_name = getJsonString(
         obj,
         "name",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'name' field",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'name' field",
         );
         std.process.exit(1);
     };
     if (raw_name.len == 0) {
-        try tools.stdout_file.writeAll(
-            "Error: empty experiment name",
+        try writeJsonErrorMsg(
+            arena,
+            "empty experiment name",
         );
         std.process.exit(1);
     }
@@ -1835,7 +1958,19 @@ fn toolExperimentStart(
             "git checkout -b '{s}'",
         .{branch},
     );
-    try runShellCommand(arena, cmd);
+    const result = runShellCapture(arena, cmd);
+    const escaped = try tools.jsonEscape(
+        arena,
+        result.output,
+    );
+    const json = try std.fmt.allocPrint(
+        arena,
+        "{{\"status\": \"ok\", " ++
+            "\"branch\": \"{s}\", " ++
+            "\"output\": \"{s}\"}}\n",
+        .{ branch, escaped },
+    );
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -1843,10 +1978,21 @@ fn toolExperimentStart(
 // ============================================================
 
 fn toolDiff(arena: Allocator) !void {
-    try runShellCommand(
+    const result = runShellCapture(
         arena,
         "git --no-pager diff",
     );
+    const escaped = try tools.jsonEscape(
+        arena,
+        result.output,
+    );
+    const json = try std.fmt.allocPrint(
+        arena,
+        "{{\"status\": \"ok\", " ++
+            "\"diff\": \"{s}\"}}\n",
+        .{escaped},
+    );
+    try tools.writeStdout(json);
 }
 
 // ============================================================
@@ -1869,18 +2015,15 @@ fn toolDiff(arena: Allocator) !void {
 fn toolExperimentFinish(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
-    const obj = readJsonInput(arena, args) orelse {
-        try tools.writeJsonError(error.InvalidInput);
-        std.process.exit(1);
-    };
     const decision = getJsonString(
         obj,
         "decision",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'decision' field",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'decision' field",
         );
         std.process.exit(1);
     };
@@ -1888,8 +2031,9 @@ fn toolExperimentFinish(
         obj,
         "summary",
     ) orelse {
-        try tools.stdout_file.writeAll(
-            "Error: missing 'summary' field",
+        try writeJsonErrorMsg(
+            arena,
+            "missing 'summary' field",
         );
         std.process.exit(1);
     };
@@ -1897,29 +2041,32 @@ fn toolExperimentFinish(
     const is_keep = tools.eql(decision, "keep");
     const is_abandon = tools.eql(decision, "abandon");
     if (!is_keep and !is_abandon) {
-        try tools.stdout_file.writeAll(
-            "Error: decision must be " ++
-                "'keep' or 'abandon'",
+        try writeJsonErrorMsg(
+            arena,
+            "decision must be 'keep' or 'abandon'",
         );
         std.process.exit(1);
     }
     if (summary.len == 0) {
-        try tools.stdout_file.writeAll(
-            "Error: empty summary",
+        try writeJsonErrorMsg(
+            arena,
+            "empty summary",
         );
         std.process.exit(1);
     }
 
     // 1. Read current branch.
     const branch = captureGitBranch(arena) catch {
-        try tools.stdout_file.writeAll(
-            "Error: cannot determine current branch",
+        try writeJsonErrorMsg(
+            arena,
+            "cannot determine current branch",
         );
         std.process.exit(1);
     };
     if (tools.eql(branch, "main")) {
-        try tools.stdout_file.writeAll(
-            "Error: already on main, " ++
+        try writeJsonErrorMsg(
+            arena,
+            "already on main, " ++
                 "no experiment to finish",
         );
         std.process.exit(1);
@@ -1969,9 +2116,9 @@ fn toolExperimentFinish(
                 "git merge '{s}'",
             .{ msg_path, msg_path, branch },
         );
-        try runShellCommand(arena, cmd);
+        _ = runShellCapture(arena, cmd);
     } else {
-        try runShellCommand(
+        _ = runShellCapture(
             arena,
             "git reset --hard HEAD && " ++
                 "git checkout main",
@@ -1981,12 +2128,14 @@ fn toolExperimentFinish(
     // 6. Clean up cached bench result.
     cleanLastBench(config, arena);
 
-    const out = try std.fmt.allocPrint(
+    const json = try std.fmt.allocPrint(
         arena,
-        "Experiment #{d} {s}.",
+        "{{\"status\": \"ok\", " ++
+            "\"experiment\": {d}, " ++
+            "\"decision\": \"{s}\"}}\n",
         .{ exp_num, decision },
     );
-    try tools.writeStdout(out);
+    try tools.writeStdout(json);
 }
 
 /// Read the cached benchmark result from
@@ -2270,7 +2419,7 @@ fn captureGitBranch(
 /// Sanitize user input for use as a git branch name.
 /// Replaces non-alphanumeric characters with dashes
 /// and collapses consecutive dashes.
-fn sanitizeBranchName(
+pub fn sanitizeBranchName(
     arena: Allocator,
     raw: []const u8,
 ) []const u8 {
@@ -2307,7 +2456,7 @@ fn sanitizeBranchName(
 
 /// Truncate text at a sentence boundary (. ! ? or ))
 /// within max_len characters.  Falls back to hard cut.
-fn truncateAtSentence(
+pub fn truncateAtSentence(
     text: []const u8,
     max_len: usize,
 ) []const u8 {
@@ -2340,17 +2489,25 @@ fn truncateAtSentence(
 fn toolHistory(
     config: *const ToolboxConfig,
     arena: Allocator,
-    args: []const []const u8,
+    obj: std.json.ObjectMap,
 ) !void {
     const count: u32 = blk: {
-        if (args.len > 0) {
-            break :blk std.fmt.parseInt(
+        const val = obj.get("count") orelse
+            break :blk 5;
+        switch (val) {
+            .integer => |i| {
+                if (i < 0) break :blk 5;
+                break :blk @intCast(
+                    @min(i, 20),
+                );
+            },
+            .string => |s| break :blk std.fmt.parseInt(
                 u32,
-                args[0],
+                s,
                 10,
-            ) catch 5;
+            ) catch 5,
+            else => break :blk 5,
         }
-        break :blk 5;
     };
     const capped = @min(count, 20);
     if (capped == 0) {
@@ -2460,8 +2617,8 @@ fn isAllowedReadPath(
             return true;
         }
     }
-    for (config.write_scope) |file| {
-        if (tools.eql(path, file)) return true;
+    for (config.write_scope) |prefix| {
+        if (tools.startsWith(path, prefix)) return true;
     }
     return false;
 }

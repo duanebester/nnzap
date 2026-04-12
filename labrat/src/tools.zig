@@ -559,12 +559,19 @@ pub fn buildArchString(
     std.debug.assert(layers.len < 64);
     var buf: std.ArrayList(u8) = .empty;
 
+    // Prepend the input size of the first layer so that
+    // a 784->128->10 network reads "784->128->10", not
+    // "128->10".
+    var first_buf: [16]u8 = undefined;
+    const first_s = std.fmt.bufPrint(
+        &first_buf,
+        "{d}",
+        .{layers[0].input_size},
+    ) catch return "?";
+    buf.appendSlice(arena, first_s) catch return "?";
+
     for (layers) |layer| {
-        if (buf.items.len > 0) {
-            buf.appendSlice(arena, "->") catch {
-                return "?";
-            };
-        }
+        buf.appendSlice(arena, "->") catch return "?";
         var num_buf: [16]u8 = undefined;
         const s = std.fmt.bufPrint(
             &num_buf,
@@ -613,6 +620,18 @@ pub fn formatCompareEntry(
     const val_acc =
         r.final_validation_accuracy_pct orelse 0.0;
 
+    // Escape string fields to prevent malformed JSON
+    // when values contain quotes or backslashes.
+    const name_escaped = try jsonEscape(arena, name);
+    const optimizer_escaped = try jsonEscape(
+        arena,
+        c.optimizer,
+    );
+    const arch_escaped = try jsonEscape(
+        arena,
+        arch_str,
+    );
+
     return std.fmt.allocPrint(
         arena,
         "  {{" ++
@@ -629,17 +648,17 @@ pub fn formatCompareEntry(
             "\"architecture\": \"{s}\"" ++
             "}}",
         .{
-            name,
+            name_escaped,
             test_acc,
             val_acc,
             r.throughput_images_per_sec,
             r.total_training_ms,
-            c.optimizer,
+            optimizer_escaped,
             c.learning_rate,
             c.batch_size,
             c.num_epochs,
             c.param_count,
-            arch_str,
+            arch_escaped,
         },
     );
 }
