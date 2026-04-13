@@ -1869,16 +1869,12 @@ fn formatHistoryLine(
         buf.appendSlice(arena, part) catch continue;
     }
 
-    // Append truncated summary.
+    // Append summary.
     if (summary.len > 0) {
-        const trunc = truncateAtSentence(
-            summary,
-            80,
-        );
         const suf = std.fmt.allocPrint(
             arena,
             "  {s}",
-            .{trunc},
+            .{summary},
         ) catch "";
         buf.appendSlice(arena, suf) catch {};
     }

@@ -2218,7 +2218,7 @@ fn appendEnrichedExperiment(
     var ts_buf: [32]u8 = undefined;
     const ts = formatTimestampUtc(&ts_buf);
 
-    const trimmed = truncateAtSentence(summary, 500);
+    const trimmed = summary;
 
     var buf: std.ArrayList(u8) = .empty;
 
