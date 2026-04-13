@@ -211,11 +211,25 @@ kernel void q4mv_spec_f16io_resadd(
 
     // Cache input in threadgroup memory — faster than
     // constant cache for non-uniform (interleaved) access.
+    constexpr uint words_per_row = K / 8;
     threadgroup half tg_input[K];
+    threadgroup float tg_gs[words_per_row];
     constexpr uint elems_per_thread = K / 512;
     for (uint j = 0; j < elems_per_thread; j++) {
         tg_input[tid * elems_per_thread + j] =
             input[tid * elems_per_thread + j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Precompute per-word group sums cooperatively.
+    // All SIMD groups share these sums — eliminates
+    // redundant gs accumulation in the QMV inner loop.
+    for (uint w = tid; w < words_per_row; w += 512) {
+        float sum = 0.0f;
+        for (uint ni = 0; ni < 8; ni++) {
+            sum += float(tg_input[w * 8 + ni]);
+        }
+        tg_gs[w] = sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -225,7 +239,6 @@ kernel void q4mv_spec_f16io_resadd(
     const uint row1 = row0 + 1;
 
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint words_per_row = K / 8;
     constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
 
@@ -252,13 +265,13 @@ kernel void q4mv_spec_f16io_resadd(
         const uint32_t word0 = w32_r0[word_idx];
         const uint32_t word1 = w32_r1[word_idx];
 
-        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
+        float nd0 = 0.0f, nd1 = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
             const float x = float(tg_input[col_base + ni]);
             nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
             nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
-            gs += x;
         }
+        const float gs = tg_gs[word_idx];
 
         const uint sc0 = safe_row0 * groups_per_row + grp;
         const uint sc1 = safe_row1 * groups_per_row + grp;
@@ -407,11 +420,23 @@ kernel void q4mv_spec_f16in(
 
     // Cache input in threadgroup memory — faster than
     // constant cache for non-uniform (interleaved) access.
+    constexpr uint words_per_row = K / 8;
     threadgroup half tg_input[K];
+    threadgroup float tg_gs[words_per_row];
     constexpr uint elems_per_thread = K / 512;
     for (uint j = 0; j < elems_per_thread; j++) {
         tg_input[tid * elems_per_thread + j] =
             input[tid * elems_per_thread + j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Precompute per-word group sums cooperatively.
+    for (uint w = tid; w < words_per_row; w += 512) {
+        float sum = 0.0f;
+        for (uint ni = 0; ni < 8; ni++) {
+            sum += float(tg_input[w * 8 + ni]);
+        }
+        tg_gs[w] = sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -421,7 +446,6 @@ kernel void q4mv_spec_f16in(
     const uint row1 = row0 + 1;
 
     constexpr uint groups_per_row = K / group_size;
-    constexpr uint words_per_row = K / 8;
     constexpr uint uint32s_per_lane = words_per_row / 32;
     constexpr uint nibble_bytes_per_row = K / 2;
 
@@ -448,13 +472,13 @@ kernel void q4mv_spec_f16in(
         const uint32_t word0 = w32_r0[word_idx];
         const uint32_t word1 = w32_r1[word_idx];
 
-        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
+        float nd0 = 0.0f, nd1 = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
             const float x = float(tg_input[col_base + ni]);
             nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
             nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
-            gs += x;
         }
+        const float gs = tg_gs[word_idx];
 
         const uint sc0 = safe_row0 * groups_per_row + grp;
         const uint sc1 = safe_row1 * groups_per_row + grp;
@@ -516,11 +540,23 @@ kernel void q4mv_spec_mg_f16io_resadd(
     const uint M = dims.M;
 
     // Cache input in threadgroup memory.
+    constexpr uint words_per_row = K / 8;
     threadgroup half tg_input[K];
+    threadgroup float tg_gs[words_per_row];
     constexpr uint elems_per_thread = K / 512;
     for (uint j = 0; j < elems_per_thread; j++) {
         tg_input[tid * elems_per_thread + j] =
             input[tid * elems_per_thread + j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Precompute per-word group sums cooperatively.
+    for (uint w = tid; w < words_per_row; w += 512) {
+        float sum = 0.0f;
+        for (uint ni = 0; ni < 8; ni++) {
+            sum += float(tg_input[w * 8 + ni]);
+        }
+        tg_gs[w] = sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -534,7 +570,6 @@ kernel void q4mv_spec_mg_f16io_resadd(
 
     constexpr uint groups_per_row = K / group_size;
     constexpr uint nibble_bytes_per_row = K / 2;
-    constexpr uint words_per_row = K / 8;
     constexpr uint uint32s_per_lane = words_per_row / 32;
 
     const uint safe_row0 = min(row0, M - 1);
@@ -559,13 +594,13 @@ kernel void q4mv_spec_mg_f16io_resadd(
         const uint32_t word0 = w32_r0[word_idx];
         const uint32_t word1 = w32_r1[word_idx];
 
-        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
+        float nd0 = 0.0f, nd1 = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
             const float x = float(tg_input[col_base + ni]);
             nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
             nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
-            gs += x;
         }
+        const float gs = tg_gs[word_idx];
 
         const uint sc0 =
             safe_row0 * groups_per_row + grp;
@@ -728,6 +763,7 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
     // Linear TG layout — no padding needed with interleaved access.
     threadgroup half tg_input[K];
     threadgroup float tg_reduce[16];
+    threadgroup float tg_gs[words_per_row];
 
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
@@ -771,6 +807,16 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // ── Phase 2.5: Precompute per-word group sums ──
+    for (uint w = tid; w < words_per_row; w += 512) {
+        float sum = 0.0f;
+        for (uint ni = 0; ni < 8; ni++) {
+            sum += float(tg_input[w * 8 + ni]);
+        }
+        tg_gs[w] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // ── Phase 3: Gate+Up Q4 QMV with SiLU ──────────
     const uint row = tgid * 16 + simdgroup_idx;
     const bool row_valid = row < M;
@@ -794,13 +840,13 @@ kernel void q4mv_spec_fused_norm_pair_silu_f16io(
         const uint32_t wa = w32_a[word_idx];
         const uint32_t wb = w32_b[word_idx];
 
-        float nda = 0.0f, ndb = 0.0f, gs = 0.0f;
+        float nda = 0.0f, ndb = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
             const float x = float(tg_input[col_base + ni]);
             nda += float((wa >> (ni * 4)) & 0xFu) * x;
             ndb += float((wb >> (ni * 4)) & 0xFu) * x;
-            gs += x;
         }
+        const float gs = tg_gs[word_idx];
 
         const uint sc = safe_row * groups_per_row + grp;
         acc_g += bf16_to_f32(scales_a[sc]) * nda
@@ -867,6 +913,7 @@ kernel void q4mv_spec_fused_norm_f16io(
 
     threadgroup half tg_input[K];
     threadgroup float tg_reduce[16];
+    threadgroup float tg_gs[words_per_row];
 
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
@@ -910,6 +957,16 @@ kernel void q4mv_spec_fused_norm_f16io(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // ── Phase 2.5: Precompute per-word group sums ──
+    for (uint w = tid; w < words_per_row; w += 512) {
+        float sum = 0.0f;
+        for (uint ni = 0; ni < 8; ni++) {
+            sum += float(tg_input[w * 8 + ni]);
+        }
+        tg_gs[w] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // ── Phase 3: Single Q4 QMV from TG memory ──────
     const uint row0 =
         tgid * 32 + simdgroup_idx * 2;
@@ -939,14 +996,14 @@ kernel void q4mv_spec_fused_norm_f16io(
         const uint32_t word0 = w32_r0[word_idx];
         const uint32_t word1 = w32_r1[word_idx];
 
-        float nd0 = 0.0f, nd1 = 0.0f, gs = 0.0f;
+        float nd0 = 0.0f, nd1 = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
             const float x =
                 float(tg_input[col_base + ni]);
             nd0 += float((word0 >> (ni * 4)) & 0xFu) * x;
             nd1 += float((word1 >> (ni * 4)) & 0xFu) * x;
-            gs += x;
         }
+        const float gs = tg_gs[word_idx];
 
         const uint sc0 =
             safe_row0 * groups_per_row + grp;
@@ -1020,6 +1077,7 @@ kernel void q4mv_spec_fused_norm_pair_f16io(
 
     threadgroup half tg_input[K];
     threadgroup float tg_reduce[16];
+    threadgroup float tg_gs[words_per_row];
 
     const uint simdgroup_idx = tid / 32;
     const uint lane = tid % 32;
@@ -1063,6 +1121,16 @@ kernel void q4mv_spec_fused_norm_pair_f16io(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // ── Phase 2.5: Precompute per-word group sums ──
+    for (uint w = tid; w < words_per_row; w += 512) {
+        float sum = 0.0f;
+        for (uint ni = 0; ni < 8; ni++) {
+            sum += float(tg_input[w * 8 + ni]);
+        }
+        tg_gs[w] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // ── Phase 3: Paired Q4 QMV from TG memory ──────
     const uint row = tgid * 16 + simdgroup_idx;
     const bool row_valid = row < M;
@@ -1086,14 +1154,14 @@ kernel void q4mv_spec_fused_norm_pair_f16io(
         const uint32_t wa = w32_a[word_idx];
         const uint32_t wb = w32_b[word_idx];
 
-        float nda = 0.0f, ndb = 0.0f, gs = 0.0f;
+        float nda = 0.0f, ndb = 0.0f;
         for (uint ni = 0; ni < 8; ni++) {
             const float x =
                 float(tg_input[col_base + ni]);
             nda += float((wa >> (ni * 4)) & 0xFu) * x;
             ndb += float((wb >> (ni * 4)) & 0xFu) * x;
-            gs += x;
         }
+        const float gs = tg_gs[word_idx];
 
         const uint sc =
             safe_row * groups_per_row + grp;
